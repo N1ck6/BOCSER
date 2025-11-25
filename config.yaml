@@ -1,15 +1,15 @@
-mol_file_name : "tests/C7H14.mol"
-exp_name: "C7H14"
+mol_file_name : "tests/NonBR.mol"
+exp_name: "NonBR"
 spin_multiplicity : 1
 charge : 0
 orca_exec_command: "/opt/orca_6.1.0/orca"
 num_of_procs : 8
-orca_method : "XTB2"
+orca_method : "M062X"
 broken_struct_energy : 100.
 bond_length_threshold : 0.7
 rolling_window_size : 5
 rolling_std_threshold : 0
 rolling_mean_threshold : 0
-num_initial_points : 1
-max_steps : 1
+num_initial_points : 382
+max_steps : 100
 acquisition_function : "ik"
