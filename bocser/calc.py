@@ -157,8 +157,8 @@ def change_dihedrals(mol_file_name: str,
 
             for i, (atoms, old_val) in enumerate(dihedrals):
                 new_val = -rdMolTransforms.GetDihedralRad(mol.GetConformer(), *atoms)
-                new_val += 2 * np.pi * round(old_val / 2 / np.pi) 
-                print(f"Old angle: {old_val}, new angle: {new_val}")
+                new_val %= 2 * np.pi
+
                 dihedrals[i] = (atoms, new_val)
 
         if full_block:
