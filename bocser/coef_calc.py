@@ -134,9 +134,8 @@ class CoefCalculator:
             angels, where on one atom there are three equal terminal atoms,
             are not interesting
         """
-
-        if bond.IsInRing():
-            return self.af == 'ik'
+        if bond.IsInRing() and self.af != 'ik':
+            return False
 
         #If one of atoms is terminal
         if len([cur for cur in bond.GetBeginAtom().GetBonds()]) < 2 or\
@@ -220,9 +219,8 @@ class CoefCalculator:
     def get_ring_dihedrals(self, mol):
         edges = []
         for bond in mol.GetBonds():
-            if not self.is_interesting(bond) or not bond.IsInRing():
-                continue
-            edges.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
+            if bond.IsInRing():
+                edges.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
 
         graph = nx.from_edgelist(edges)
         graph.remove_edges_from(nx.bridges(graph))
