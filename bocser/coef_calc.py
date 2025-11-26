@@ -125,7 +125,14 @@ class CoefCalculator:
             return True
 
         return False
-
+    
+    def is_terminal(self, bond : Chem.rdchem.Bond) -> bool:
+        if len([cur for cur in bond.GetBeginAtom().GetBonds()]) < 2 or\
+           len([cur for cur in bond.GetEndAtom().GetBonds()]) < 2 :
+            return True
+        
+        return False
+    
     def is_interesting(self,
                        bond : Chem.rdchem.Atom) -> bool:
         """
@@ -134,12 +141,11 @@ class CoefCalculator:
             angels, where on one atom there are three equal terminal atoms,
             are not interesting
         """
-        if bond.IsInRing() and self.af != 'ik':
-            return False
+        if bond.IsInRing():
+            return self.af == 'ik'
 
         #If one of atoms is terminal
-        if len([cur for cur in bond.GetBeginAtom().GetBonds()]) < 2 or\
-           len([cur for cur in bond.GetEndAtom().GetBonds()]) < 2 :
+        if self.is_terminal(bond):
             return False
 
         # If bond isn't single
@@ -176,14 +182,6 @@ class CoefCalculator:
 
         return result
 
-    def __get_unique_mols(self,
-                        lst : list[Chem.rdchem.Mol]) -> list[Chem.rdchem.Mol]:
-        """
-            get unique molecules from list
-        """
-
-        return list(map(Chem.MolFromSmiles, set(list(map(Chem.MolToSmiles, lst)))))
-
     def generate_3d_coords(self,
                            lst : list[Chem.rdchem.Mol]) -> list[Chem.rdchem.Mol]:
         """
@@ -208,7 +206,7 @@ class CoefCalculator:
 
         for bond in mol.GetBonds():
 
-            if not self.is_interesting(bond):
+            if self.is_terminal(bond):
                 continue
 
             return ([cur.GetIdx() for cur in bond.GetBeginAtom().GetNeighbors() if cur.GetIdx() != bond.GetEndAtomIdx()][0],
