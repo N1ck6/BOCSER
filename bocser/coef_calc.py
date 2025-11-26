@@ -329,7 +329,7 @@ class CoefCalculator:
             for atom in [*bond.GetBeginAtom().GetNeighbors(),\
                          *bond.GetEndAtom().GetNeighbors()]:
                 atoms_to_use.add(atom.GetIdx())
-
+            print(atoms_to_use)
             if self.skip_triple_equal_terminal_atoms and\
                self.is_triple_eq_neighbors(atom):
                 atoms_to_use.update([cur.GetIdx() for cur in atom.GetNeighbors()])
