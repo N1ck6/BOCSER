@@ -126,7 +126,7 @@ class CoefCalculator:
 
         return False
     
-    def is_terminal(self, bond : Chem.rdchem.Bond) -> bool:
+    def is_terminal_bond(self, bond : Chem.rdchem.Bond) -> bool:
         if len([cur for cur in bond.GetBeginAtom().GetBonds()]) < 2 or\
            len([cur for cur in bond.GetEndAtom().GetBonds()]) < 2 :
             return True
@@ -145,7 +145,7 @@ class CoefCalculator:
             return self.af == 'ik'
 
         #If one of atoms is terminal
-        if self.is_terminal(bond):
+        if self.is_terminal_bond(bond):
             return False
 
         # If bond isn't single
@@ -206,7 +206,7 @@ class CoefCalculator:
 
         for bond in mol.GetBonds():
 
-            if self.is_terminal(bond):
+            if self.is_terminal_bond(bond):
                 continue
 
             return ([cur.GetIdx() for cur in bond.GetBeginAtom().GetNeighbors() if cur.GetIdx() != bond.GetEndAtomIdx()][0],
