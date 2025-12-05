@@ -14,7 +14,6 @@ from db_connector import Connector
 
 import networkx as nx
 from ik_loss import CyclicCollection
-import vf3py
 
 
 class CoefCalculator:
@@ -38,8 +37,8 @@ class CoefCalculator:
         """
             mol - rdkit molecule
             dir_for_inps - path to directory, where scan .inp files will generates
-            skip_triple_equal_terminal_atoms - skip diherdrals,
-                where one of atoms is RX3, where X - terminal atom
+            skip_triple_equal_terminal_atoms - skip dihedrals,
+                where one of atoms is RX3, where X is a terminal atom
             num_of_procs - num of procs to calculate
             method_of_calc - method in orca format
             charge - charge of molecule
@@ -138,7 +137,7 @@ class CoefCalculator:
         """
             Returns True if we should scan this bond
             if skip_triple_equale_terminal_atoms == True - dihedral
-            angels, where on one atom there are three equal terminal atoms,
+            angles, where on one atom there are three equal terminal atoms,
             are not interesting
         """
         if bond.IsInRing() and self.af != 'ik':

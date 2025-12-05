@@ -10,24 +10,28 @@ import numpy as np
 
 from sklearn.cluster import KMeans
 
-from typing import Dict
+
 
 from default_vals import ConfSearchConfig
+import subprocess
+import shlex
+import shutil
+from pathlib import Path
 
 import tempfile
 
 HARTRI_TO_KCAL = 627.509474063 
 
-ORCA_EXEC_COMMAND = ConfSearchConfig.orca_exec_command
-NUM_OF_PROCS = ConfSearchConfig.num_of_procs
+ORCA_EXEC_COMMAND = "/opt/orca5/orca"
+NUM_OF_PROCS = 8
 DEFAULT_METHOD = None
-ORCA_METHOD = ConfSearchConfig.orca_method
-CHARGE = ConfSearchConfig.charge
-MULTIPL = ConfSearchConfig.spin_multiplicity
-TS = ConfSearchConfig.ts
-BROKEN_STRUCT_ENERGY = ConfSearchConfig.broken_struct_energy
-BOND_LENGTH_THRESHOLD = ConfSearchConfig.bond_length_threshold
-CURRENT_STRUCTURE_ID = 0 # global id for every structure that we would save
+ORCA_METHOD = "lda sto-3g"
+CHARGE = 0
+MULTIPL = 1
+TS = False
+BROKEN_STRUCT_ENERGY = 100.0
+BOND_LENGTH_THRESHOLD = 0.7
+_CURRENT_STRUCTURE_ID = 0  # global id for every structure that we would save (use accessors)
 
 ACQUISITION_FUNCTION = ConfSearchConfig.acquisition_function
 
@@ -37,78 +41,23 @@ WRONG_GEOMETRY = False
 #that consists of list with four atoms and value of degree
 dihedral = tuple[list[int], float]
 
-def load_params_from_config(
-    config : Dict[str, object]
-) -> None:
-    
+def set_config(config: ConfSearchConfig) -> None:
+    """Set runtime parameters for calculation functions from a `ConfSearchConfig`.
+
+    This replaces the previous dict-based loader and centralizes config
+    propagation. Call this early in your program (e.g. from `conf_search.py`).
+    """
     global MULTIPL, CHARGE, ORCA_EXEC_COMMAND, NUM_OF_PROCS, ORCA_METHOD, TS, BROKEN_STRUCT_ENERGY, BOND_LENGTH_THRESHOLD, ACQUISITION_FUNCTION
-    
-    print(f"Loading calculation config!")
-    update_number = 0
-    if "spin_multiplicity" in config:
-        if not isinstance(config["spin_multiplicity"], int):
-            print(f"Spin Multiplicity should be integer! Continue with default value {MULTIPL}")
-        else:
-            MULTIPL = config["spin_multiplicity"]
-            update_number += 1
 
-    if "charge" in config:
-        if not isinstance(config["charge"], int):
-            print(f"Charge should be integer! Continue with default value {CHARGE}")
-        else:
-            CHARGE = config["charge"]
-            update_number += 1
-
-    if "orca_exec_command" in config:
-        if not isinstance(config["orca_exec_command"], str):
-            print(f"Orca execution command should be str! Continue with default value {ORCA_EXEC_COMMAND}")
-        else:
-            ORCA_EXEC_COMMAND = config["orca_exec_command"]
-            update_number += 1    
-
-    if "num_of_procs" in config:
-        if not isinstance(config["num_of_procs"], int):
-            print(f"Number of procs should be integer! Continue with default value {NUM_OF_PROCS}")
-        else:
-            NUM_OF_PROCS = config["num_of_procs"]
-            update_number += 1
-
-    if "orca_method" in config:
-        if not isinstance(config["orca_method"], str):
-            print(f"Orca method should be str! Continue with default value {ORCA_METHOD}")
-        else:
-            ORCA_METHOD = config["orca_method"]
-            update_number += 1
-    
-    if "ts" in config:
-        if not isinstance(config["ts"], bool):
-            print(f"TS key should be bool! Continue with default value {TS}")
-        else:
-            TS = config["ts"]
-            update_number += 1
-
-    if "broken_struct_energy" in config:
-        if not isinstance(config["broken_struct_energy"], float):
-            print(f"Broken structure Energy should be float! Continue with default value {BROKEN_STRUCT_ENERGY}")
-        else:
-            BROKEN_STRUCT_ENERGY = config["broken_struct_energy"]
-            update_number += 1
-
-    if "bond_length_threshold" in config:
-        if not isinstance(config["bond_length_threshold"], float):
-            print(f"Bond length threshold should be float! Continue with default value {BOND_LENGTH_THRESHOLD}")
-        else:
-            BOND_LENGTH_THRESHOLD = config["bond_length_threshold"]
-            update_number += 1
-            
-    if "acquisition_function" in config:
-        if not isinstance(config["acquisition_function"], str):
-            print(f"Acquisition function should be str! Continue with default value {ACQUISITION_FUNCTION}")
-        else:
-            ACQUISITION_FUNCTION = config["acquisition_function"]
-            update_number += 1
-
-    print(f"Calculation config loaded! {update_number} params were updated!")
+    ORCA_EXEC_COMMAND = config.orca_exec_command
+    NUM_OF_PROCS = config.num_of_procs
+    ORCA_METHOD = config.orca_method
+    CHARGE = config.charge
+    MULTIPL = config.spin_multiplicity
+    TS = config.ts
+    BROKEN_STRUCT_ENERGY = config.broken_struct_energy
+    BOND_LENGTH_THRESHOLD = config.bond_length_threshold
+    ACQUISITION_FUNCTION = config.acquisition_function
 
 def dist_between_atoms(mol : Chem.rdchem.Mol, i : int, j : int) -> float:
     pos_i = mol.GetConformer().GetAtomPosition(i)
@@ -220,20 +169,59 @@ def generate_oinp(
         file.write(coords)
         file.write("END\n")
 
-def generate_default_oinp(coords : str, dihedrals : list[dihedral], oinp_name : str, constrained_opt : bool = False):
-    generate_oinp(coords, dihedrals, oinp_name, NUM_OF_PROCS, ORCA_METHOD,\
-                                                CHARGE, MULTIPL, constrained_opt=constrained_opt)
-def start_calc(gjf_name : str, sbatch: bool = True):
+def generate_default_oinp(
+    coords: str,
+    dihedrals: list[dihedral],
+    oinp_name: str,
+    constrained_opt: bool = False,
+    num_of_procs: int = None,
+    orca_method: str = None,
+    charge: int = None,
+    multipl: int = None,
+) -> None:
+    """Generate ORCA input file using module globals or explicit parameters.
+    
+    If optional parameters are not provided, uses module-level defaults set by set_config().
+    """
+    num_of_procs = num_of_procs if num_of_procs is not None else NUM_OF_PROCS
+    orca_method = orca_method if orca_method is not None else ORCA_METHOD
+    charge = charge if charge is not None else CHARGE
+    multipl = multipl if multipl is not None else MULTIPL
+    generate_oinp(
+        coords,
+        dihedrals,
+        oinp_name,
+        num_of_procs,
+        orca_method,
+        charge,
+        multipl,
+        constrained_opt=constrained_opt,
+    )
+
+
+def start_calc(gjf_name: str, sbatch: bool = True):
     """
         Running calculation
     """	
     if sbatch:
         sbatch_name = gjf_name.split('/')[-1][:-4] + ".sh"
-        os.system("cp sbatch_temp " + sbatch_name)
-        os.system("echo \"" + ORCA_EXEC_COMMAND + " " + gjf_name + " > " + gjf_name[:-4] + ".out\"" + " >> " + sbatch_name) 
-        os.system("sbatch " + sbatch_name)
+        try:
+            shutil.copy("sbatch_temp", sbatch_name)
+            # append the orca call into the sbatch script
+            with open(sbatch_name, "a") as fh:
+                fh.write(f"{ORCA_EXEC_COMMAND} {gjf_name} > {gjf_name[:-4]}.out\n")
+            subprocess.run(["sbatch", sbatch_name], check=True)
+        except Exception:
+            # fall back to running the previous approach if sbatch fails
+            subprocess.run(shlex.split(ORCA_EXEC_COMMAND) + [gjf_name], check=False)
     else:
-        os.system(ORCA_EXEC_COMMAND + " " + gjf_name + " > " + gjf_name[:-4] + ".out") 
+        out_path = gjf_name[:-4] + ".out"
+        try:
+            with open(out_path, "wb") as out_f:
+                subprocess.run(shlex.split(ORCA_EXEC_COMMAND) + [gjf_name], stdout=out_f, check=False)
+        except Exception:
+            # best-effort fallback using shell in case ORCA_EXEC_COMMAND is complex
+            subprocess.run(f"{ORCA_EXEC_COMMAND} {gjf_name} > {out_path}", shell=True)
 
 def mol_to_inp_name(mol_file_name : str) -> str:
     """
@@ -278,7 +266,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
             en = float(en_line.split()[4])
             return en, True
     except FileNotFoundError:
-        print(f"No log file! Something went wrong! Finishing!")
+        print("No log file! Something went wrong! Finishing!")
         exit(0) #TODO: Make hooks for finishing
     except IndexError:
         print(f"Seems that optimization finished with error! Check it carefuly by yourself! Returning default energy for broken structures: {BROKEN_STRUCT_ENERGY}")
@@ -309,36 +297,40 @@ def check_is_broken(
     return False
  
 def calc_energy(
-        mol_file_name : str,
-        dihedrals : list[dihedral] = [],
-        norm_energy : float = 0, 
-        save_structs : bool = True,
-        constrained_opt : bool = False,
-        force_xyz_block : Union[None, str] = None,
-        ik_loss = None
-    ) -> float:
+        mol_file_name: str,
+        dihedrals: list[dihedral] = [],
+        norm_energy: float = 0,
+        save_structs: bool = True,
+        constrained_opt: bool = False,
+        force_xyz_block: Union[None, str] = None,
+        ik_loss=None,
+        config: ConfSearchConfig = None,
+) -> float:
     """
-        calculates energy of molecule from 'mol_file_name'
-        with current properties and returns it as float
-        Also displace atoms on random distances is RANDOM_DISPLACEMENT = True
+        Calculates energy of molecule from 'mol_file_name'
+        with current properties and returns it as float.
+        If config is provided, uses its values; otherwise uses module-level defaults.
     """
+    # Use config values if provided, else fall back to globals set by set_config()
+    bond_len_threshold = config.bond_length_threshold if config else BOND_LENGTH_THRESHOLD
 
     print(f"Calc with save_struct={save_structs}")
 
     xyz_upd = None
-    
-    print('dihedrals before: ', dihedrals)
+
+    print("dihedrals before: ", dihedrals)
     if force_xyz_block:
         xyz_upd = force_xyz_block
     else:
         xyz_upd = change_dihedrals(mol_file_name, dihedrals, ik_loss)
 
-    print('dihedrals after: ', dihedrals)
+    print("dihedrals after: ", dihedrals)
 
-    if check_is_broken(xyz_upd, BOND_LENGTH_THRESHOLD):
-        print(f"Seems that some atoms in current structure is closer then {BOND_LENGTH_THRESHOLD}!")
-        print(f"Returning broken_struct_energy that is {BROKEN_STRUCT_ENERGY}")
-        return BROKEN_STRUCT_ENERGY, False
+    if check_is_broken(xyz_upd, bond_len_threshold):
+        broken_energy = config.broken_struct_energy if config else BROKEN_STRUCT_ENERGY
+        print(f"Seems that some atoms in current structure is closer than {bond_len_threshold}!")
+        print(f"Returning broken_struct_energy that is {broken_energy}")
+        return broken_energy, False
 
     opt_status = True
 
@@ -346,8 +338,21 @@ def calc_energy(
     out_name = inp_to_out_name(inp_name)
 
     if os.path.isfile(out_name):
-        os.system("rm -r " + out_name)
-    generate_default_oinp(xyz_upd, dihedrals, inp_name, constrained_opt=constrained_opt)
+        try:
+            Path(out_name).unlink(missing_ok=True)
+        except Exception:
+            # fallback to remove via shell
+            subprocess.run(["rm", "-f", out_name])
+    generate_default_oinp(
+        xyz_upd,
+        dihedrals,
+        inp_name,
+        constrained_opt=constrained_opt,
+        num_of_procs=config.num_of_procs if config else None,
+        orca_method=config.orca_method if config else None,
+        charge=config.charge if config else None,
+        multipl=config.spin_multiplicity if config else None,
+    )
     start_calc(inp_name)
     wait_for_the_end_of_calc(out_name, 1000)
     
@@ -364,13 +369,18 @@ def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
     return ''.join(full_xyz[2:])
 
 def increase_structure_id() -> int:
-    global CURRENT_STRUCTURE_ID
-    CURRENT_STRUCTURE_ID += 1
-    return CURRENT_STRUCTURE_ID - 1
+    """Increment and return a new structure id.
+
+    The module-level counter is internal; use this accessor instead of
+    touching the variable directly.
+    """
+    global _CURRENT_STRUCTURE_ID
+    _CURRENT_STRUCTURE_ID += 1
+    return _CURRENT_STRUCTURE_ID - 1
 
 def dihedral_angle(a : list[float], b : list[float], c : list[float], d : list[float]) -> float:
     """
-       Calculates dihedral angel between 4 points
+    Calculates dihedral angle between 4 points
     """
     
     a = np.array(a)
@@ -378,7 +388,7 @@ def dihedral_angle(a : list[float], b : list[float], c : list[float], d : list[f
     c = np.array(c)
     d = np.array(d)
     
-    #Next will be calc of signed dihedral angel in terms of rdkit
+    # Next: compute signed dihedral angle in terms used by RDKit
     #Vars named like in rdkit source code
 
     lengthSq = lambda u : np.sum(u ** 2)
@@ -411,7 +421,8 @@ def parse_points_from_trj(
 
     structures = []
 
-    global CURRENT_STRUCTURE_ID
+    # use internal counter for structure ids
+    global _CURRENT_STRUCTURE_ID
 
     with open(trj_file_name, "r") as file:
         lines = [line[:-1] for line in file]
@@ -458,18 +469,18 @@ def parse_points_from_trj(
     if save_structs:
 
         print("SAVING STRUCTS")
-        print(f"Saving first struct from trj. Current structure number: {CURRENT_STRUCTURE_ID}")
-        with open(structures_path + str(CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
+        print("Saving first struct from trj. Current structure number: {}".format(_CURRENT_STRUCTURE_ID))
+        with open(structures_path + str(_CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
             file.write(structures[0])
-        print(f"saved")
-        CURRENT_STRUCTURE_ID += 1
+        print("saved")
+        _CURRENT_STRUCTURE_ID += 1
 
         for cluster_id in vals:
-            print(f"saving struct number {CURRENT_STRUCTURE_ID}")
-            with open(structures_path + str(CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
+            print("saving struct number {}".format(_CURRENT_STRUCTURE_ID))
+            with open(structures_path + str(_CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
                 file.write(structures[vals[cluster_id][1] + 1]) # because points parsed from result[1:]
             print("saved")
-            CURRENT_STRUCTURE_ID += 1
+            _CURRENT_STRUCTURE_ID += 1
    
     minima_node = {
         "coords" : result[-1][0],

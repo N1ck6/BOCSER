@@ -1,12 +1,8 @@
-import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
 from trieste.types import TensorType
 from trieste.data import Dataset
-
-from trieste.acquisition.rule import EfficientGlobalOptimization
-from trieste.acquisition import ExpectedImprovement
 from trieste.acquisition.interface import (AcquisitionFunction,
                                            AcquisitionFunctionClass,
                                            SingleModelAcquisitionBuilder)
@@ -18,8 +14,7 @@ from ik_loss import IKLoss
 
 
 class ImprovementVarianceWithIK(SingleModelAcquisitionBuilder):
-    """
-        Returns variance of Improvement I(x) = max(\eta + threshold - f(x), 0)
+    """Returns variance of Improvement I(x) = max(eta + threshold - f(x), 0).
     """
 
     def __init__(

@@ -17,7 +17,7 @@ class ConfSearchConfig:
     rolling_std_threshold : float = 0.15
     rolling_mean_threshold : float = 1.
     num_initial_points : int = 3
-    max_steps : int = 50,
+    max_steps : int = 50
     exp_name : str = "cs"
     load_ensemble : Union[str, None] = None
     acquisition_function : str = "iv"

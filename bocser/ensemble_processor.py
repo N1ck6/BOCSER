@@ -2,7 +2,7 @@ import tensorflow as tf
 
 from typing import List, Tuple, Callable#, Self
 
-from calc import dihedral_angle, HARTRI_TO_KCAL
+from calc import dihedral_angle
 
 def parse_energy_from_xyz_2nd_line(s):
     return float(s.split()[-1]) #*HARTRI_TO_KCAL
@@ -19,7 +19,7 @@ class EnsembleProcessor:
             and their energies in kcal/mol. 
 
             Args:
-                ensembel_filename - filename of ensemble
+                ensemble_filename - filename of the ensemble
                 dihedral_idxs - list of 4-element lists with atom idxs.
                     angles given in expected order
                 parse_energy_from_xyz_2nd_line - function that will apply 

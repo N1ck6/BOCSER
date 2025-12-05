@@ -1,4 +1,3 @@
-import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
@@ -6,8 +5,6 @@ import tensorflow_probability as tfp
 from trieste.types import TensorType
 from trieste.data import Dataset
 
-from trieste.acquisition.rule import EfficientGlobalOptimization
-from trieste.acquisition import ExpectedImprovement
 from trieste.acquisition.interface import (
     AcquisitionFunction,
     AcquisitionFunctionClass,
@@ -18,8 +15,8 @@ from trieste.models import ProbabilisticModel
 from typing import cast
 
 class ExplorationalVarianceMinimizer(SingleModelAcquisitionBuilder):
-    """
-        Returns Explorational Variance Minimizer acquisition fucntion value EVM(x) = max(\eta + threshold - f(x), 0)
+    """Returns Explorational Variance Minimizer acquisition function value
+    EVM(x) = max(eta + threshold - f(x), 0).
     """
     def __init__(self, threshold):
 
