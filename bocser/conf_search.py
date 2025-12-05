@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import os
 import json
+from pathlib import Path
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -80,6 +81,7 @@ class ConfSearchState:
     mol_file_name: Optional[str] = None
     exp_name: str = ""
     structures_path: str = ""
+    working_folder: str = ""
     norm_energy: float = 0.0
     dihedral_ids: list = field(default_factory=list)
     global_degrees: list = field(default_factory=list)
@@ -104,13 +106,26 @@ class ConfSearchRunner:
     Encapsulates all state and workflow logic, eliminating module-level globals.
     """
 
-    def __init__(self):
+    def __init__(self, working_folder: str = "."):
+        """
+        Initialize the conformational search runner.
+        
+        Args:
+            working_folder: Directory where config, input files are read from
+                           and output files are written to. Defaults to current directory.
+        """
         self.state = ConfSearchState()
+        self.state.working_folder = working_folder
+        # Ensure working folder exists
+        Path(working_folder).mkdir(parents=True, exist_ok=True)
 
     def _dump_status_hook(self, dumping_value: bool, filename: Optional[str] = None) -> None:
         """Save optimization status to JSON file."""
         if filename is None:
-            filename = self.state.exp_name + "_last_opt_status.json"
+            filename = os.path.join(
+                self.state.working_folder,
+                self.state.exp_name + "_last_opt_status.json"
+            )
         with open(filename, "w") as file:
             json.dump({"LAST_OPT_OK": dumping_value}, file)
 
@@ -215,7 +230,11 @@ class ConfSearchRunner:
             return_minima=True,
         )
 
-        with open(f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz", "w") as minima_xyz_writer:
+        minima_file = os.path.join(
+            self.state.working_folder,
+            f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz"
+        )
+        with open(minima_file, "w") as minima_xyz_writer:
             minima_xyz_writer.write(last_point["xyz_block"])
 
         self.state.minima.append((last_point["coords"], last_point["rel_en"]))
@@ -251,8 +270,16 @@ class ConfSearchRunner:
         return Dataset(query_points, observations)
 
     def load_config(self, config_path: str) -> None:
-        """Load and validate configuration from file."""
+        """Load and validate configuration from file.
+        
+        Args:
+            config_path: Path to config file. Can be relative to working_folder or absolute.
+        """
         from config_loader import load_config, ConfigError
+
+        # If config_path is relative, look in working_folder
+        if not os.path.isabs(config_path):
+            config_path = os.path.join(self.state.working_folder, config_path)
 
         try:
             config = load_config(config_path)
@@ -279,13 +306,23 @@ class ConfSearchRunner:
 
         # Propagate configuration to modules and internal state
         set_config(config)
-        self.state.mol_file_name = config.mol_file_name
-        self.state.structures_path = config.exp_name + "/"
+        
+        # Use mol_file_name from config, resolving relative paths to working_folder
+        mol_file = config.mol_file_name
+        if not os.path.isabs(mol_file):
+            mol_file = os.path.join(self.state.working_folder, mol_file)
+        self.state.mol_file_name = mol_file
+        
+        self.state.structures_path = os.path.join(
+            self.state.working_folder,
+            config.exp_name + "/"
+        )
         self.state.exp_name = config.exp_name
 
         if not os.path.exists(self.state.structures_path):
             os.makedirs(self.state.structures_path)
-            os.makedirs(self.state.structures_path[:-1] + "_minima" + "/")
+            minima_path = os.path.join(self.state.working_folder, config.exp_name + "_minima/")
+            os.makedirs(minima_path)
 
         if config.acquisition_function not in {"ei", "evm", "ik"}:
             print(
@@ -297,11 +334,15 @@ class ConfSearchRunner:
         print("Coef calculator creating")
 
         self.state.mol = Chem.RemoveHs(Chem.MolFromMolFile(self.state.mol_file_name))
+        
+        scans_dir = os.path.join(self.state.working_folder, f"{self.state.exp_name}_scans/")
+        db_file = os.path.join(self.state.working_folder, "dihedral_logs.db")
+        
         coef_calc = CoefCalculator(
             mol=self.state.mol,
             config=config,
-            dir_for_inps=f"{self.state.exp_name}_scans/",
-            db_connector=LocalConnector("dihedral_logs.db"),
+            dir_for_inps=scans_dir,
+            db_connector=LocalConnector(db_file),
         )
         coef_matrix = coef_calc.coef_matrix()
 
@@ -591,28 +632,45 @@ class ConfSearchRunner:
             if self.state.minima[i][1] < res[cluster_id][0]:
                 res[cluster_id] = self.state.minima[i][1], i
 
+        clustering_file = os.path.join(
+            self.state.working_folder,
+            f"{self.state.exp_name}_clustering_results.json"
+        )
         print(
             f"Results of clustering: {res}\n"
             f"There are relative energy and number of structure for each cluster. "
-            f"Saved in `{self.state.exp_name}_clustering_results.json`"
+            f"Saved in `{clustering_file}`"
         )
-        json.dump(res, open(f"{self.state.exp_name}_clustering_results.json", "w"))
+        json.dump(res, open(clustering_file, "w"))
 
-        print(f"Saving final ensemble into `{self.state.exp_name}_final_ensemble.xyz`")
+        final_ensemble_file = os.path.join(
+            self.state.working_folder,
+            f"{self.state.exp_name}_final_ensemble.xyz"
+        )
+        print(f"Saving final ensemble into `{final_ensemble_file}`")
         ens_xyz_str = ""
         for _, structure_id in res.values():
             cur_xyz = ""
-            with open(f"{self.state.exp_name}_minima/{structure_id}.xyz", "r") as cur_xyz_reader:
+            minima_file = os.path.join(
+                self.state.working_folder,
+                self.state.exp_name + "_minima",
+                f"{structure_id}.xyz"
+            )
+            with open(minima_file, "r") as cur_xyz_reader:
                 cur_xyz = "".join([line for line in cur_xyz_reader])
             ens_xyz_str += cur_xyz + "\n"
 
-        with open(f"{self.state.exp_name}_final_ensemble.xyz", "w") as ens_writer:
+        with open(final_ensemble_file, "w") as ens_writer:
             ens_writer.write(ens_xyz_str)
 
-        print(f"Saving all points at `{self.state.exp_name}_all_points.json`")
+        all_points_file = os.path.join(
+            self.state.working_folder,
+            f"{self.state.exp_name}_all_points.json"
+        )
+        print(f"Saving all points at `{all_points_file}`")
         json.dump(
             {"query_points": query_points.tolist(), "observations": observations.tolist()},
-            open(f"{self.state.exp_name}_all_points.json", "w"),
+            open(all_points_file, "w"),
         )
 
 
@@ -624,13 +682,23 @@ def main():
         prog="bo_confsearch",
         description="Bayesian optimization for conformational search",
     )
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--folder",
+        default=".",
+        help="Working folder for input files and output results (default: current directory)"
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Config file name (relative to --folder or absolute path)"
+    )
 
     args = parser.parse_args()
 
-    print(f"Reading config {args.config}")
+    print(f"Working folder: {args.folder}")
+    print(f"Reading config from: {args.config}")
 
-    runner = ConfSearchRunner()
+    runner = ConfSearchRunner(working_folder=args.folder)
     runner.load_config(args.config)
     runner.setup()
     runner.run()
