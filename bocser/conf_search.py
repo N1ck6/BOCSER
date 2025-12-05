@@ -82,6 +82,7 @@ class ConfSearchState:
     exp_name: str = ""
     structures_path: str = ""
     working_folder: str = ""
+    db_file: str = ""
     norm_energy: float = 0.0
     dihedral_ids: list = field(default_factory=list)
     global_degrees: list = field(default_factory=list)
@@ -106,16 +107,28 @@ class ConfSearchRunner:
     Encapsulates all state and workflow logic, eliminating module-level globals.
     """
 
-    def __init__(self, working_folder: str = "."):
+    def __init__(self, working_folder: str = ".", db_file: Optional[str] = None):
         """
         Initialize the conformational search runner.
         
         Args:
             working_folder: Directory where config, input files are read from
                            and output files are written to. Defaults to current directory.
+            db_file: Path to dihedral_logs.db database file. If not provided, defaults to
+                    the parent directory of the bocser module (../dihedral_logs.db).
         """
         self.state = ConfSearchState()
         self.state.working_folder = working_folder
+        
+        # Set database file path
+        if db_file is None:
+            # Default: one directory up from bocser folder
+            bocser_dir = os.path.dirname(os.path.abspath(__file__))
+            parent_dir = os.path.dirname(bocser_dir)
+            db_file = os.path.join(parent_dir, "dihedral_logs.db")
+        
+        self.state.db_file = db_file
+        
         # Ensure working folder exists
         Path(working_folder).mkdir(parents=True, exist_ok=True)
 
