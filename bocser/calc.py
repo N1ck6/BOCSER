@@ -41,7 +41,7 @@ def load_params_from_config(
     config : Dict[str, object]
 ) -> None:
     
-    global ORCA_EXEC_COMMAND, NUM_OF_PROCS, ORCA_METHOD, ORCA, CHARGE, MULTIPL, ACQUISITION_FUNCTION
+    global MULTIPL, CHARGE, ORCA_EXEC_COMMAND, NUM_OF_PROCS, ORCA_METHOD, TS, BROKEN_STRUCT_ENERGY, BOND_LENGTH_THRESHOLD, ACQUISITION_FUNCTION
     
     print(f"Loading calculation config!")
     update_number = 0
@@ -120,7 +120,6 @@ def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]],
                      ik_loss=None,
                      full_block=False):
-
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
 
@@ -139,25 +138,25 @@ def change_dihedrals(mol_file_name: str,
 
             for bl_dict in ik_loss.bond_lengths:
                 for (a, b), value in bl_dict.items():
-                    ff.MMFFAddDistanceConstraint(a, b, False, value, value, 1e4)
+                    ff.MMFFAddDistanceConstraint(a, b, False, value, value, 1e3)
 
             for va_dict in ik_loss.valence_angles:
                 for (a, b, c), value in va_dict.items():
                     ff.MMFFAddAngleConstraint(a, b, c, False,
                                               np.rad2deg(value),
-                                              np.rad2deg(value), 1e4)
+                                              np.rad2deg(value), 1e2)
 
             for (a, b, c, d), value in dihedrals:
                 ff.MMFFAddTorsionConstraint(a, b, c, d, False,
                                             np.rad2deg(-value),
-                                            np.rad2deg(-value), 1e4)
+                                            np.rad2deg(-value), 1)
 
-            ff.Minimize(maxIts=10000)
+            ff.Minimize(maxIts=1000)
             mol = tmp_mol
 
             for i, (atoms, old_val) in enumerate(dihedrals):
-                new_val = -rdMolTransforms.GetDihedralRad(mol.GetConformer(), *atoms)
-                new_val %= 2 * np.pi
+                positions = [mol.GetConformer().GetAtomPosition(idx) for idx in atoms]
+                new_val = dihedral_angle(*positions)
 
                 dihedrals[i] = (atoms, new_val)
 
@@ -177,7 +176,7 @@ def to_degrees(dihedrals : list[dihedral]) -> list[dihedral]:
     for cur in dihedrals:
         a, d = cur
         res.append((a, d * 180 / math.pi))
-    print(res)
+    
     return res
 
 def read_xyz(name : str) -> list[str]:
@@ -257,9 +256,10 @@ def wait_for_the_end_of_calc(log_name : str, timeout):
         try: 
             with open(log_name, 'r') as file:
                 log_file = [line for line in file]               
-                if("ORCA TERMINATED NORMALLY" in log_file[-2] or\
+                if "ORCA TERMINATED NORMALLY" in log_file[-2] or\
                         "ORCA finished by error" in log_file[-5] or\
-                        "Error" in log_file[-2]):
+                        "Error" in log_file[-2] or\
+                        "GSTEP" in log_file[-2]:
                     break
         except FileNotFoundError:
             pass
@@ -327,13 +327,13 @@ def calc_energy(
 
     xyz_upd = None
     
+    print('dihedrals before: ', dihedrals)
     if force_xyz_block:
         xyz_upd = force_xyz_block
     else:
         xyz_upd = change_dihedrals(mol_file_name, dihedrals, ik_loss)
 
-    print(dihedrals)
-    print(list(zip(*dihedrals)))
+    print('dihedrals after: ', dihedrals)
 
     if check_is_broken(xyz_upd, BOND_LENGTH_THRESHOLD):
         print(f"Seems that some atoms in current structure is closer then {BOND_LENGTH_THRESHOLD}!")
@@ -344,11 +344,13 @@ def calc_energy(
 
     inp_name = mol_to_inp_name(mol_file_name)
     out_name = inp_to_out_name(inp_name)
+
     if os.path.isfile(out_name):
         os.system("rm -r " + out_name)
     generate_default_oinp(xyz_upd, dihedrals, inp_name, constrained_opt=constrained_opt)
     start_calc(inp_name)
     wait_for_the_end_of_calc(out_name, 1000)
+    
     res, opt_status = find_energy_in_log(out_name) 
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     print(f"opt status in calc_energy is {opt_status}")

@@ -4,12 +4,15 @@ from typing import List, Tuple, Callable#, Self
 
 from calc import dihedral_angle, HARTRI_TO_KCAL
 
+def parse_energy_from_xyz_2nd_line(s):
+    return float(s.split()[-1]) #*HARTRI_TO_KCAL
+
 class EnsembleProcessor:
     def __init__(
         self,
         ensemble_filename : str,
         dihedral_idxs : List[List[int]],
-        parse_energy_from_xyz_2nd_line : Callable[[str], float] = lambda s: float(s.split()[-1])*HARTRI_TO_KCAL
+        parse_energy_from_xyz_2nd_line : Callable[[str], float] = parse_energy_from_xyz_2nd_line
     ) -> None:
         """
             Processes .xyz ensemble to list of torsion angle values
@@ -27,17 +30,20 @@ class EnsembleProcessor:
 
         try:
             with open(ensemble_filename, 'r') as file:
-                current_block = ""
-                for idx, line in enumerate(file):
-                    if len(line.split()) == 1 and idx > 0:
-                        xyz_blocks.append(current_block)
-                        current_block = ""
-                    current_block += line
-                xyz_blocks.append(current_block)
+                lines = [l.rstrip('\n') for l in file]
+                
+            i = 0
+            nlines = len(lines)
+            while i < nlines:
+                n_atoms = int(lines[i])
+                block = lines[i : i + 2 + n_atoms]
+                xyz_blocks.append("\n".join(block))
+                i += 2 + n_atoms
+                
         except FileNotFoundError:
             print(f"Error! No such file: {ensemble_filename}; Finishing with empty ensemble!")
             return
-
+        
         self.energies = [parse_energy_from_xyz_2nd_line(xyz_block.split('\n')[1]) for xyz_block in xyz_blocks]
 
         for raw_xyz in xyz_blocks:

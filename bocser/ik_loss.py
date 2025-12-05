@@ -7,6 +7,8 @@ import math
 import tempfile
 import typing
 
+from calc import dihedral_angle
+
 T = typing.TypeVar('T')
 
 class CyclicCollection(typing.Generic[T]):
@@ -31,11 +33,14 @@ class IKLoss:
         self,
         bond_lengths: list[list[float]],
         valence_angles: list[list[float]],
+        dihedral_angles: list[list[float]],
         bond_lengths_dicts,
         valence_angles_dicts,
+        dihedral_angles_dicts
     ):
         self.bond_lengths = bond_lengths_dicts
         self.valence_angles = valence_angles_dicts
+        self.dihedral_angles = dihedral_angles_dicts
 
         self.D_matrices = [
             tf.stack([self.D_matrix(d) for d in cycle_lengths])
@@ -45,6 +50,11 @@ class IKLoss:
         self.V_matrices = [
             tf.stack([self.V_matrix(a) for a in cycle_angles])
             for cycle_angles in valence_angles
+        ]
+        
+        self.T_matrices = [
+            tf.stack([self.T_matrix(da) for da in cycle_dihedrals])
+            for cycle_dihedrals in dihedral_angles
         ]
 
     @classmethod
@@ -58,8 +68,11 @@ class IKLoss:
 
         bond_lengths = []
         valence_angles = []
+        dihedral_angles = []
+        
         bond_lengths_dicts = []
         valence_angles_dicts = []
+        dihedral_angles_dicts = []
 
         for ring_atoms_list in all_ring_atoms:
             ring_atoms = CyclicCollection(ring_atoms_list)
@@ -72,9 +85,15 @@ class IKLoss:
                 np.deg2rad(conf.v(*xx(ring_atoms[i] for i in (k - 1, k, k + 1))))
                 for k in range(len(ring_atoms))
             ]
+            da = [
+                dihedral_angle(*(mol.GetConformer().GetAtomPosition(ring_atoms[i]) 
+                for i in (k - 1, k, k + 1, k + 2)))
+                for k in range(len(ring_atoms))
+            ]
 
             bond_lengths.append(bl)
             valence_angles.append(va)
+            dihedral_angles.append(da)
 
             bond_lengths_dicts.append({
                 tuple(ring_atoms[k] for k in (i, i + 1)): v
@@ -84,8 +103,12 @@ class IKLoss:
                 tuple(ring_atoms[k] for k in (i - 1, i, i + 1)): v
                 for i, v in enumerate(va)
             })
+            dihedral_angles_dicts.append({
+                tuple(ring_atoms[k] for k in (i - 1, i, i + 1, i + 2)): v
+                for i, v in enumerate(da)
+            })
 
-        return cls(bond_lengths, valence_angles, bond_lengths_dicts, valence_angles_dicts)
+        return cls(bond_lengths, valence_angles, dihedral_angles, bond_lengths_dicts, valence_angles_dicts, dihedral_angles_dicts)
 
     @staticmethod
     def D_matrix(d):
@@ -113,31 +136,69 @@ class IKLoss:
 
     @staticmethod
     def T_matrix(a):
-        rotation_matrix = tf.stack([
-            [tf.cos(a), -tf.sin(a)],
-            [tf.sin(a), tf.cos(a)],
-        ])
-        return tf.linalg.LinearOperatorBlockDiag([
-            tf.linalg.LinearOperatorFullMatrix(
-                tf.ones([tf.shape(a)[0], 1, 1], dtype=tf.float64)),
-            tf.linalg.LinearOperatorFullMatrix(
-                tf.transpose(rotation_matrix, [2, 0, 1])),
-            tf.linalg.LinearOperatorFullMatrix(
-                tf.ones([tf.shape(a)[0], 1, 1], dtype=tf.float64)),
-        ]).to_dense()
+        a = tf.convert_to_tensor(a, dtype=tf.float64)
+        a = a.reshape(-1, 1)
+        
+        batch_size = tf.shape(a)[0]
+        
+        cos_a = tf.cos(a)
+        sin_a = tf.sin(a)
+        zeros = tf.zeros_like(a)
+        ones = tf.ones_like(a)
+        
+        row1 = tf.stack([ones, zeros, zeros, zeros], axis=1)
+        row2 = tf.stack([zeros, cos_a, -sin_a, zeros], axis=1)
+        row3 = tf.stack([zeros, sin_a, cos_a, zeros], axis=1)
+        row4 = tf.stack([zeros, zeros, zeros, ones], axis=1)
+        
+        return tf.squeeze(tf.stack([row1, row2, row3, row4], axis=1))
 
-    def __call__(self, dihedrals_list):
+    def build_T_matrices(self, angles_list):
+        result = []
+        
+        for i, angles in enumerate(angles_list):
+            n, l = tf.shape(angles)[0], tf.shape(angles)[1]
+            
+            result_columns = []
+            
+            for j in range(l):
+                column_angles = angles[:, j]
+                column_has_nan = tf.math.is_nan(column_angles)
+                
+                if tf.reduce_all(column_has_nan):
+                    T_col = tf.expand_dims(self.T_matrices[i][j], 0)
+                    T_col = tf.tile(T_col, [n, 1, 1])
+                else:
+                    T_col = self.T_matrix(column_angles)
+                
+                result_columns.append(tf.expand_dims(T_col, 1))
+            
+            result.append(tf.concat(result_columns, axis=1))
+            
+        return result
+    
+    @staticmethod
+    def compute_total_motions(V, D, T):
+        V = V[None, ...]
+        D = D[None, ...]
+
+        S = V @ D @ T
+        S = tf.transpose(S, [1, 0, 2, 3])
+        
+        def step(prev, cur):
+            return prev @ cur
+
+        total = tf.scan(fn=step, elems=S)
+
+        return total[-1]
+    
+    def __call__(self, dihedrals):
+        T_matrices = self.build_T_matrices(dihedrals)
+        
         total_loss = 0
-        for dihedrals, V, D in zip(dihedrals_list, self.V_matrices, self.D_matrices):
-            total_motions = tf.map_fn(
-                fn=lambda dihedral: tf.scan(
-                    fn=tf.matmul,
-                    elems=tf.map_fn(
-                        fn=lambda x: x[0, :, :] @ x[1, :, :] @ x[2, :, :],
-                        elems=tf.stack([V, D, self.T_matrix(dihedral)], axis=1),
-                    ),
-                )[-1],
-                elems=dihedrals,
+        for i in range(len(dihedrals)):            
+            total_motions = self.compute_total_motions(
+                self.V_matrices[i], self.D_matrices[i], T_matrices[i]
             )
 
             ik_loss = tf.map_fn(

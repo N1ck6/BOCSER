@@ -141,8 +141,8 @@ class CoefCalculator:
             angels, where on one atom there are three equal terminal atoms,
             are not interesting
         """
-        if bond.IsInRing():
-            return self.af == 'ik'
+        if bond.IsInRing() and self.af != 'ik':
+            return False
 
         #If one of atoms is terminal
         if self.is_terminal_bond(bond):
@@ -203,8 +203,7 @@ class CoefCalculator:
         """
             Returns idxs of dihedral angel in correct order
         """
-
-        for bond in mol.GetBonds():
+        for bond in Chem.RemoveAllHs(mol).GetBonds():
 
             if self.is_terminal_bond(bond):
                 continue
@@ -256,7 +255,7 @@ class CoefCalculator:
                             found = True
                             break
                     if not found:
-                        raise ValueError(f"Can't match dihedral {d} to any fragment")
+                        dihedral_idxs.append(None)
 
                 all_dihedrals.append(dihedrals)
                 all_dihedral_idxs.append(dihedral_idxs)
@@ -329,7 +328,13 @@ class CoefCalculator:
             for atom in [*bond.GetBeginAtom().GetNeighbors(),\
                          *bond.GetEndAtom().GetNeighbors()]:
                 atoms_to_use.add(atom.GetIdx())
-            print(atoms_to_use)
+                
+            # TODO: fused rings
+            if self.af == 'ik':
+                ring_idxs = set([idx for idx in atoms_to_use if self.mol.GetAtomWithIdx(idx).IsInRing()])
+                if len(ring_idxs) >= 4:
+                    atoms_to_use = ring_idxs                
+            
             if self.skip_triple_equal_terminal_atoms and\
                self.is_triple_eq_neighbors(atom):
                 atoms_to_use.update([cur.GetIdx() for cur in atom.GetNeighbors()])
@@ -353,7 +358,7 @@ class CoefCalculator:
             )
 
             print(f"rot_frag_smiles: {rotable_frag_smiles}\nidxs_to_rotate: {self.get_idxs_to_rotate(rotable_frags[-1])}")
-
+            
             query_result = self.mol.GetSubstructMatches(
                 Chem.MolFromSmiles(
                     self._sanitize_smiles(

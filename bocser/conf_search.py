@@ -332,7 +332,9 @@ try:
 except Exception as e:
     ik_loss = None
     ik_loss_dihedrals_idxs = []
-    print(f"Failed to prepare IK loss: {e}")
+    print(f"Failed to prepare IK loss")
+    
+    raise e
 
 search_dim = len(DIHEDRAL_IDS)
 
