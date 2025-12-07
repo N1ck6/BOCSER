@@ -13,7 +13,6 @@ class ConfSearchConfig:
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7
     ts : bool = False
-    # ORCA monitoring defaults
     orca_poll_timeout_seconds: int = 3600
     orca_poll_interval_ms: int = 1000
     sbatch_template_name: str = "sbatch_temp"
@@ -25,12 +24,3 @@ class ConfSearchConfig:
     exp_name : str = "cs"
     load_ensemble : Union[str, None] = None
     acquisition_function : str = "iv"
-        
-#ORCA_EXEC_COMMAND = "/opt/orca5/orca"
-#DEFAULT_NUM_OF_PROCS = 8
-#DEFAULT_METHOD = "RHF/STO-3G"
-#DEFAULT_ORCA_METHOD = "r2SCAN-3c TightSCF"
-#DEFAULT_ORCA_METHOD = "M062X 6-31+G(d) CPCM(water)"
-#DEFAULT_CHARGE = 0
-#DEFAULT_MULTIPL = 1
-#ts = False 

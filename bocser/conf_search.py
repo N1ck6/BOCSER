@@ -548,7 +548,8 @@ class ConfSearchRunner:
             logger.debug("After step: %s", self.state.last_opt_ok)
 
             last_opt_status = None
-            with open(self.state.exp_name + "_last_opt_status.json", "r") as file:
+            status_file = Path(self.state.working_folder) / f"{self.state.exp_name}_last_opt_status.json"
+            with open(status_file, "r") as file:
                 last_opt_status = json.load(file)
             logger.debug("Last opt status: %s", last_opt_status)
 
@@ -564,7 +565,8 @@ class ConfSearchRunner:
                 "norm_en": self.state.norm_energy,
             }
 
-            with open(f"{self.state.exp_name}_logs.json", "w") as file:
+            logs_file = Path(self.state.working_folder) / f"{self.state.exp_name}_logs.json"
+            with open(logs_file, "w") as file:
                 json.dump(logs, file)
 
             logger.debug("Eta is %s", getattr(rule._acquisition_function, "_eta", None))
@@ -588,7 +590,8 @@ class ConfSearchRunner:
 
             logger.info("Step %s completed! Current dataset is: %s", step, dataset)
 
-            with open(f"{self.state.exp_name}_all_minima.json", "w") as json_minima_writer:
+            all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
+            with open(all_minima_file, "w") as json_minima_writer:
                 json.dump(self.state.minima, json_minima_writer)
 
             if step < config.rolling_window_size:
@@ -647,10 +650,7 @@ class ConfSearchRunner:
             if self.state.minima[i][1] < res[cluster_id][0]:
                 res[cluster_id] = self.state.minima[i][1], i
 
-        clustering_file = os.path.join(
-            self.state.working_folder,
-            f"{self.state.exp_name}_clustering_results.json"
-        )
+        clustering_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_clustering_results.json")
         logger.info(
             "Results of clustering: %s. There are relative energy and number of structure for each cluster. Saved in %s",
             res,
@@ -658,19 +658,12 @@ class ConfSearchRunner:
         )
         json.dump(res, open(clustering_file, "w"))
 
-        final_ensemble_file = os.path.join(
-            self.state.working_folder,
-            f"{self.state.exp_name}_final_ensemble.xyz"
-        )
+        final_ensemble_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_final_ensemble.xyz")
         logger.info("Saving final ensemble into %s", final_ensemble_file)
         ens_xyz_str = ""
         for _, structure_id in res.values():
             cur_xyz = ""
-            minima_file = os.path.join(
-                self.state.working_folder,
-                self.state.exp_name + "_minima",
-                f"{structure_id}.xyz"
-            )
+            minima_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_minima" / f"{structure_id}.xyz")
             with open(minima_file, "r") as cur_xyz_reader:
                 cur_xyz = "".join([line for line in cur_xyz_reader])
             ens_xyz_str += cur_xyz + "\n"
@@ -678,10 +671,7 @@ class ConfSearchRunner:
         with open(final_ensemble_file, "w") as ens_writer:
             ens_writer.write(ens_xyz_str)
 
-        all_points_file = os.path.join(
-            self.state.working_folder,
-            f"{self.state.exp_name}_all_points.json"
-        )
+        all_points_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_all_points.json")
         logger.info("Saving all points at %s", all_points_file)
         json.dump(
             {"query_points": query_points.tolist(), "observations": observations.tolist()},

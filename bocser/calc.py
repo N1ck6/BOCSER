@@ -289,12 +289,12 @@ def wait_for_the_end_of_calc(log_name: str, poll_interval_ms: int | None = None,
 
         try:
             with open(log_name, "r", errors="ignore") as fh:
-                last_lines = deque(fh, maxlen=200)
+                last_lines = deque(fh, maxlen=3)
                 joined = "\n".join(last_lines)
 
                 if "ORCA TERMINATED NORMALLY" in joined:
                     return True
-                if "ORCA finished by error" in joined or "Error" in joined or "GSTEP" in joined:
+                if "ORCA finished by error" in joined or "GSTEP" in joined:
                     return False
         except FileNotFoundError:
             # File may not yet exist; continue polling until timeout
