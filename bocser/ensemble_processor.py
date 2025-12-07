@@ -3,6 +3,8 @@ import tensorflow as tf
 from typing import List, Tuple, Callable#, Self
 
 from calc import dihedral_angle
+import logging
+logger = logging.getLogger(__name__)
 
 def parse_energy_from_xyz_2nd_line(s):
     return float(s.split()[-1]) #*HARTRI_TO_KCAL
@@ -26,6 +28,7 @@ class EnsembleProcessor:
                     to the 2nd line of .xyz file and return Energy in kcal/mol
         """
         self.processed_ens = []
+        self.energies: list[float] = []
         xyz_blocks = []
 
         try:
@@ -41,7 +44,10 @@ class EnsembleProcessor:
                 i += 2 + n_atoms
                 
         except FileNotFoundError:
-            print(f"Error! No such file: {ensemble_filename}; Finishing with empty ensemble!")
+            logger.error("Error! No such file: %s; Finishing with empty ensemble!", ensemble_filename)
+            # Keep object in a valid state with empty data so callers can continue.
+            self.processed_ens = []
+            self.energies = []
             return
         
         self.energies = [parse_energy_from_xyz_2nd_line(xyz_block.split('\n')[1]) for xyz_block in xyz_blocks]

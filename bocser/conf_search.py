@@ -29,9 +29,9 @@ from calc import (
     calc_energy,
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
-    increase_structure_id,
-    set_config,
 )
+from run_state import increase_structure_id
+import config_manager
 from coef_calc import CoefCalculator
 from db_connector import LocalConnector
 from ensemble_processor import EnsembleProcessor
@@ -45,6 +45,9 @@ from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
 tf.config.run_functions_eagerly(True)
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class PotentialFunction:
@@ -123,9 +126,9 @@ class ConfSearchRunner:
         # Set database file path
         if db_file is None:
             # Default: one directory up from bocser folder
-            bocser_dir = os.path.dirname(os.path.abspath(__file__))
-            parent_dir = os.path.dirname(bocser_dir)
-            db_file = os.path.join(parent_dir, "dihedral_logs.db")
+            bocser_dir = Path(__file__).resolve().parent
+            parent_dir = bocser_dir.parent
+            db_file = str(parent_dir / "dihedral_logs.db")
         
         self.state.db_file = db_file
         
@@ -135,23 +138,20 @@ class ConfSearchRunner:
     def _dump_status_hook(self, dumping_value: bool, filename: Optional[str] = None) -> None:
         """Save optimization status to JSON file."""
         if filename is None:
-            filename = os.path.join(
-                self.state.working_folder,
-                self.state.exp_name + "_last_opt_status.json"
-            )
-        with open(filename, "w") as file:
-            json.dump({"LAST_OPT_OK": dumping_value}, file)
+            filename = Path(self.state.working_folder) / f"{self.state.exp_name}_last_opt_status.json"
+        filename = Path(filename)
+        filename.write_text(json.dumps({"LAST_OPT_OK": dumping_value}))
 
     def _calc_point(self, dihedrals: list[float]) -> float:
         """Performs energy calculation for given dihedral angles."""
 
         if self.state.model_chk:
-            print("Checkpoint is not null, calculating previous acq. func. max!")
+            logger.info("Checkpoint is not null, calculating previous acq. func. max!")
             dihedrals_tf = tf.constant(dihedrals, dtype=tf.float64)
             if len(dihedrals_tf.shape) == 1:
                 dihedrals_tf = tf.reshape(dihedrals_tf, [1, dihedrals_tf.shape[0]])
-            print(f"Cur dihedrals_tf: {dihedrals_tf}")
-            print(f"Current minima: {self.state.current_minima}")
+            logger.debug("Cur dihedrals_tf: %s", dihedrals_tf)
+            logger.debug("Current minima: %s", self.state.current_minima)
             mean, variance = self.state.model_chk.predict_f(dihedrals_tf)
             normal = tfp.distributions.Normal(mean, tf.sqrt(variance))
             tau = self.state.current_minima + 3.0
@@ -170,10 +170,10 @@ class ConfSearchRunner:
 
         self.state.asked_points.append(dihedrals)
 
-        print(f"Point: {dihedrals}")
+        logger.debug("Point: %s", dihedrals)
 
         # Pre-opt
-        print("Optimizing constrained struct")
+        logger.info("Optimizing constrained struct")
         en, preopt_status = calc_energy(
             self.state.mol_file_name,
             list(zip(self.state.dihedral_ids, dihedrals)),
@@ -183,16 +183,15 @@ class ConfSearchRunner:
             ik_loss=self.state.ik_loss,
         )
         self.state.last_opt_ok = preopt_status
-        print(f"Status of preopt: {preopt_status}; LAST_OPT_OK: {self.state.last_opt_ok}")
+        logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
         if not preopt_status:
             self._dump_status_hook(dumping_value=self.state.last_opt_ok)
             skipped_structure_id = increase_structure_id()
-            print(f"Preopt finished with error! Structure with number {skipped_structure_id} will be skipped!")
+            logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
             return en + np.random.randn()
-
-        print("Optimized!\nLoading xyz from preopt")
+        logger.info("Optimized! Loading xyz from preopt")
         xyz_from_constrained = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
-        print("Loaded!\nFull opt")
+        logger.info("Loaded! Full opt")
         en, opt_status = calc_energy(
             self.state.mol_file_name,
             list(zip(self.state.dihedral_ids, dihedrals)),
@@ -202,13 +201,13 @@ class ConfSearchRunner:
             ik_loss=self.state.ik_loss,
         )
         self.state.last_opt_ok = opt_status
-        print(f"Status of opt: {opt_status}; LAST_OPT_OK: {self.state.last_opt_ok}")
-        print(f"Optimized! En = {en}")
+        logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
+        logger.info("Optimized! En = %s", en)
         self._dump_status_hook(dumping_value=self.state.last_opt_ok)
 
         if not opt_status:
             skipped_structure_id = increase_structure_id()
-            print(f"Opt finished with error! Structure with number {skipped_structure_id} will be skipped!")
+            logger.error("Opt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
 
         return en + ((not opt_status) * np.random.randn())
 
@@ -233,7 +232,7 @@ class ConfSearchRunner:
 
     def _upd_dataset_from_trj(self, trj_filename: str, dataset: Optional[Dataset]) -> Dataset:
         """Update dataset by parsing trajectory file."""
-        print(f"Input dataset is: {dataset}")
+        logger.debug("Input dataset is: %s", dataset)
         parsed_data, last_point = parse_points_from_trj(
             trj_file_name=trj_filename,
             dihedrals=self.state.dihedral_ids,
@@ -252,9 +251,9 @@ class ConfSearchRunner:
 
         self.state.minima.append((last_point["coords"], last_point["rel_en"]))
 
-        print(f"Parsed data: {parsed_data}")
+        logger.debug("Parsed data: %s", parsed_data)
         degrees, energies = zip(*parsed_data)
-        print(f"Degrees: {degrees}\nEnergies: {energies}")
+        logger.debug("Degrees: %s\nEnergies: %s", degrees, energies)
 
         self.state.global_degrees.extend(degrees)
 
@@ -288,7 +287,7 @@ class ConfSearchRunner:
         Args:
             config_path: Path to config file. Can be relative to working_folder or absolute.
         """
-        from config_loader import load_config, ConfigError
+        from config_manager import load_config, ConfigError
 
         # If config_path is relative, look in working_folder
         if not os.path.isabs(config_path):
@@ -297,13 +296,13 @@ class ConfSearchRunner:
         try:
             config = load_config(config_path)
         except FileNotFoundError:
-            print(f"No config file {config_path}!\nFinishing!")
+            logger.error("No config file %s! Finishing!", config_path)
             raise
         except ConfigError as e:
-            print(f"Config error: {e}\nFinishing!")
+            logger.error("Config error: %s. Finishing!", e)
             raise
         except Exception:
-            print("Something went wrong while loading config!\nFinishing!")
+            logger.exception("Something went wrong while loading config! Finishing!")
             raise
 
         self.state.config = config
@@ -315,58 +314,53 @@ class ConfSearchRunner:
 
         config = self.state.config
 
-        print(f"Performing conf. search with config: {config}")
+        logger.info("Performing conf. search with config: %s", config)
 
-        # Propagate configuration to modules and internal state
-        set_config(config)
+        # Propagate configuration to central config manager and internal state
+        config_manager.set_config(config)
         
         # Use mol_file_name from config, resolving relative paths to working_folder
-        mol_file = config.mol_file_name
-        if not os.path.isabs(mol_file):
-            mol_file = os.path.join(self.state.working_folder, mol_file)
-        self.state.mol_file_name = mol_file
-        
-        self.state.structures_path = os.path.join(
-            self.state.working_folder,
-            config.exp_name + "/"
-        )
-        self.state.exp_name = config.exp_name
+        mol_file = Path(config.mol_file_name)
+        if not mol_file.is_absolute():
+            mol_file = Path(self.state.working_folder) / mol_file
+        self.state.mol_file_name = str(mol_file)
 
-        if not os.path.exists(self.state.structures_path):
-            os.makedirs(self.state.structures_path)
-            minima_path = os.path.join(self.state.working_folder, config.exp_name + "_minima/")
-            os.makedirs(minima_path)
+        self.state.exp_name = config.exp_name
+        self.state.structures_path = str(Path(self.state.working_folder) / f"{config.exp_name}/")
+
+        Path(self.state.structures_path).mkdir(parents=True, exist_ok=True)
+        minima_path = Path(self.state.working_folder) / f"{config.exp_name}_minima/"
+        minima_path.mkdir(parents=True, exist_ok=True)
 
         if config.acquisition_function not in {"ei", "evm", "ik"}:
-            print(
-                f"Acquisition function should be one of the following: 'ei', 'evm', 'ik'; "
-                f"got {config.acquisition_function}; Continue with default: 'evm'"
+            logger.warning(
+                "Acquisition function should be one of the following: 'ei', 'evm', 'ik'; got %s; Continue with default: 'evm'",
+                config.acquisition_function,
             )
             config.acquisition_function = "evm"
 
-        print("Coef calculator creating")
+        logger.info("Coef calculator creating")
 
         self.state.mol = Chem.RemoveHs(Chem.MolFromMolFile(self.state.mol_file_name))
         
-        scans_dir = os.path.join(self.state.working_folder, f"{self.state.exp_name}_scans/")
-        db_file = os.path.join(self.state.working_folder, "dihedral_logs.db")
+        scans_dir = str(Path(self.state.working_folder) / f"{self.state.exp_name}_scans/")
         
         coef_calc = CoefCalculator(
             mol=self.state.mol,
             config=config,
             dir_for_inps=scans_dir,
-            db_connector=LocalConnector(db_file),
+            db_connector=LocalConnector(self.state.db_file),
         )
         coef_matrix = coef_calc.coef_matrix()
 
-        print("Coef calculator created!")
+        logger.info("Coef calculator created!")
 
         for ids, coefs in coef_matrix:
             self.state.dihedral_ids.append(ids)
             self.state.mean_func_coefs.append(coefs)
 
-        print("Dihedral ids", self.state.dihedral_ids)
-        print("Mean func coefs", self.state.mean_func_coefs)
+        logger.info("Dihedral ids: %s", self.state.dihedral_ids)
+        logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
 
         try:
             dihedral_list_all, ring_atoms_list, ik_loss_dihedrals_idxs = coef_calc.get_ring_dihedrals(
@@ -375,19 +369,19 @@ class ConfSearchRunner:
             if ik_loss_dihedrals_idxs:
                 self.state.ik_loss = IKLoss.from_rdkit(self.state.mol, ring_atoms_list)
                 self.state.ik_loss_dihedrals_idxs = ik_loss_dihedrals_idxs
-                print(f"IK loss prepared. IK dihedral indices: {ik_loss_dihedrals_idxs}")
+                logger.info("IK loss prepared. IK dihedral indices: %s", ik_loss_dihedrals_idxs)
             else:
                 self.state.ik_loss = None
                 self.state.ik_loss_dihedrals_idxs = []
-                print("No ring dihedrals detected; IK acquisition will be unavailable.")
+                logger.warning("No ring dihedrals detected; IK acquisition will be unavailable.")
         except Exception as e:
             self.state.ik_loss = None
             self.state.ik_loss_dihedrals_idxs = []
-            print("Failed to prepare IK loss")
+            logger.exception("Failed to prepare IK loss")
             raise e
 
         self.state.search_dim = len(self.state.dihedral_ids)
-        print("Cur search dim is", self.state.search_dim)
+        logger.info("Cur search dim is %s", self.state.search_dim)
 
     def _build_model_and_acquisition(self) -> Tuple[Any, Any, Any]:
         """Build GPR model, BO optimizer, and acquisition rule."""
@@ -429,7 +423,7 @@ class ConfSearchRunner:
         self.state.norm_energy, _ = calc_energy(
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss
         )
-        print(f"Norm energy: {self.state.norm_energy}")
+        logger.info("Norm energy: %s", self.state.norm_energy)
 
         observer = trieste.objectives.utils.mk_observer(self._func_objective)
 
@@ -441,33 +435,37 @@ class ConfSearchRunner:
         dataset = None
 
         if config.load_ensemble:
-            print("Loading init points from given ensemble!")
+            load_ensemble_filename = Path(config.load_ensemble)
+            if not load_ensemble_filename.is_absolute():
+                load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
+            load_ensemble_filename = str(load_ensemble_filename)
+            logger.info("Loading init points from given ensemble!")
             dataset = Dataset(
                 *EnsembleProcessor(
-                    config.load_ensemble,
+                    load_ensemble_filename,
                     dihedral_idxs=self.state.dihedral_ids,
                 ).normalize_energy(self.state.norm_energy).get_tf_data()
             )
-            print(f"Init dataset collected!\n{dataset}")
+            logger.info("Init dataset collected! %s", dataset)
         else:
             for idx in range(config.num_initial_points):
                 AllChem.EmbedMolecule(self.state.mol)
                 initial_query_points = self._extract_dofs_values(self.state.mol)
                 observed_point = observer(initial_query_points)
                 if not self.state.last_opt_ok:
-                    print(
-                        f"Optimization didn't finish well. Continue only with broken_struct_energy "
-                        f"in required point: {observed_point}"
+                    logger.warning(
+                        "Optimization didn't finish well. Continue only with broken_struct_energy in required point: %s",
+                        observed_point,
                     )
                     dataset = observed_point if not dataset else dataset + observed_point
                 else:
                     dataset = self._upd_dataset_from_trj(
                         f"{self.state.mol_file_name[:-4]}_trj.xyz", dataset
                     )
-
-            print(
-                f"Initial dataset observed! {config.num_initial_points} minima observed, "
-                f"total {dataset.query_points.shape[0]} points has been collected!"
+            logger.info(
+                "Initial dataset observed! %s minima observed, total %s points has been collected!",
+                config.num_initial_points,
+                dataset.query_points.shape[0],
             )
 
         return dataset
@@ -480,15 +478,15 @@ class ConfSearchRunner:
 
         match config.acquisition_function:
             case "evm":
-                print("Continue with Explorational Variance Minimizer acquisition function!")
+                logger.info("Continue with Explorational Variance Minimizer acquisition function!")
                 rule = EfficientGlobalOptimization(ExplorationalVarianceMinimizer(threshold=3))
             case "ei":
-                print("Continue with ExpectedImprovement acquisition function!")
+                logger.info("Continue with ExpectedImprovement acquisition function!")
                 rule = EfficientGlobalOptimization(ExpectedImprovement())
             case "ik":
-                print("Continue with ImprovementVarianceWithIK acquisition function!")
+                logger.info("Continue with ImprovementVarianceWithIK acquisition function!")
                 if self.state.ik_loss is None or len(self.state.ik_loss_dihedrals_idxs) == 0:
-                    print("IK loss is not available; falling back to ExplorationalVarianceMinimizer")
+                    logger.warning("IK loss is not available; falling back to ExplorationalVarianceMinimizer")
                     rule = EfficientGlobalOptimization(ExplorationalVarianceMinimizer(threshold=3))
                 else:
                     rule = EfficientGlobalOptimization(
@@ -519,7 +517,7 @@ class ConfSearchRunner:
 
         bo = trieste.bayesian_optimizer.BayesianOptimizer(observer, search_space)
 
-        print(f"Initial data:\n{dataset}")
+        logger.debug("Initial data: %s", dataset)
 
         model.optimize(dataset)
 
@@ -531,29 +529,32 @@ class ConfSearchRunner:
         deepest_minima = []
         early_termination_flag = False
 
-        print(f"MINIMA: {self.state.minima}")
+        logger.info("MINIMA: %s", self.state.minima)
 
         for step in range(1, config.max_steps + 1):
-            print(f"Previous last_opt_ok: {self.state.last_opt_ok}")
-            print(f"Step number {step}")
+            logger.debug("Previous last_opt_ok: %s", self.state.last_opt_ok)
+            logger.debug("Step number %s", step)
 
             try:
                 result = bo.optimize(1, dataset, model, rule, fit_initial_model=False)
-                print(f"Optimization step {step} succeed!")
+                logger.info("Optimization step %s succeed!", step)
             except Exception:
-                print("Optimization failed")
-                print(result.astuple()[1][-1].dataset)
+                logger.warning("Optimization failed")
+                try:
+                    logger.debug("Optimization result dataset: %s", result.astuple()[1][-1].dataset)
+                except Exception:
+                    logger.debug("No optimization result dataset available")
 
-            print(f"After step: {self.state.last_opt_ok}")
+            logger.debug("After step: %s", self.state.last_opt_ok)
 
             last_opt_status = None
             with open(self.state.exp_name + "_last_opt_status.json", "r") as file:
                 last_opt_status = json.load(file)
-            print(last_opt_status)
+            logger.debug("Last opt status: %s", last_opt_status)
 
             dataset = result.try_get_final_dataset()
             model = result.try_get_final_model()
-            print(f"Last asked point was {self.state.asked_points[-1]}")
+            logger.debug("Last asked point was %s", self.state.asked_points[-1])
 
             deepest_minima.append(tf.reduce_min(dataset.observations).numpy())
 
@@ -566,25 +567,26 @@ class ConfSearchRunner:
             with open(f"{self.state.exp_name}_logs.json", "w") as file:
                 json.dump(logs, file)
 
-            print(f"Eta is {rule._acquisition_function._eta}")
+            logger.debug("Eta is %s", getattr(rule._acquisition_function, "_eta", None))
             if self.state.last_opt_ok:
                 dataset = self._erase_last_from_dataset(dataset, 1)
                 dataset = self._upd_dataset_from_trj(
                     f"{self.state.mol_file_name[:-4]}_trj.xyz", dataset
                 )
             else:
-                print("Last optimization finished with error, skipping trj parsing!")
+                logger.warning("Last optimization finished with error, skipping trj parsing!")
             model.update(dataset)
             model.optimize(dataset)
 
-            print("Updating model checkpoint!")
+            logger.info("Updating model checkpoint!")
             self.state.model_chk = gpflow.utilities.deepcopy(model.model)
-            self.state.current_minima = rule._acquisition_function._eta.numpy()[0]
-            print("Updated!")
+            try:
+                self.state.current_minima = rule._acquisition_function._eta.numpy()[0]
+            except Exception:
+                logger.debug("Unable to read current minima from acquisition function" )
+            logger.info("Updated!")
 
-            print(
-                f"Step {step} completed! Current dataset is:" + f"\n{dataset}"
-            )
+            logger.info("Step %s completed! Current dataset is: %s", step, dataset)
 
             with open(f"{self.state.exp_name}_all_minima.json", "w") as json_minima_writer:
                 json.dump(self.state.minima, json_minima_writer)
@@ -592,10 +594,8 @@ class ConfSearchRunner:
             if step < config.rolling_window_size:
                 continue
 
-            print("Checking termination criterion!")
-            print(
-                f"Acq vals in window: {logs['acq_vals'][max(0, step - config.rolling_window_size) : step]}"
-            )
+            logger.debug("Checking termination criterion!")
+            logger.debug("Acq vals in window: %s", logs['acq_vals'][max(0, step - config.rolling_window_size) : step])
 
             rolling_mean = np.mean(
                 logs["acq_vals"][max(0, step - config.rolling_window_size) : step]
@@ -604,28 +604,30 @@ class ConfSearchRunner:
                 logs["acq_vals"][max(0, step - config.rolling_window_size) : step]
             )
 
-            print(f"After step {step}:")
-            print(
-                f"Current rolling mean of acquisition function maximum is: {rolling_mean}, "
-                f"threshold is {config.rolling_mean_threshold}"
+            logger.debug("After step %s:", step)
+            logger.info(
+                "Current rolling mean of acquisition function maximum is: %s, threshold is %s",
+                rolling_mean,
+                config.rolling_mean_threshold,
             )
-            print(
-                f"Current rolling std of acquisition function maximum is: {rolling_std}, "
-                f"threshold is {config.rolling_std_threshold}"
+            logger.info(
+                "Current rolling std of acquisition function maximum is: %s, threshold is %s",
+                rolling_std,
+                config.rolling_std_threshold,
             )
             if (
                 step >= config.rolling_window_size
                 and rolling_std < config.rolling_std_threshold
                 and rolling_mean < config.rolling_mean_threshold
             ):
-                print(f"Termination criterion reached on step {step}! Terminating search!")
+                logger.info("Termination criterion reached on step %s! Terminating search!", step)
                 early_termination_flag = True
                 break
 
         if not early_termination_flag:
-            print("Max number of steps has been reached!")
+            logger.info("Max number of steps has been reached!")
 
-        print(f"MINIMA: {self.state.minima}")
+        logger.info("MINIMA: %s", self.state.minima)
         self._save_results(dataset)
 
     def _save_results(self, dataset: Dataset) -> None:
@@ -649,10 +651,10 @@ class ConfSearchRunner:
             self.state.working_folder,
             f"{self.state.exp_name}_clustering_results.json"
         )
-        print(
-            f"Results of clustering: {res}\n"
-            f"There are relative energy and number of structure for each cluster. "
-            f"Saved in `{clustering_file}`"
+        logger.info(
+            "Results of clustering: %s. There are relative energy and number of structure for each cluster. Saved in %s",
+            res,
+            clustering_file,
         )
         json.dump(res, open(clustering_file, "w"))
 
@@ -660,7 +662,7 @@ class ConfSearchRunner:
             self.state.working_folder,
             f"{self.state.exp_name}_final_ensemble.xyz"
         )
-        print(f"Saving final ensemble into `{final_ensemble_file}`")
+        logger.info("Saving final ensemble into %s", final_ensemble_file)
         ens_xyz_str = ""
         for _, structure_id in res.values():
             cur_xyz = ""
@@ -680,7 +682,7 @@ class ConfSearchRunner:
             self.state.working_folder,
             f"{self.state.exp_name}_all_points.json"
         )
-        print(f"Saving all points at `{all_points_file}`")
+        logger.info("Saving all points at %s", all_points_file)
         json.dump(
             {"query_points": query_points.tolist(), "observations": observations.tolist()},
             open(all_points_file, "w"),
@@ -708,15 +710,15 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Working folder: {args.folder}")
-    print(f"Reading config from: {args.config}")
+    logger.info("Working folder: %s", args.folder)
+    logger.info("Reading config from: %s", args.config)
 
     runner = ConfSearchRunner(working_folder=args.folder)
     runner.load_config(args.config)
     runner.setup()
     runner.run()
 
-    print("Conformational search completed!")
+    logger.info("Conformational search completed!")
 
 
 if __name__ == "__main__":

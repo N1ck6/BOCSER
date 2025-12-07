@@ -55,7 +55,7 @@ class TestLoadConfig:
         with pytest.raises(ConfigError):
             load_config(str(config_path))
 
-    def test_unknown_config_key_warns(self, temp_dir, capsys):
+    def test_unknown_config_key_warns(self, temp_dir, caplog):
         """Test that unknown keys trigger a warning but don't fail."""
         config_path = temp_dir / "config_with_unknown.yaml"
         config_data = {
@@ -64,11 +64,11 @@ class TestLoadConfig:
         }
         with open(config_path, "w") as f:
             yaml.dump(config_data, f)
-
-        config = load_config(str(config_path))
+        import logging
+        with caplog.at_level(logging.WARNING):
+            config = load_config(str(config_path))
         assert config.mol_file_name == "test.mol"
-        captured = capsys.readouterr()
-        assert "unknown_key" in captured.out
+        assert "unknown_key" in caplog.text
 
     def test_type_coercion_bool_true(self, temp_dir):
         """Test type coercion for boolean values."""

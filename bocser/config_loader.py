@@ -10,6 +10,8 @@ from typing import Any, Dict
 import yaml
 
 from default_vals import ConfSearchConfig
+import logging
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -59,7 +61,7 @@ def load_config(path: str) -> ConfSearchConfig:
     for k, v in raw.items():
         if k not in valid_fields:
             # don't fail hard on unknown keys, just warn
-            print(f"Warning: unknown config key '{k}' - ignoring")
+            logger.warning("Unknown config key '%s' - ignoring", k)
             continue
         target_type = valid_fields[k]
         try:

@@ -13,6 +13,10 @@ class ConfSearchConfig:
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7
     ts : bool = False
+    # ORCA monitoring defaults
+    orca_poll_timeout_seconds: int = 3600
+    orca_poll_interval_ms: int = 1000
+    sbatch_template_name: str = "sbatch_temp"
     rolling_window_size : int = 5
     rolling_std_threshold : float = 0.15
     rolling_mean_threshold : float = 1.

@@ -12,9 +12,9 @@ from calc import (
     inp_to_out_name,
     check_is_broken,
     increase_structure_id,
-    set_config,
 )
 from default_vals import ConfSearchConfig
+import config_manager
 
 
 class TestDihedralAngle:
@@ -199,38 +199,36 @@ class TestStructureId:
 
 class TestSetConfig:
     """Tests for the set_config function."""
-
-    def test_set_config_updates_globals(self, sample_config):
-        """Test that set_config updates module-level globals."""
-        import calc
-
-        set_config(sample_config)
-
-        assert calc.ORCA_EXEC_COMMAND == sample_config.orca_exec_command
-        assert calc.NUM_OF_PROCS == sample_config.num_of_procs
-        assert calc.ORCA_METHOD == sample_config.orca_method
-        assert calc.CHARGE == sample_config.charge
-        assert calc.MULTIPL == sample_config.spin_multiplicity
-        assert calc.TS == sample_config.ts
-        assert calc.BROKEN_STRUCT_ENERGY == sample_config.broken_struct_energy
-        assert calc.BOND_LENGTH_THRESHOLD == sample_config.bond_length_threshold
-        assert calc.ACQUISITION_FUNCTION == sample_config.acquisition_function
+    def test_set_config_updates_central_config(self, sample_config):
+        """Test that setting config stores it in the central config manager."""
+        config_manager.set_config(sample_config)
+        cfg = config_manager.get_config()
+        assert cfg is not None
+        assert cfg.orca_exec_command == sample_config.orca_exec_command
+        assert cfg.num_of_procs == sample_config.num_of_procs
+        assert cfg.orca_method == sample_config.orca_method
+        assert cfg.charge == sample_config.charge
+        assert cfg.spin_multiplicity == sample_config.spin_multiplicity
+        assert cfg.ts == sample_config.ts
+        assert cfg.broken_struct_energy == sample_config.broken_struct_energy
+        assert cfg.bond_length_threshold == sample_config.bond_length_threshold
+        assert cfg.acquisition_function == sample_config.acquisition_function
 
     def test_set_config_partial_update(self, sample_config):
-        """Test that set_config completely replaces config."""
-        import calc
-
+        """Test that setting a new config replaces the central config."""
         original_ts = sample_config.ts
-        set_config(sample_config)
-        assert calc.TS == original_ts
+        config_manager.set_config(sample_config)
+        cfg = config_manager.get_config()
+        assert cfg.ts == original_ts
 
         # Create a new config with different TS value
         modified_config = ConfSearchConfig(
             mol_file_name=sample_config.mol_file_name,
             ts=not original_ts,  # Flip the value
         )
-        set_config(modified_config)
-        assert calc.TS == (not original_ts)
+        config_manager.set_config(modified_config)
+        cfg2 = config_manager.get_config()
+        assert cfg2.ts == (not original_ts)
 
 
 @pytest.fixture

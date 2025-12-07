@@ -19,45 +19,28 @@ import shutil
 from pathlib import Path
 
 import tempfile
+import logging
+logger = logging.getLogger(__name__)
+import config_manager
+import run_state
 
 HARTRI_TO_KCAL = 627.509474063 
-
-ORCA_EXEC_COMMAND = "/opt/orca5/orca"
-NUM_OF_PROCS = 8
-DEFAULT_METHOD = None
-ORCA_METHOD = "lda sto-3g"
-CHARGE = 0
-MULTIPL = 1
-TS = False
-BROKEN_STRUCT_ENERGY = 100.0
-BOND_LENGTH_THRESHOLD = 0.7
-_CURRENT_STRUCTURE_ID = 0  # global id for every structure that we would save (use accessors)
-
-ACQUISITION_FUNCTION = ConfSearchConfig.acquisition_function
-
-WRONG_GEOMETRY = False
 
 #Alias for type of node about dihedral angle 
 #that consists of list with four atoms and value of degree
 dihedral = tuple[list[int], float]
 
-def set_config(config: ConfSearchConfig) -> None:
-    """Set runtime parameters for calculation functions from a `ConfSearchConfig`.
 
-    This replaces the previous dict-based loader and centralizes config
-    propagation. Call this early in your program (e.g. from `conf_search.py`).
+def _get_config_or_raise() -> ConfSearchConfig:
+    """Return the runtime config or raise RuntimeError if it's not set.
+
+    This enforces that calculations always use the central config and avoids
+    falling back to outdated module-level globals.
     """
-    global MULTIPL, CHARGE, ORCA_EXEC_COMMAND, NUM_OF_PROCS, ORCA_METHOD, TS, BROKEN_STRUCT_ENERGY, BOND_LENGTH_THRESHOLD, ACQUISITION_FUNCTION
-
-    ORCA_EXEC_COMMAND = config.orca_exec_command
-    NUM_OF_PROCS = config.num_of_procs
-    ORCA_METHOD = config.orca_method
-    CHARGE = config.charge
-    MULTIPL = config.spin_multiplicity
-    TS = config.ts
-    BROKEN_STRUCT_ENERGY = config.broken_struct_energy
-    BOND_LENGTH_THRESHOLD = config.bond_length_threshold
-    ACQUISITION_FUNCTION = config.acquisition_function
+    cfg = config_manager.get_config()
+    if cfg is None:
+        raise RuntimeError("Configuration is not set. Call `config_manager.set_config()` or load a config before using calc functions.")
+    return cfg
 
 def dist_between_atoms(mol : Chem.rdchem.Mol, i : int, j : int) -> float:
     pos_i = mol.GetConformer().GetAtomPosition(i)
@@ -71,8 +54,11 @@ def change_dihedrals(mol_file_name: str,
                      full_block=False):
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+        # Read acquisition function from central config (require config to be set)
+        _cfg = _get_config_or_raise()
+        _af = _cfg.acquisition_function
 
-        if ACQUISITION_FUNCTION != 'ik':
+        if _af != 'ik':
             for cycle in dihedrals:
                 for atoms, degree in cycle:
                     rdMolTransforms.SetDihedralRad(mol.GetConformer(), *atoms, degree)
@@ -114,7 +100,7 @@ def change_dihedrals(mol_file_name: str,
         return '\n'.join(Chem.MolToXYZBlock(mol).split('\n')[2:])
 
     except OSError:
-        print("No such file!")
+        logger.error("No such file: %s", mol_file_name)
         return None
     
 def to_degrees(dihedrals : list[dihedral]) -> list[dihedral]:
@@ -151,23 +137,38 @@ def generate_oinp(
     """
         generates orca .inp file
     """
-    with open(gjf_name, 'w+') as file:
+    # Require runtime config to be set; config provides TS flag
+    cfg = _get_config_or_raise()
+    parent = Path(gjf_name).parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    # Write atomically into the same directory to avoid partial writes being
+    # picked up by monitoring code. Use a temp file and then replace.
+    with tempfile.NamedTemporaryFile(mode="w", dir=str(parent), delete=False, suffix=".tmp") as tmp:
         opt_cmd = "opt"
-        if TS:
+        if cfg.ts:
             opt_cmd = "OptTS"
-        file.write("!" + method_of_calc + f" {opt_cmd}\n")
-        file.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
+        tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
+        tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
         if constrained_opt:
-            file.write("%geom Constraints\n")
+            tmp.write("%geom Constraints\n")
             dihedrals = to_degrees(dihedrals)
             for cur in dihedrals:
                 a, d = cur
-                file.write("{ D " + " ".join(map(str, a)) + " " + str(d) + " C }\n")
-            file.write("end\n")
-            file.write("end\n")    
-        file.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
-        file.write(coords)
-        file.write("END\n")
+                tmp.write("{ D " + " ".join(map(str, a)) + " " + str(d) + " C }\n")
+            tmp.write("end\n")
+            tmp.write("end\n")    
+        tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
+        tmp.write(coords)
+        tmp.write("END\n")
+        tmp_name = tmp.name
+
+    try:
+        os.replace(tmp_name, gjf_name)
+        os.chmod(gjf_name, 0o644)
+    except Exception:
+        # If atomic replace fails, try a best-effort move
+        shutil.move(tmp_name, gjf_name)
 
 def generate_default_oinp(
     coords: str,
@@ -183,10 +184,12 @@ def generate_default_oinp(
     
     If optional parameters are not provided, uses module-level defaults set by set_config().
     """
-    num_of_procs = num_of_procs if num_of_procs is not None else NUM_OF_PROCS
-    orca_method = orca_method if orca_method is not None else ORCA_METHOD
-    charge = charge if charge is not None else CHARGE
-    multipl = multipl if multipl is not None else MULTIPL
+    if num_of_procs is None or orca_method is None or charge is None or multipl is None:
+        cfg = _get_config_or_raise()
+    num_of_procs = num_of_procs if num_of_procs is not None else cfg.num_of_procs
+    orca_method = orca_method if orca_method is not None else cfg.orca_method
+    charge = charge if charge is not None else cfg.charge
+    multipl = multipl if multipl is not None else cfg.spin_multiplicity
     generate_oinp(
         coords,
         dihedrals,
@@ -199,29 +202,51 @@ def generate_default_oinp(
     )
 
 
+def _select_sbatch_template(gjf_dir: Path, cfg: ConfSearchConfig) -> str:
+    """Return the path to the sbatch template to copy for `gjf_dir`.
+
+    Prefers a template found inside `gjf_dir`; otherwise falls back to the
+    configured template name (which may be a path in the current working dir).
+    Returns a string path suitable for passing to `shutil.copy`.
+    """
+    candidate = gjf_dir / cfg.sbatch_template_name
+    if candidate.exists():
+        return str(candidate)
+    return cfg.sbatch_template_name
+
+
 def start_calc(gjf_name: str, sbatch: bool = True):
     """
         Running calculation
     """	
+    cfg = _get_config_or_raise()
+    orca_cmd = cfg.orca_exec_command
     if sbatch:
-        sbatch_name = gjf_name.split('/')[-1][:-4] + ".sh"
+        # Place the generated sbatch script next to the input file so scripts
+        # and outputs live inside the working folder instead of the module cwd.
+        gjf_path = Path(gjf_name).resolve()
+        gjf_dir = gjf_path.parent
+        gjf_base = gjf_path.stem
+        sbatch_name = str(gjf_dir / (gjf_base + ".sh"))
         try:
-            shutil.copy("sbatch_temp", sbatch_name)
+            # Prefer a template located in the same directory as the input file.
+            template_to_copy = _select_sbatch_template(gjf_dir, cfg)
+            shutil.copy(template_to_copy, sbatch_name)
             # append the orca call into the sbatch script
             with open(sbatch_name, "a") as fh:
-                fh.write(f"{ORCA_EXEC_COMMAND} {gjf_name} > {gjf_name[:-4]}.out\n")
+                fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
             subprocess.run(["sbatch", sbatch_name], check=True)
         except Exception:
             # fall back to running the previous approach if sbatch fails
-            subprocess.run(shlex.split(ORCA_EXEC_COMMAND) + [gjf_name], check=False)
+            subprocess.run(shlex.split(orca_cmd) + [gjf_name], check=False)
     else:
         out_path = gjf_name[:-4] + ".out"
         try:
             with open(out_path, "wb") as out_f:
-                subprocess.run(shlex.split(ORCA_EXEC_COMMAND) + [gjf_name], stdout=out_f, check=False)
+                subprocess.run(shlex.split(orca_cmd) + [gjf_name], stdout=out_f, check=False)
         except Exception:
             # best-effort fallback using shell in case ORCA_EXEC_COMMAND is complex
-            subprocess.run(f"{ORCA_EXEC_COMMAND} {gjf_name} > {out_path}", shell=True)
+            subprocess.run(f"{orca_cmd} {gjf_name} > {out_path}", shell=True)
 
 def mol_to_inp_name(mol_file_name : str) -> str:
     """
@@ -235,47 +260,94 @@ def inp_to_out_name(inp_file_name : str) -> str:
     """
     return inp_file_name[:-4] + ".out"
 
-def wait_for_the_end_of_calc(log_name : str, timeout):
+def wait_for_the_end_of_calc(log_name: str, poll_interval_ms: int | None = None, timeout_seconds: int | None = None) -> bool:
+    """Monitor ORCA output file until the run finishes or times out.
+
+    Returns True if ORCA terminated normally, False if it finished with an
+    error. Raises `TimeoutError` if the file doesn't reach a terminal state
+    within `timeout_seconds`.
+
+    Both `poll_interval_ms` and `timeout_seconds` default to values from the
+    runtime config if not provided.
     """
-        waiting fot the end of calculation in gaussian 
-        by checking log file every 'timeout' ms
-    """
+    cfg = config_manager.get_config()
+    if poll_interval_ms is None:
+        poll_interval_ms = cfg.orca_poll_interval_ms if cfg is not None else 1000
+    if timeout_seconds is None:
+        timeout_seconds = cfg.orca_poll_timeout_seconds if cfg is not None else 3600
+
+    poll_s = max(0.05, poll_interval_ms / 1000.0)
+    deadline = time.time() + float(timeout_seconds)
+
+    # Keep a small rolling buffer of recent lines to avoid reading entire huge
+    # log files repeatedly.
+    from collections import deque
+
     while True:
-        try: 
-            with open(log_name, 'r') as file:
-                log_file = [line for line in file]               
-                if "ORCA TERMINATED NORMALLY" in log_file[-2] or\
-                        "ORCA finished by error" in log_file[-5] or\
-                        "Error" in log_file[-2] or\
-                        "GSTEP" in log_file[-2]:
-                    break
+        if time.time() > deadline:
+            raise TimeoutError(f"Waiting for ORCA output {log_name} timed out after {timeout_seconds} seconds")
+
+        try:
+            with open(log_name, "r", errors="ignore") as fh:
+                last_lines = deque(fh, maxlen=200)
+                joined = "\n".join(last_lines)
+
+                if "ORCA TERMINATED NORMALLY" in joined:
+                    return True
+                if "ORCA finished by error" in joined or "Error" in joined or "GSTEP" in joined:
+                    return False
         except FileNotFoundError:
-            pass
-        except IndexError:
-            pass
-        finally:
-            time.sleep(timeout / 1000)
+            # File may not yet exist; continue polling until timeout
+            logger.debug("Output file %s not present yet; polling...", log_name)
+        except Exception:
+            logger.exception("Error while monitoring output file %s", log_name)
+
+        time.sleep(poll_s)
 
 def find_energy_in_log(log_name : str) -> tuple[float, bool]:
     """
         finds energy of structure in log file
     """
+    import re
+    energy_re = re.compile(r"FINAL SINGLE POINT ENERGY\s+(-?\d+\.\d+)")
+    alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
+
     try:
-        with open(log_name, 'r') as file:
-            en_line = [line for line in file if "FINAL SINGLE POINT ENERGY" in line][-1]
-            en = float(en_line.split()[4])
-            return en, True
+        with open(log_name, 'r', errors='ignore') as fh:
+            # scan from end to find the last occurrence without loading whole huge files
+            from collections import deque
+            last_lines = deque(fh, maxlen=500)
+            joined = "\n".join(last_lines)
+
+            m = energy_re.search(joined)
+            if not m:
+                m = alt_re.search(joined)
+            if m:
+                try:
+                    en = float(m.group(1))
+                    return en, True
+                except Exception:
+                    logger.exception("Failed to parse energy from line: %s", m.group(0))
+                    cfg = _get_config_or_raise()
+                    return cfg.broken_struct_energy, False
+            # no energy line found -> optimization likely failed; return broken_struct_energy
+            logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
+            cfg = _get_config_or_raise()
+            return cfg.broken_struct_energy, False
     except FileNotFoundError:
-        print("No log file! Something went wrong! Finishing!")
-        exit(0) #TODO: Make hooks for finishing
-    except IndexError:
-        print(f"Seems that optimization finished with error! Check it carefuly by yourself! Returning default energy for broken structures: {BROKEN_STRUCT_ENERGY}")
-        return BROKEN_STRUCT_ENERGY, False #TODO: find better way to handle errors in orca
+        logger.error("No log file: %s. Returning broken_struct_energy", log_name)
+        cfg = _get_config_or_raise()
+        return cfg.broken_struct_energy, False
 
 def check_is_broken(
     xyz_block : str,
-    len_threshold : float = BOND_LENGTH_THRESHOLD
+    len_threshold : float | None = None
 ) -> bool:
+    # Determine bond-length threshold from config unless explicitly provided
+    if len_threshold is None:
+        cfg = _get_config_or_raise()
+        len_threshold = cfg.bond_length_threshold
+
     coord_matrix = np.asarray(
         list(
             map(
@@ -311,25 +383,32 @@ def calc_energy(
         with current properties and returns it as float.
         If config is provided, uses its values; otherwise uses module-level defaults.
     """
-    # Use config values if provided, else fall back to globals set by set_config()
-    bond_len_threshold = config.bond_length_threshold if config else BOND_LENGTH_THRESHOLD
+    # Use explicit config if provided, otherwise require central config
+    if config is None:
+        cfg = _get_config_or_raise()
+    else:
+        cfg = config
+    bond_len_threshold = cfg.bond_length_threshold
 
-    print(f"Calc with save_struct={save_structs}")
+    logger.debug("Calc with save_struct=%s", save_structs)
 
     xyz_upd = None
 
-    print("dihedrals before: ", dihedrals)
+    logger.debug("dihedrals before: %s", dihedrals)
     if force_xyz_block:
         xyz_upd = force_xyz_block
     else:
         xyz_upd = change_dihedrals(mol_file_name, dihedrals, ik_loss)
 
-    print("dihedrals after: ", dihedrals)
+    logger.debug("dihedrals after: %s", dihedrals)
 
     if check_is_broken(xyz_upd, bond_len_threshold):
-        broken_energy = config.broken_struct_energy if config else BROKEN_STRUCT_ENERGY
-        print(f"Seems that some atoms in current structure is closer than {bond_len_threshold}!")
-        print(f"Returning broken_struct_energy that is {broken_energy}")
+        broken_energy = cfg.broken_struct_energy
+        logger.warning(
+            "Seems that some atoms in current structure are closer than %s! Returning broken_struct_energy=%s",
+            bond_len_threshold,
+            broken_energy,
+        )
         return broken_energy, False
 
     opt_status = True
@@ -337,7 +416,7 @@ def calc_energy(
     inp_name = mol_to_inp_name(mol_file_name)
     out_name = inp_to_out_name(inp_name)
 
-    if os.path.isfile(out_name):
+    if Path(out_name).is_file():
         try:
             Path(out_name).unlink(missing_ok=True)
         except Exception:
@@ -348,17 +427,18 @@ def calc_energy(
         dihedrals,
         inp_name,
         constrained_opt=constrained_opt,
-        num_of_procs=config.num_of_procs if config else None,
-        orca_method=config.orca_method if config else None,
-        charge=config.charge if config else None,
-        multipl=config.spin_multiplicity if config else None,
+        num_of_procs=cfg.num_of_procs,
+        orca_method=cfg.orca_method,
+        charge=cfg.charge,
+        multipl=cfg.spin_multiplicity,
     )
     start_calc(inp_name)
-    wait_for_the_end_of_calc(out_name, 1000)
+    # Use configured polling defaults inside wait_for_the_end_of_calc
+    wait_for_the_end_of_calc(out_name)
     
     res, opt_status = find_energy_in_log(out_name) 
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
-    print(f"opt status in calc_energy is {opt_status}")
+    logger.debug("opt status in calc_energy is %s", opt_status)
     return res, opt_status
 
 def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
@@ -368,15 +448,7 @@ def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
             full_xyz.append(line)
     return ''.join(full_xyz[2:])
 
-def increase_structure_id() -> int:
-    """Increment and return a new structure id.
-
-    The module-level counter is internal; use this accessor instead of
-    touching the variable directly.
-    """
-    global _CURRENT_STRUCTURE_ID
-    _CURRENT_STRUCTURE_ID += 1
-    return _CURRENT_STRUCTURE_ID - 1
+# `increase_structure_id` is provided by `run_state`.
 
 def dihedral_angle(a : list[float], b : list[float], c : list[float], d : list[float]) -> float:
     """
@@ -415,14 +487,13 @@ def parse_points_from_trj(
         for every point
     """
 
-    print(f"Parsing starts with norm_en={norm_en}, save_struct={save_structs}")
+    logger.debug("Parsing starts with norm_en=%s, save_struct=%s", norm_en, save_structs)
 
     result = []
 
     structures = []
 
-    # use internal counter for structure ids
-    global _CURRENT_STRUCTURE_ID
+    # use internal counter for structure ids (from run_state)
 
     with open(trj_file_name, "r") as file:
         lines = [line[:-1] for line in file]
@@ -440,7 +511,7 @@ def parse_points_from_trj(
                 cur_d.append(dihedral_angle(a_coord, b_coord, c_coord, d_coord))
             result.append((cur_d, energy))
     
-    print(f"Points in trj: {len(result)}")
+    logger.debug("Points in trj: %s", len(result))
     
     if len(result) == 1:
         return result
@@ -448,7 +519,7 @@ def parse_points_from_trj(
     points, obs = list(zip(*result[1:]))
 
     num_of_clusters = min(3, len(points))
-    print(f"Num of clusters: {num_of_clusters}")
+    logger.debug("Num of clusters: %s", num_of_clusters)
 
     vals = {cluster_id : (1e9, -1) for cluster_id in range(num_of_clusters)}
 
@@ -465,22 +536,23 @@ def parse_points_from_trj(
             vals[cluster] = obs[i], i
     #print(len(vals))
     #print(vals)
-    print(f"PARSING POINTS, CLUSTER NUM = {num_of_clusters}")
+    logger.debug("PARSING POINTS, CLUSTER NUM = %s", num_of_clusters)
     if save_structs:
-
-        print("SAVING STRUCTS")
-        print("Saving first struct from trj. Current structure number: {}".format(_CURRENT_STRUCTURE_ID))
-        with open(structures_path + str(_CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
+        logger.info("SAVING STRUCTS")
+        cur_id = run_state.peek_structure_id()
+        logger.info("Saving first struct from trj. Current structure number: %s", cur_id)
+        with open(structures_path + str(cur_id) + ".xyz", "w") as file:
             file.write(structures[0])
-        print("saved")
-        _CURRENT_STRUCTURE_ID += 1
+        logger.info("saved")
+        run_state.increase_structure_id()
 
         for cluster_id in vals:
-            print("saving struct number {}".format(_CURRENT_STRUCTURE_ID))
-            with open(structures_path + str(_CURRENT_STRUCTURE_ID) + ".xyz", "w") as file:
+            cur_id = run_state.peek_structure_id()
+            logger.info("saving struct number %s", cur_id)
+            with open(structures_path + str(cur_id) + ".xyz", "w") as file:
                 file.write(structures[vals[cluster_id][1] + 1]) # because points parsed from result[1:]
-            print("saved")
-            _CURRENT_STRUCTURE_ID += 1
+            logger.info("saved")
+            run_state.increase_structure_id()
    
     minima_node = {
         "coords" : result[-1][0],

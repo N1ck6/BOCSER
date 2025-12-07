@@ -1,6 +1,8 @@
 import sqlite3
 import os
 from typing import List
+import logging
+logger = logging.getLogger(__name__)
 
 class Connector:
     
@@ -29,7 +31,7 @@ class LocalConnector(Connector):
     ) -> None:
         self.db_filename = db_filename
         if not os.path.isfile(db_filename):
-            print("No database file located!")
+            logger.error("No database file located: %s", db_filename)
             raise FileNotFoundError(db_filename)
 
     def set_request(
@@ -43,7 +45,7 @@ class LocalConnector(Connector):
             connection.commit()
             connection.close()
         except Exception as e:
-            print("Something went wrong with db")
+            logger.exception("Something went wrong with db")
             raise e
     
     def get_request(
@@ -58,6 +60,6 @@ class LocalConnector(Connector):
             connection.close()
             return result
         except Exception as e:
-            print("Something went wrong with db")
+            logger.exception("Something went wrong with db")
             raise e
 

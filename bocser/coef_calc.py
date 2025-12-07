@@ -14,6 +14,8 @@ from db_connector import Connector
 
 import networkx as nx
 from ik_loss import CyclicCollection
+import logging
+logger = logging.getLogger(__name__)
 
 
 class CoefCalculator:
@@ -294,7 +296,7 @@ class CoefCalculator:
     ) -> str:
         cur_mol = Chem.MolFromSmiles(cur_smiles)
         while True:
-            print(f"Cur smiles: {Chem.MolToSmiles(cur_mol)}; Num of radical electrons: {sum([cur.GetNumRadicalElectrons() for cur in cur_mol.GetAtoms()])}")
+            logger.debug("Cur smiles: %s; Num of radical electrons: %s", Chem.MolToSmiles(cur_mol), sum([cur.GetNumRadicalElectrons() for cur in cur_mol.GetAtoms()]))
             found_radical_electrons = False
             for atom in cur_mol.GetAtoms():
                 found_radical_electrons |= atom.GetNumRadicalElectrons()
@@ -356,7 +358,7 @@ class CoefCalculator:
                 )
             )
 
-            print(f"rot_frag_smiles: {rotable_frag_smiles}\nidxs_to_rotate: {self.get_idxs_to_rotate(rotable_frags[-1])}")
+            logger.debug("rot_frag_smiles: %s idxs_to_rotate: %s", rotable_frag_smiles, self.get_idxs_to_rotate(rotable_frags[-1]))
             
             query_result = self.mol.GetSubstructMatches(
                 Chem.MolFromSmiles(
@@ -369,7 +371,7 @@ class CoefCalculator:
                 )
             )
     
-            print(f"query_result: {query_result}")
+            logger.debug("query_result: %s", query_result)
 
             old_idxs = ()
 
@@ -533,7 +535,7 @@ class CoefCalculator:
                 continue
             res.append(calc_coefs(self.degrees, energies))
         
-        print(f"Sucessful calculated {len(inp_filenames) - len(self.fetched_coefs)} coefs and fetched from db {len(self.fetched_coefs)} coefs!")    
+        logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", len(inp_filenames) - len(self.fetched_coefs), len(self.fetched_coefs))
         
         insert_request_template = 'insert into dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) values (\"{smiles}\", \"{method}\", {a1}, {a2}, {a3}, {b1}, {b2}, {b3}, {c})'
         
@@ -563,13 +565,13 @@ class CoefCalculator:
         """  
         unique_coefs = self.calc()
         result = []        
-        print(f"Frags: {self.frags}")
+        logger.debug("Frags: %s", self.frags)
 
         for idxs in self.frags:
             result.append((list(idxs), unique_coefs[self.frags[idxs]]))
         
-        print("DB Content:")
+        logger.info("DB Content:")
         for cur in self.db_connector.get_request('select * from dihedrals'):
-            print(*cur, sep='|')
+            logger.info("%s", "|".join(map(str, cur)))
 
         return result
