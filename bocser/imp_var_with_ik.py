@@ -134,8 +134,8 @@ class improvement_variance(AcquisitionFunctionClass):
         normal = tfp.distributions.Normal(mean, tf.sqrt(variance))
         tau = self._eta + self._threshold
 
-        gathered_result = safe_gather_with_none(x, self._ik_loss_idxs, axis=-1)
-        ring_dihedrals = [gathered_result[:, i] for i in range(len(self._ik_loss_idxs))]
+        gathered_result = safe_gather_with_none(x, self._ik_loss_idxs)
+        ring_dihedrals = [gathered_result[:, i].to_tensor() for i in range(len(self._ik_loss_idxs))]
 
         return (normal.cdf(tau) * (((tau - mean)**2) *
                                    (1 - normal.cdf(tau)) + variance) +
@@ -143,22 +143,26 @@ class improvement_variance(AcquisitionFunctionClass):
                 (1 - 2 * normal.cdf(tau)) - variance * (normal.prob(tau)**2) -
                 self._ik_loss_weight * self._ik_loss(ring_dihedrals))
 
-def safe_gather_with_none(x, idxs, axis=-1):
-    x_squeezed = tf.squeeze(x, axis=1)
-    
-    clean_idxs = tf.ragged.constant(
-        [[0 if idx is None else idx for idx in row] for row in idxs], 
-        dtype=tf.int32
+def safe_gather_with_none(x, indices):
+    x = tf.convert_to_tensor(x)
+    indices = tf.ragged.constant(indices, dtype=tf.int32)
+
+    nan = tf.constant(float("nan"), x.dtype)
+
+    def gather_one(xb):
+        def gather_flat(idx):
+            safe_idx = tf.maximum(idx, 0)
+            val = tf.gather(xb, safe_idx)
+            return tf.where(idx > -1, val, nan)
+
+        return tf.ragged.map_flat_values(gather_flat, indices)
+
+    return tf.map_fn(
+        gather_one,
+        x[:, 0, :],
+        fn_output_signature=tf.RaggedTensorSpec(
+            shape=indices.shape,
+            dtype=x.dtype,
+            ragged_rank=indices.ragged_rank
+        )
     )
-    
-    none_mask = tf.ragged.constant(
-        [[idx is None for idx in row] for row in idxs],
-        dtype=tf.bool
-    )
-    
-    gathered = tf.gather(x_squeezed, clean_idxs, axis=1)
-    
-    fill_value_cast = tf.cast(float('nan'), gathered.dtype)
-    result = tf.where(none_mask, fill_value_cast, gathered)
-    
-    return result.to_tensor()

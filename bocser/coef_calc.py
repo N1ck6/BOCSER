@@ -8,7 +8,7 @@ from typing import Union
 import os
 
 from default_vals import ConfSearchConfig
-from calc import start_calc, wait_for_the_end_of_calc
+from calc import start_calc
 from coef_from_grid import calc_coefs
 from db_connector import Connector
 
@@ -256,7 +256,7 @@ class CoefCalculator:
                             found = True
                             break
                     if not found:
-                        dihedral_idxs.append(None)
+                        dihedral_idxs.append(-1)
 
                 all_dihedrals.append(dihedrals)
                 all_dihedral_idxs.append(dihedral_idxs)
@@ -336,9 +336,9 @@ class CoefCalculator:
                 if len(ring_idxs) >= 4:
                     atoms_to_use = ring_idxs                
             
-            if self.skip_triple_equal_terminal_atoms and\
-               self.is_triple_eq_neighbors(atom):
-                atoms_to_use.update([cur.GetIdx() for cur in atom.GetNeighbors()])
+            # if self.skip_triple_equal_terminal_atoms and\
+            #    self.is_triple_eq_neighbors(atom):
+            #     atoms_to_use.update([cur.GetIdx() for cur in atom.GetNeighbors()])
 
             rotable_frag_smiles = Chem.rdmolfiles.MolFragmentToSmiles(self.mol, atomsToUse = list(atoms_to_use))
 
@@ -489,11 +489,6 @@ class CoefCalculator:
             return list of lists of energies in
             [0.0, 360.0] with step = 10 degrees
         """
-        for inp_name in lst:
-            out_name = inp_name[:-3] + "out"
-            if not (self.scanfile2smiles[inp_name] in self.fetched_coefs):
-                wait_for_the_end_of_calc(out_name, 1000)
-
         result = []
 
         for inp_name in lst:
@@ -519,7 +514,7 @@ class CoefCalculator:
         inp_files = self.generate_scan_inps_from_mol()
         for cur in inp_files:
             if not (self.scanfile2smiles[cur] in self.fetched_coefs):
-               start_calc(cur)    
+               start_calc(cur, scan=True)    
         return self.get_energies_from_scans(inp_files)
 
     def calc(self) -> list[list[float]]:

@@ -13,7 +13,10 @@ class ConfSearchConfig:
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7
     ts : bool = False
-    orca_poll_timeout_seconds: int = 3600
+    use_grass : bool = False
+    path_to_grass : str = ""
+    grass_options : str = ""
+    orca_poll_timeout_minutes: int = 60
     orca_poll_interval_ms: int = 1000
     sbatch_template_name: str = "sbatch_temp"
     rolling_window_size : int = 5

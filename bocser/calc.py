@@ -10,8 +10,6 @@ import numpy as np
 
 from sklearn.cluster import KMeans
 
-
-
 from default_vals import ConfSearchConfig
 import subprocess
 import shlex
@@ -145,22 +143,28 @@ def generate_oinp(
     # Write atomically into the same directory to avoid partial writes being
     # picked up by monitoring code. Use a temp file and then replace.
     with tempfile.NamedTemporaryFile(mode="w", dir=str(parent), delete=False, suffix=".tmp") as tmp:
-        opt_cmd = "opt"
-        if cfg.ts:
-            opt_cmd = "OptTS"
-        tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
-        tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
-        if constrained_opt:
-            tmp.write("%geom Constraints\n")
-            dihedrals = to_degrees(dihedrals)
-            for cur in dihedrals:
-                a, d = cur
-                tmp.write("{ D " + " ".join(map(str, a)) + " " + str(d) + " C }\n")
-            tmp.write("end\n")
-            tmp.write("end\n")    
-        tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
-        tmp.write(coords)
-        tmp.write("END\n")
+        
+        if cfg.ts and cfg.use_grass:
+            tmp.write(str(coords.count('\n')))
+            tmp.write("\n\n")
+            tmp.write(coords)
+        else:
+            opt_cmd = "OptTS" if cfg.ts else "Opt"
+                
+            tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
+            tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
+            if constrained_opt:
+                tmp.write("%geom Constraints\n")
+                dihedrals = to_degrees(dihedrals)
+                for cur in dihedrals:
+                    a, d = cur
+                    tmp.write("{ D " + " ".join(map(str, a)) + " " + str(d) + " C }\n")
+                tmp.write("end\n")
+                tmp.write("end\n")    
+            tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
+            tmp.write(coords)
+            tmp.write("END\n")
+        
         tmp_name = tmp.name
 
     try:
@@ -169,38 +173,6 @@ def generate_oinp(
     except Exception:
         # If atomic replace fails, try a best-effort move
         shutil.move(tmp_name, gjf_name)
-
-def generate_default_oinp(
-    coords: str,
-    dihedrals: list[dihedral],
-    oinp_name: str,
-    constrained_opt: bool = False,
-    num_of_procs: int = None,
-    orca_method: str = None,
-    charge: int = None,
-    multipl: int = None,
-) -> None:
-    """Generate ORCA input file using module globals or explicit parameters.
-    
-    If optional parameters are not provided, uses module-level defaults set by set_config().
-    """
-    if num_of_procs is None or orca_method is None or charge is None or multipl is None:
-        cfg = _get_config_or_raise()
-    num_of_procs = num_of_procs if num_of_procs is not None else cfg.num_of_procs
-    orca_method = orca_method if orca_method is not None else cfg.orca_method
-    charge = charge if charge is not None else cfg.charge
-    multipl = multipl if multipl is not None else cfg.spin_multiplicity
-    generate_oinp(
-        coords,
-        dihedrals,
-        oinp_name,
-        num_of_procs,
-        orca_method,
-        charge,
-        multipl,
-        constrained_opt=constrained_opt,
-    )
-
 
 def _select_sbatch_template(gjf_dir: Path, cfg: ConfSearchConfig) -> str:
     """Return the path to the sbatch template to copy for `gjf_dir`.
@@ -215,94 +187,44 @@ def _select_sbatch_template(gjf_dir: Path, cfg: ConfSearchConfig) -> str:
     return cfg.sbatch_template_name
 
 
-def start_calc(gjf_name: str, sbatch: bool = True):
+def start_calc(gjf_name: str, scan=False):
     """
         Running calculation
     """	
     cfg = _get_config_or_raise()
     orca_cmd = cfg.orca_exec_command
-    if sbatch:
-        # Place the generated sbatch script next to the input file so scripts
-        # and outputs live inside the working folder instead of the module cwd.
-        gjf_path = Path(gjf_name).resolve()
-        gjf_dir = gjf_path.parent
-        gjf_base = gjf_path.stem
-        sbatch_name = str(gjf_dir / (gjf_base + ".sh"))
-        try:
-            # Prefer a template located in the same directory as the input file.
-            template_to_copy = _select_sbatch_template(gjf_dir, cfg)
-            shutil.copy(template_to_copy, sbatch_name)
-            # append the orca call into the sbatch script
-            with open(sbatch_name, "a") as fh:
-                fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
-            subprocess.run(["sbatch", sbatch_name], check=True)
-        except Exception:
-            # fall back to running the previous approach if sbatch fails
-            subprocess.run(shlex.split(orca_cmd) + [gjf_name], check=False)
-    else:
-        out_path = gjf_name[:-4] + ".out"
-        try:
-            with open(out_path, "wb") as out_f:
-                subprocess.run(shlex.split(orca_cmd) + [gjf_name], stdout=out_f, check=False)
-        except Exception:
-            # best-effort fallback using shell in case ORCA_EXEC_COMMAND is complex
-            subprocess.run(f"{orca_cmd} {gjf_name} > {out_path}", shell=True)
 
+    # Place the generated sbatch script next to the input file so scripts
+    # and outputs live inside the working folder instead of the module cwd.
+    gjf_path = Path(gjf_name).resolve()
+    gjf_dir = gjf_path.parent
+    gjf_base = gjf_path.stem
+    sbatch_name = str(gjf_dir / (gjf_base + ".sh"))
+    template_to_copy = _select_sbatch_template(gjf_dir, cfg)
+    shutil.copy(template_to_copy, sbatch_name)
+    
+    with open(sbatch_name, "a") as fh:
+        if cfg.ts and cfg.use_grass and not scan:
+            fh.write(f"python -u {cfg.path_to_grass} {gjf_name} -OPATH {orca_cmd[:-4]} -p orca -onp {cfg.num_of_procs} -oms \"{cfg.orca_method}\" {cfg.grass_options} > {gjf_name[:-4]}.grass\n")
+        else:
+            fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
+    
+    timeout_minutes = cfg.orca_poll_timeout_minutes
+    subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), sbatch_name])    
+    
 def mol_to_inp_name(mol_file_name : str) -> str:
     """
         generating name of inp file from mol file name
     """
-    return mol_file_name[:-4] + ".inp"
+    cfg = _get_config_or_raise()
+    return mol_file_name[:-4] + (".inp" if not cfg.ts or not cfg.use_grass else ".xyz")
 
 def inp_to_out_name(inp_file_name : str) -> str:
     """
         generating name of out file from inp file name
     """
-    return inp_file_name[:-4] + ".out"
-
-def wait_for_the_end_of_calc(log_name: str, poll_interval_ms: int | None = None, timeout_seconds: int | None = None) -> bool:
-    """Monitor ORCA output file until the run finishes or times out.
-
-    Returns True if ORCA terminated normally, False if it finished with an
-    error. Raises `TimeoutError` if the file doesn't reach a terminal state
-    within `timeout_seconds`.
-
-    Both `poll_interval_ms` and `timeout_seconds` default to values from the
-    runtime config if not provided.
-    """
-    cfg = config_manager.get_config()
-    if poll_interval_ms is None:
-        poll_interval_ms = cfg.orca_poll_interval_ms if cfg is not None else 1000
-    if timeout_seconds is None:
-        timeout_seconds = cfg.orca_poll_timeout_seconds if cfg is not None else 3600
-
-    poll_s = max(0.05, poll_interval_ms / 1000.0)
-    deadline = time.time() + float(timeout_seconds)
-
-    # Keep a small rolling buffer of recent lines to avoid reading entire huge
-    # log files repeatedly.
-    from collections import deque
-
-    while True:
-        if time.time() > deadline:
-            raise TimeoutError(f"Waiting for ORCA output {log_name} timed out after {timeout_seconds} seconds")
-
-        try:
-            with open(log_name, "r", errors="ignore") as fh:
-                last_lines = deque(fh, maxlen=3)
-                joined = "\n".join(last_lines)
-
-                if "ORCA TERMINATED NORMALLY" in joined:
-                    return True
-                if "ORCA finished by error" in joined or "GSTEP" in joined:
-                    return False
-        except FileNotFoundError:
-            # File may not yet exist; continue polling until timeout
-            logger.debug("Output file %s not present yet; polling...", log_name)
-        except Exception:
-            logger.exception("Error while monitoring output file %s", log_name)
-
-        time.sleep(poll_s)
+    cfg = _get_config_or_raise()
+    return (inp_file_name[:-4] + ".out") if not cfg.ts or not cfg.use_grass else (os.path.dirname(inp_file_name) + "/outfile.out")
 
 def find_energy_in_log(log_name : str) -> tuple[float, bool]:
     """
@@ -422,19 +344,17 @@ def calc_energy(
         except Exception:
             # fallback to remove via shell
             subprocess.run(["rm", "-f", out_name])
-    generate_default_oinp(
+    generate_oinp(
         xyz_upd,
         dihedrals,
         inp_name,
         constrained_opt=constrained_opt,
         num_of_procs=cfg.num_of_procs,
-        orca_method=cfg.orca_method,
+        method_of_calc=cfg.orca_method,
         charge=cfg.charge,
         multipl=cfg.spin_multiplicity,
     )
     start_calc(inp_name)
-    # Use configured polling defaults inside wait_for_the_end_of_calc
-    wait_for_the_end_of_calc(out_name)
     
     res, opt_status = find_energy_in_log(out_name) 
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy

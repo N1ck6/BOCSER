@@ -12,4 +12,4 @@ export MKL_NUM_THREADS=1
 
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
-python bocser/conf_search.py --config=config.yaml
+python -u bocser/conf_search.py --config=config.yaml --folder=$1
