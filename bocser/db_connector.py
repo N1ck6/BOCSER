@@ -38,28 +38,30 @@ class LocalConnector(Connector):
         self,
         request : str
     ) -> None:
+        connection = sqlite3.connect(self.db_filename)
         try:
-            connection = sqlite3.connect(self.db_filename)
             cursor = connection.cursor()
             cursor.execute(request)
             connection.commit()
-            connection.close()
         except Exception as e:
             logger.exception("Something went wrong with db")
             raise e
-    
+        finally:
+            connection.close()
+
     def get_request(
         self,
         request : str
     ) -> List:
+        connection = sqlite3.connect(self.db_filename)
         try:
-            connection = sqlite3.connect(self.db_filename)
             cursor = connection.cursor()
             result = cursor.execute(request).fetchall()
             connection.commit()
-            connection.close()
             return result
         except Exception as e:
             logger.exception("Something went wrong with db")
             raise e
+        finally:
+            connection.close()
 

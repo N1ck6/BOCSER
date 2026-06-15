@@ -284,7 +284,7 @@ def check_is_broken(
         )
     )
     for i in range(coord_matrix.shape[0]):
-        for j in range(i+1, coord_matrix.shape[1]):
+        for j in range(i+1, coord_matrix.shape[0]):
             #print(np.linalg.norm(coord_matrix[i, :] - coord_matrix[j, :]))
             if np.linalg.norm(coord_matrix[i, :] - coord_matrix[j, :]) <= len_threshold:
                 return True
@@ -434,7 +434,12 @@ def parse_points_from_trj(
     logger.debug("Points in trj: %s", len(result))
     
     if len(result) == 1:
-        return result
+        minima_node = {
+            "coords": result[0][0],
+            "rel_en": result[0][1],
+            "xyz_block": structures[0],
+        }
+        return result, minima_node
 
     points, obs = list(zip(*result[1:]))
 

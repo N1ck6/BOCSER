@@ -49,7 +49,7 @@ class CoefCalculator:
         """
 
         self.mol = mol
-        self.dir_for_inps = dir_for_inps if dir_for_inps[-1] == "/" else dir_for_inps + "/"
+        self.dir_for_inps = (dir_for_inps.rstrip("/") + "/") if dir_for_inps else ""
         self.skip_triple_equal_terminal_atoms = skip_triple_equal_terminal_atoms
         self.num_of_procs = config.num_of_procs
         self.method_of_calc = config.orca_method
@@ -214,6 +214,10 @@ class CoefCalculator:
                     bond.GetEndAtomIdx(),
                     [cur.GetIdx() for cur in bond.GetEndAtom().GetNeighbors() if cur.GetIdx() != bond.GetBeginAtomIdx()][0])
 
+        raise ValueError(
+            f"No non-terminal bond found in molecule {Chem.MolToSmiles(Chem.RemoveAllHs(mol))} — cannot determine dihedral indices"
+        )
+
     def get_ring_dihedrals(self, mol):
         edges = []
         for bond in mol.GetBonds():
@@ -250,9 +254,9 @@ class CoefCalculator:
                 dihedral_idxs = []
                 for d in dihedrals:
                     found = False
-                    for id_, f in enumerate(self.frags.keys()):
+                    for f in self.frags.keys():
                         if all(atom in f for atom in d):
-                            dihedral_idxs.append(id_)
+                            dihedral_idxs.append(self.frags[f])
                             found = True
                             break
                     if not found:
@@ -320,77 +324,83 @@ class CoefCalculator:
 
         count = 0
 
+        ring_info = self.mol.GetRingInfo()
+
         for bond in self.mol.GetBonds():
             if not self.is_interesting(bond):
                 continue
 
-            atoms_to_use = set([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
+            # For ring bonds under the ik acquisition function, process each
+            # ring the bond belongs to separately so that self.frags gets a
+            # distinct 4-atom key per ring.  This is necessary for fused ring
+            # systems (e.g. decalin) where a shared bond must contribute to
+            # the ring-closure constraints of both rings.
+            if self.af == 'ik' and bond.IsInRing():
+                bond_rings = [
+                    set(ring) for ring in ring_info.AtomRings()
+                    if bond.GetBeginAtomIdx() in ring and bond.GetEndAtomIdx() in ring
+                ]
+                rings_to_process = bond_rings if bond_rings else [None]
+            else:
+                rings_to_process = [None]
 
-            for atom in [*bond.GetBeginAtom().GetNeighbors(),\
-                         *bond.GetEndAtom().GetNeighbors()]:
-                atoms_to_use.add(atom.GetIdx())
-                
-            # TODO: fused rings
-            if self.af == 'ik':
-                ring_idxs = set([idx for idx in atoms_to_use if self.mol.GetAtomWithIdx(idx).IsInRing()])
-                if len(ring_idxs) >= 4:
-                    atoms_to_use = ring_idxs                
-            
-            # if self.skip_triple_equal_terminal_atoms and\
-            #    self.is_triple_eq_neighbors(atom):
-            #     atoms_to_use.update([cur.GetIdx() for cur in atom.GetNeighbors()])
-
-            rotable_frag_smiles = Chem.rdmolfiles.MolFragmentToSmiles(self.mol, atomsToUse = list(atoms_to_use))
-
-            if not Chem.MolFromSmiles(rotable_frag_smiles):
-                if self.aromatic_to_aliphatic:
-                    rotable_frag_smiles = self.convert_all_aromatic_to_aliphatic(rotable_frag_smiles)
+            for ring_atoms in rings_to_process:
+                if ring_atoms is not None:
+                    atoms_to_use = ring_atoms
                 else:
-                    continue
-            
-            # Looks like shit, but works... I should rewrite it
+                    atoms_to_use = set([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
+                    for atom in [*bond.GetBeginAtom().GetNeighbors(),
+                                 *bond.GetEndAtom().GetNeighbors()]:
+                        atoms_to_use.add(atom.GetIdx())
 
-            rotable_frag_smiles = self._sanitize_smiles(rotable_frag_smiles)
+                rotable_frag_smiles = Chem.rdmolfiles.MolFragmentToSmiles(self.mol, atomsToUse=list(atoms_to_use))
 
-            rotable_frags.append(
-                Chem.MolFromSmiles(
-                    rotable_frag_smiles
-                )
-            )
+                if not Chem.MolFromSmiles(rotable_frag_smiles):
+                    if self.aromatic_to_aliphatic:
+                        rotable_frag_smiles = self.convert_all_aromatic_to_aliphatic(rotable_frag_smiles)
+                    else:
+                        continue
 
-            logger.debug("rot_frag_smiles: %s idxs_to_rotate: %s", rotable_frag_smiles, self.get_idxs_to_rotate(rotable_frags[-1]))
-            
-            query_result = self.mol.GetSubstructMatches(
-                Chem.MolFromSmiles(
-                    self._sanitize_smiles(
-                        Chem.rdmolfiles.MolFragmentToSmiles(
-                            rotable_frags[-1],
-                            atomsToUse=self.get_idxs_to_rotate(rotable_frags[-1])
+                rotable_frag_smiles = self._sanitize_smiles(rotable_frag_smiles)
+                frag_mol = Chem.MolFromSmiles(rotable_frag_smiles)
+                frag_smiles = Chem.MolToSmiles(frag_mol)
+
+                # Add to rotable_frags only the first time we see this SMILES;
+                # duplicate entries share the same coefficient index.
+                if frag_smiles not in self.unique_frags:
+                    rotable_frags.append(frag_mol)
+                    self.unique_frags[frag_smiles] = count
+                    count += 1
+
+                logger.debug("rot_frag_smiles: %s idxs_to_rotate: %s", frag_smiles, self.get_idxs_to_rotate(frag_mol))
+
+                query_result = self.mol.GetSubstructMatches(
+                    Chem.MolFromSmiles(
+                        self._sanitize_smiles(
+                            Chem.rdmolfiles.MolFragmentToSmiles(
+                                frag_mol,
+                                atomsToUse=self.get_idxs_to_rotate(frag_mol)
+                            )
                         )
                     )
                 )
-            )
-    
-            logger.debug("query_result: %s", query_result)
 
-            old_idxs = ()
+                logger.debug("query_result: %s", query_result)
 
-            for res in query_result:
-                corr_idxs = True
-                for cur in res:
-                    corr_idxs = corr_idxs and cur in atoms_to_use
-                if corr_idxs:
-                    old_idxs = res
-                    break
+                old_idxs = ()
+                for res in query_result:
+                    if all(cur in atoms_to_use for cur in res):
+                        old_idxs = res
+                        break
 
-            frag_smiles = Chem.MolToSmiles(rotable_frags[-1])
+                if not old_idxs:
+                    logger.error(
+                        "No matching substructure found for fragment %s (atoms %s) in molecule — skipping dihedral",
+                        frag_smiles, atoms_to_use,
+                    )
+                    continue
 
-            if frag_smiles in self.unique_frags:
                 self.frags[old_idxs] = self.unique_frags[frag_smiles]
-            else:
-                self.unique_frags[frag_smiles] = count
-                self.frags[old_idxs] = count
-                count += 1
 
         return self.generate_3d_coords(self.get_unique_mols(rotable_frags))
 
@@ -501,10 +511,10 @@ class CoefCalculator:
             cur_res = []
             with open(res_file_name, "r") as file:
                 for line in file:
-                    cur_res.append(float(line[:-1].split()[1]))
+                    cur_res.append(float(line.strip().split()[1]))
             result.append(np.array(cur_res))
 
-        return zip(lst, result)
+        return list(zip(lst, result))
 
     def get_scans_of_dihedrals(self) -> np.ndarray:
         """
