@@ -473,12 +473,13 @@ class CoefCalculator:
             if len(db_response) > 0:
                 self.fetched_coefs[cur_mol_smiles] = db_response[0]
 
-            SetDihedralRad(cur_mol.GetConformer(), 
-                        *self.get_idxs_to_rotate(cur_mol),
-                        0)
-                
-            xyz = Chem.MolToXYZBlock(cur_mol)
             idxs_to_rotate = self.get_idxs_to_rotate(cur_mol)
+            heavy_mol = Chem.RemoveAllHs(cur_mol)
+            central_bond = heavy_mol.GetBondBetweenAtoms(idxs_to_rotate[1], idxs_to_rotate[2])
+            if not central_bond.IsInRing():
+                SetDihedralRad(cur_mol.GetConformer(), *idxs_to_rotate, 0)
+
+            xyz = Chem.MolToXYZBlock(cur_mol)
             filename = self.dir_for_inps + "scan_" + str(angle_number) + ".inp"
             self.generate_scan_inp(
                 xyz=self.get_coords_from_xyz_block(xyz), 
