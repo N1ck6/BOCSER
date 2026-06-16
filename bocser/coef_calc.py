@@ -478,6 +478,10 @@ class CoefCalculator:
             central_bond = heavy_mol.GetBondBetweenAtoms(idxs_to_rotate[1], idxs_to_rotate[2])
             if not central_bond.IsInRing():
                 SetDihedralRad(cur_mol.GetConformer(), *idxs_to_rotate, 0)
+            elif cur_mol_smiles not in self.fetched_coefs:
+                # A ring dihedral cannot be freely scanned (the ring breaks);
+                # use a flat GP mean prior so the IK loss alone guides ring geometry.
+                self.fetched_coefs[cur_mol_smiles] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
             xyz = Chem.MolToXYZBlock(cur_mol)
             filename = self.dir_for_inps + "scan_" + str(angle_number) + ".inp"
