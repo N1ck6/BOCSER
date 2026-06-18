@@ -319,10 +319,9 @@ class ConfSearchRunner:
         # Propagate configuration to central config manager and internal state
         config_manager.set_config(config)
         
-        # Use mol_file_name from config, resolving relative paths to working_folder
         mol_file = Path(config.mol_file_name)
         if not mol_file.is_absolute():
-            mol_file = Path(self.state.working_folder) / mol_file
+            mol_file = mol_file.resolve()
         self.state.mol_file_name = str(mol_file)
 
         self.state.exp_name = config.exp_name
