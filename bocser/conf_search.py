@@ -29,6 +29,7 @@ from calc import (
     calc_energy,
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
+    _qc_calcs_dir,
 )
 from run_state import increase_structure_id
 import config_manager
@@ -460,7 +461,7 @@ class ConfSearchRunner:
                     dataset = observed_point if not dataset else dataset + observed_point
                 else:
                     dataset = self._upd_dataset_from_trj(
-                        f"{self.state.mol_file_name[:-4]}_trj.xyz", dataset
+                        str(_qc_calcs_dir(self.state.mol_file_name) / (Path(self.state.mol_file_name).stem + "_trj.xyz")), dataset
                     )
             logger.info(
                 "Initial dataset observed! %s minima observed, total %s points has been collected!",
@@ -573,7 +574,7 @@ class ConfSearchRunner:
             if self.state.last_opt_ok:
                 dataset = self._erase_last_from_dataset(dataset, 1)
                 dataset = self._upd_dataset_from_trj(
-                    f"{self.state.mol_file_name[:-4]}_trj.xyz", dataset
+                    str(_qc_calcs_dir(self.state.mol_file_name) / (Path(self.state.mol_file_name).stem + "_trj.xyz")), dataset
                 )
             else:
                 logger.warning("Last optimization finished with error, skipping trj parsing!")

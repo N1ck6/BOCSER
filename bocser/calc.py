@@ -212,12 +212,20 @@ def start_calc(gjf_name: str, scan=False):
     timeout_minutes = cfg.orca_poll_timeout_minutes
     subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), sbatch_name])    
     
+def _qc_calcs_dir(mol_file_name: str) -> Path:
+    """Return path to the QC calculation subfolder, creating it if needed."""
+    qc_dir = Path(mol_file_name).parent / "qc_calcs"
+    qc_dir.mkdir(exist_ok=True)
+    return qc_dir
+
 def mol_to_inp_name(mol_file_name : str) -> str:
     """
         generating name of inp file from mol file name
     """
     cfg = _get_config_or_raise()
-    return mol_file_name[:-4] + (".inp" if not cfg.ts or not cfg.use_grass else ".xyz")
+    stem = Path(mol_file_name).stem
+    ext = ".inp" if not cfg.ts or not cfg.use_grass else ".xyz"
+    return str(_qc_calcs_dir(mol_file_name) / (stem + ext))
 
 def inp_to_out_name(inp_file_name : str) -> str:
     """
@@ -362,10 +370,9 @@ def calc_energy(
     return res, opt_status
 
 def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
-    full_xyz = []
-    with open(mol_file_name[:-4] + '.xyz', 'r') as xyz_file:
-        for line in xyz_file:
-            full_xyz.append(line)
+    xyz_path = _qc_calcs_dir(mol_file_name) / (Path(mol_file_name).stem + ".xyz")
+    with open(xyz_path, 'r') as xyz_file:
+        full_xyz = xyz_file.readlines()
     return ''.join(full_xyz[2:])
 
 # `increase_structure_id` is provided by `run_state`.
