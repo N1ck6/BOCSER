@@ -122,7 +122,7 @@ class ConfSearchRunner:
                     the parent directory of the bocser module (../dihedral_logs.db).
         """
         self.state = ConfSearchState()
-        self.state.working_folder = working_folder
+        self.state.working_folder = str(Path(working_folder).resolve())
         
         # Set database file path
         if db_file is None:
@@ -290,9 +290,8 @@ class ConfSearchRunner:
         """
         from config_manager import load_config, ConfigError
 
-        # If config_path is relative, look in working_folder
         if not os.path.isabs(config_path):
-            config_path = os.path.join(self.state.working_folder, config_path)
+            config_path = str(Path(config_path).resolve())
 
         try:
             config = load_config(config_path)
