@@ -1,37 +1,101 @@
-# Physics-Informed Bayesian Optimization for Conformational Ensemble Augmentation
+# BOCSER: Physics-Informed Bayesian Optimization for Conformational Ensemble Augmentation
 
-Here you can find a source code for Bayesian optimization with Gaussian Process Conformational Ensemble Augmentation method. It allows one to perform conformational ensemble augmentation on any level of theory (available in ORCA) via Bayessian Optimization. 
+**Physics-informed Bayesian Optimization for Conformational Ensemble Augmentation**
 
-## Installation
+BOCSER finds all conformers of a molecule using Gaussian Process Regression with a physics-informed kernel.
 
-1. Clone repo
+---
+
+## Quick Start
+
+```bash
+# 1. Install dependencies
+conda create -n bocser python=3.10 && conda activate bocser
+pip install -r requirements.txt
+
+# 2. Prepare your working directory
+mkdir my_run && cd my_run
+# Place molecule.mol and config.yaml here
+
+# 3. Run
+python bocser/conf_search.py --folder=my_run --config=config.yaml
+
+# Or via Slurm (requiers installed ORCA to perform calculations and Slurm workload manager to manage them)
+sbatch run_cs.sh my_run
 ```
-git clone https://github.com/TheorChemGroup/BOCSER.git
+
+---
+
+## Input
+
+| File | Description |
+|---|---|
+| `molecule.mol` | RDKit MDL MOL file with 3D coordinates |
+| `config.yaml` | Experiment settings (see below) |
+| ORCA binary | Quantum chemistry engine, installed separately |
+| `sbatch_temp` | Slurm batch script template |
+
+### Structure of `config.yaml`
+
+```yaml
+mol_file_name: "molecule.mol"
+exp_name: "my_experiment"
+orca_exec_command: "/path/to/orca"
+orca_method: "PBE def2-SVP"
+num_of_procs: 8
+charge: 0
+spin_multiplicity: 1
+acquisition_function: "evm"   # "ei", "evm", or "ik"
+num_initial_points: 5
+max_steps: 100
 ```
-2. Install dependecies
+
+---
+
+## Output
+
+All files are written to `--folder`, prefixed with `exp_name`:
+
+| File | Contents |
+|---|---|
+| `<exp_name>_final_ensemble.xyz` | **Main output.** Deduplicated stable conformers |
+| `<exp_name>_all_minima.json` | All local minima with relative energies (kcal/mol) |
+| `<exp_name>_logs.json` | Acquisition values and best energy per BO step |
+| `<exp_name>_minima/` | Individual `.xyz` files for each minimum |
+| `<exp_name>_clustering_results.json` | DBSCAN cluster assignments |
+
+---
+
+## How It Works
+
+1. **Detect rotatable bonds** in the molecule (RDKit).
+2. **Pre-scan each bond** through 360° with ORCA → fit Fourier coefficients → these become the GP prior mean (cached in `dihedral_logs.db`).
+3. **Initialize dataset** from random RDKit embeddings or a seed ensemble.
+4. **Bayesian optimization loop** (up to `max_steps`):
+   - Acquisition function selects next dihedral angles to evaluate.
+   - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt.
+   - Result updates the GP model.
+   - Early-stop when acquisition values plateau (rolling window criterion).
+5. **Cluster** all discovered minima with DBSCAN (angular distance) → write final ensemble.
+
+---
+
+## Acquisition Functions
+
+| Value | Description |
+|---|---|
+| `evm` | Explorational Variance Minimizer — balances exploration and exploitation (default) |
+| `ei` | Expected Improvement — classic BO, more exploitative |
+| `ik` | IK-aware EVM — adds ring-closure penalty for macrocycles/ring molecules |
+
+---
+
+## Running Tests
+
+```bash
+# Fast tests only (no TF/ORCA needed)
+pytest bocser/tests/test_config_loader_only.py -v
+
+# Full test suite
+pytest bocser/tests/ -v --timeout=30
 ```
-conda create -c bocser python=3.10 trieste rdkit pyyaml
-conda activate bocser
-``` 
-Also method requiers installed ORCA to perform calculations and Slurm workload manager to manage them
-
-## Usage
-
-Conformational ensemble augmentation configures from config.yaml file, that should be placed nearby conf_search.py. It has several properties:
-
-* exp_name : str - name of experiment. It should be prefix for all files, associated with current evaluation of method
-* mol_file_name : str - name of .mol file of molecule for conformational search
-* charge : int - charge of a molecule
-* spin_multiplicity : int - spin multiplicity of molecule 
-* orca_exec_command : str - path to the orca binary file with which ORCA will be executed
-* num_of_procs : str - number of procs for ORCA calculations
-* broken_struct_energy : int - default energy, that will be returned if optimiztion didn't finished successful
-* bond_length_threshold : float - minimum bond length to accept structure as correct
-* rolling_window_size : int - number of steps to take into account when calculating termination criteria
-* rolling_std_threshold : float - maximum standard deviation of acquisition function values in rolling window to stop the search
-* rolling_mean_threshold : float - maximum acquisition function values mean in rolling window to stop the search
-* num_initial_points : int - number of randomly selecting initial points for method
-* max_steps : int - maximum number of steps of Bayesian optimization
-* load_ensemble : str - path to .xyz file with already calculated ensemble if you want to refine ensemble
-* acquisition_function : str - defines acquisition function to use. If "ei" is passed - ExpectedImprovement is used, if "evm" - our acquisition function, named Explorational Variance Minimizer
-
