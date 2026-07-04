@@ -219,6 +219,13 @@ class CoefCalculator:
         )
 
     def get_ring_dihedrals(self, mol):
+        rings = [list(r) for r in Chem.GetSymmSSSR(mol)]
+        logger.info("GetSymmSSSR нашёл %d колец", len(rings))
+
+        if not rings:
+            logger.warning("Кольца не найдены в молекуле — IK недоступен")
+            return [], [], []
+
         edges = []
         for bond in mol.GetBonds():
             if bond.IsInRing():
@@ -265,7 +272,7 @@ class CoefCalculator:
                 all_dihedrals.append(dihedrals)
                 all_dihedral_idxs.append(dihedral_idxs)
 
-        return all_dihedrals, all_ring_traversals, all_dihedral_idxs        
+        return all_dihedrals, all_ring_traversals, all_dihedral_idxs
             
     def convert_all_aromatic_to_aliphatic(
         self,

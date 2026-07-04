@@ -7,3 +7,6 @@ slurm*
 dihedral_logs.db
 grad_log
 out.log
+test.py
+test.ipynb
+.ipynb_checkpoints/
