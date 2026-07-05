@@ -297,7 +297,42 @@ def check_is_broken(
             if np.linalg.norm(coord_matrix[i, :] - coord_matrix[j, :]) <= len_threshold:
                 return True
     return False
- 
+
+def _check_rings_intact(
+    xyz_block: str,
+    original_mol: Chem.rdchem.Mol,
+    bond_threshold: float = 1.8
+) -> bool:
+    """
+    Verifies that all rings of molecule are remained 
+    intact in proposed structure.
+    bond_threshold: the maximum allowed bond length.
+    """
+    lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
+    coords = {}
+    for i, line in enumerate(lines):
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        coords[i] = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    ring_info = original_mol.GetRingInfo()
+    for ring in ring_info.AtomRings():
+        for j in range(len(ring)):
+            a = ring[j]
+            b = ring[(j + 1) % len(ring)]
+            if a not in coords or b not in coords:
+                logger.warning("Атом %d или %d не найден в XYZ блоке", a, b)
+                return False
+            dist = np.linalg.norm(coords[a] - coords[b])
+            if dist > bond_threshold:
+                logger.warning(
+                    "Кольцевая связь %d-%d разомкнулась: длина %.3f Å > %.3f Å",
+                    a, b, dist, bond_threshold
+                )
+                return False
+    return True
+
 def calc_energy(
         mol_file_name: str,
         dihedrals: list[dihedral] = [],
@@ -307,6 +342,7 @@ def calc_energy(
         force_xyz_block: Union[None, str] = None,
         ik_loss=None,
         config: ConfSearchConfig = None,
+        original_mol=None,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -340,6 +376,11 @@ def calc_energy(
             broken_energy,
         )
         return broken_energy, False
+
+    if ik_loss is not None:
+        if not _check_rings_intact(xyz_upd, original_mol, cfg.bond_length_threshold * 2.5):
+            logger.warning("Кольцо разомкнуто в кандидате — пропускаем ORCA")
+            return cfg.broken_struct_energy, False
 
     opt_status = True
 

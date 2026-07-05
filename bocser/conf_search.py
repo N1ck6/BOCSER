@@ -182,6 +182,7 @@ class ConfSearchRunner:
             True,
             constrained_opt=True,
             ik_loss=self.state.ik_loss,
+            original_mol=self.state.mol,
         )
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
@@ -200,6 +201,7 @@ class ConfSearchRunner:
             True,
             force_xyz_block=xyz_from_constrained,
             ik_loss=self.state.ik_loss,
+            original_mol=self.state.mol,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -420,7 +422,8 @@ class ConfSearchRunner:
 
         # Compute normalizing energy (in kcal/mol)
         self.state.norm_energy, _ = calc_energy(
-            self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss
+            self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
+            original_mol=self.state.mol
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
 
