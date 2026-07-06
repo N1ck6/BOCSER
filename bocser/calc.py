@@ -309,6 +309,9 @@ def _check_rings_intact(
     bond_threshold: the maximum allowed bond length.
     """
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
+    start = 2 if lines[0].strip().isdigit() else 0
+    lines = lines[start:]
+
     coords = {}
     for i, line in enumerate(lines):
         parts = line.split()
@@ -477,7 +480,7 @@ def parse_points_from_trj(
                 c_coord = list(map(float, lines[i * (n + 2) + 2 + c].split()[1:]))
                 d_coord = list(map(float, lines[i * (n + 2) + 2 + d].split()[1:]))    
                 cur_d.append(dihedral_angle(a_coord, b_coord, c_coord, d_coord))
-            result.append((cur_d, energy))
+            result.append((cur_d, energy, structures[i]))
     
     logger.debug("Points in trj: %s", len(result))
     
@@ -485,19 +488,16 @@ def parse_points_from_trj(
         minima_node = {
             "coords": result[0][0],
             "rel_en": result[0][1],
-            "xyz_block": structures[0],
+            "xyz_block": result[0][2],
         }
         return result, minima_node
 
-    points, obs = list(zip(*result[1:]))
+    points, obs, _ = list(zip(*result[1:]))
 
     num_of_clusters = min(3, len(points))
     logger.debug("Num of clusters: %s", num_of_clusters)
 
     vals = {cluster_id : (1e9, -1) for cluster_id in range(num_of_clusters)}
-
-    #print(points)
-    #print(len(points))
 
     model = KMeans(n_clusters=num_of_clusters)
     model.fit(points)
@@ -507,8 +507,7 @@ def parse_points_from_trj(
         #print(cluster)
         if vals[cluster][0] > obs[i]:
             vals[cluster] = obs[i], i
-    #print(len(vals))
-    #print(vals)
+    
     logger.debug("PARSING POINTS, CLUSTER NUM = %s", num_of_clusters)
     if save_structs:
         logger.info("SAVING STRUCTS")
@@ -533,4 +532,10 @@ def parse_points_from_trj(
         "xyz_block" : structures[-1]
     }
 
-    return [result[0]] + [(points[vals[cluster_id][1]], vals[cluster_id][0]) for cluster_id in vals], minima_node
+    return (
+        [result[0]] + [
+            (points[vals[cluster_id][1]], vals[cluster_id][0], result[vals[cluster_id][1] + 1][2])
+            for cluster_id in vals
+        ],
+        minima_node
+    )

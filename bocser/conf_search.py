@@ -30,6 +30,7 @@ from calc import (
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
     _qc_calcs_dir,
+    _check_rings_intact,
 )
 from run_state import increase_structure_id
 import config_manager
@@ -244,31 +245,56 @@ class ConfSearchRunner:
             structures_path=self.state.structures_path,
             return_minima=True,
         )
+        # Filter out frames where rings opened during ORCA optimization
+        valid_degrees, valid_energies = [], []
+        for coords, energy, xyz_block in parsed_data:
+            if self.state.ik_loss is not None:
+                if not _check_rings_intact(xyz_block, self.state.mol):
+                    logger.warning(
+                        "Discarding trajectory frame (energy=%.3f kcal/mol): "
+                        "ring opened during optimization",
+                        energy
+                    )
+                    continue
+            valid_degrees.append(coords)
+            valid_energies.append(energy)
 
-        minima_file = os.path.join(
-            self.state.working_folder,
-            f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz"
-        )
-        with open(minima_file, "w") as minima_xyz_writer:
-            minima_xyz_writer.write(last_point["xyz_block"])
+        if not valid_degrees:
+            logger.warning(
+                "All trajectory frames from %s discarded (rings broken in all frames). "
+                "Dataset unchanged.",
+                trj_filename
+            )
+            return dataset
 
-        self.state.minima.append((last_point["coords"], last_point["rel_en"]))
+        # Validate last_point before saving to minima list.
+        last_xyz = last_point["xyz_block"]
+        if self.state.ik_loss is None or _check_rings_intact(last_xyz, self.state.mol):
+            minima_file = os.path.join(
+                self.state.working_folder,
+                f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz"
+            )
+            with open(minima_file, "w") as minima_xyz_writer:
+                minima_xyz_writer.write(last_xyz)
+            self.state.minima.append((last_point["coords"], last_point["rel_en"]))
+        else:
+            logger.warning(
+                "Last trajectory point (energy=%.3f kcal/mol) discarded: "
+                "ring opened during optimization. Not added to minima.",
+                last_point["rel_en"]
+            )
 
-        logger.debug("Parsed data: %s", parsed_data)
-        degrees, energies = zip(*parsed_data)
-        logger.debug("Degrees: %s\nEnergies: %s", degrees, energies)
+        logger.debug("Valid frames: %d / %d", len(valid_degrees), len(parsed_data))
+        logger.debug("Degrees: %s\nEnergies: %s", valid_degrees, valid_energies)
 
-        self.state.global_degrees.extend(degrees)
+        self.state.global_degrees.extend(valid_degrees)
 
         add_part = Dataset(
-            tf.constant(list(degrees), dtype="double"),
-            tf.constant(list(energies), dtype="double").reshape(len(energies), 1),
+            tf.constant(valid_degrees, dtype="double"),
+            tf.constant(valid_energies, dtype="double").reshape(len(valid_energies), 1),
         )
 
-        if not dataset:
-            return add_part
-        else:
-            return dataset + add_part
+        return add_part if not dataset else dataset + add_part
 
     def _erase_last_from_dataset(self, dataset: Dataset, n: int = 1) -> Dataset:
         """Remove last n points from dataset."""
