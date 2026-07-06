@@ -378,8 +378,10 @@ class ConfSearchRunner:
         except Exception as e:
             self.state.ik_loss = None
             self.state.ik_loss_dihedrals_idxs = []
-            logger.exception("Failed to prepare IK loss")
-            raise e
+            logger.exception(
+                "Failed to prepare IK loss: %s. "
+                "Possible cause: unsupported ring topology. Falling back to evm.", e
+            )
 
         self.state.search_dim = len(self.state.dihedral_ids)
         logger.info("Cur search dim is %s", self.state.search_dim)

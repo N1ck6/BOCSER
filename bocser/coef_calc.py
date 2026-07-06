@@ -232,6 +232,10 @@ class CoefCalculator:
                 edges.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))
 
         graph = nx.from_edgelist(edges)
+        if graph.number_of_edges() == 0:
+            logger.warning("Ring graph has no edges, IK unavailable")
+            return [], [], []
+
         graph.remove_edges_from(nx.bridges(graph))
 
         all_dihedrals = []
