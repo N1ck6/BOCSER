@@ -210,7 +210,7 @@ def start_calc(gjf_name: str, scan=False):
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
     
     timeout_minutes = cfg.orca_poll_timeout_minutes
-    subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), sbatch_name])    
+    subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name])
     
 def _qc_calcs_dir(mol_file_name: str) -> Path:
     """Return path to the QC calculation subfolder, creating it if needed."""

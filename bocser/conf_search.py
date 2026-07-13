@@ -713,6 +713,11 @@ def main():
     """Entry point for the conformational search orchestrator."""
     import argparse
 
+    logging.basicConfig( # Output all project info
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         prog="bo_confsearch",
         description="Bayesian optimization for conformational search",
