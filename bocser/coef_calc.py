@@ -189,14 +189,20 @@ class CoefCalculator:
             returns list with same molecules but with
             Hs and generated coords by ETKDG
         """
-
         result = []
-
         for mol in lst:
             mol = Chem.AddHs(mol)
-            AllChem.EmbedMolecule(mol)
+            res = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+            if res == -1:
+                # Fallback: random coordinates + MMFF minimization
+                res = AllChem.EmbedMolecule(mol, randomSeed=42, useRandomCoords=True)
+            if res == -1:
+                logger.error(
+                    "EmbedMolecule failed for %s — skipping fragment",
+                    Chem.MolToSmiles(Chem.RemoveAllHs(mol))
+                )
+                continue
             result.append(mol)
-
         return result
 
     def get_idxs_to_rotate(self,
@@ -253,6 +259,14 @@ class CoefCalculator:
 
             for cycle in cycles:
                 ring_nodes = cycle
+
+                if len(ring_nodes) < 4:
+                    logger.warning(
+                        "Skipping ring of size %d (atoms %s): "
+                        "too small for dihedral definition, IK not applicable",
+                        len(ring_nodes), ring_nodes
+                    )
+                    continue
 
                 ring_traversal = CyclicCollection(ring_nodes)
                 all_ring_traversals.append(ring_traversal.a)
@@ -351,6 +365,8 @@ class CoefCalculator:
                     set(ring) for ring in ring_info.AtomRings()
                     if bond.GetBeginAtomIdx() in ring and bond.GetEndAtomIdx() in ring
                 ]
+                # skip 3-atom rings
+                bond_rings = [r for r in bond_rings if len(r) >= 4]
                 rings_to_process = bond_rings if bond_rings else [None]
             else:
                 rings_to_process = [None]
@@ -400,9 +416,11 @@ class CoefCalculator:
 
                 old_idxs = ()
                 for res in query_result:
-                    if all(cur in atoms_to_use for cur in res):
+                    if len(res) == 4 and all(cur in atoms_to_use for cur in res):
                         old_idxs = res
                         break
+                    elif len(res) != 4:
+                        logger.warning("Skipping dihedral match with %d atoms (need 4): %s", len(res), res)
 
                 if not old_idxs:
                     logger.error(
@@ -591,8 +609,8 @@ class CoefCalculator:
         for idxs in self.frags:
             result.append((list(idxs), unique_coefs[self.frags[idxs]]))
         
-        logger.info("DB Content:")
+        logger.debug("DB Content:")
         for cur in self.db_connector.get_request('select * from dihedrals'):
-            logger.info("%s", "|".join(map(str, cur)))
+            logger.debug("%s", "|".join(map(str, cur)))
 
         return result
