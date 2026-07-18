@@ -225,11 +225,12 @@ class CoefCalculator:
         )
 
     def get_ring_dihedrals(self, mol):
-        rings = [list(r) for r in Chem.GetSymmSSSR(mol)]
-        logger.info("GetSymmSSSR нашёл %d колец", len(rings))
+        all_rings = [list(r) for r in Chem.GetSymmSSSR(mol)]
+        rings = [r for r in all_rings if len(r) >= 4]
+        logger.info("GetSymmSSSR found %d cycles, %d for use", len(all_rings), len(rings))
 
         if not rings:
-            logger.warning("Кольца не найдены в молекуле — IK недоступен")
+            logger.warning("Rings are not found in molecule, IK unavailable")
             return [], [], []
 
         edges = []
@@ -357,7 +358,7 @@ class CoefCalculator:
 
             # For ring bonds under the ik acquisition function, process each
             # ring the bond belongs to separately so that self.frags gets a
-            # distinct 4-atom key per ring.  This is necessary for fused ring
+            # distinct 4-atom key per ring. This is necessary for fused ring
             # systems (e.g. decalin) where a shared bond must contribute to
             # the ring-closure constraints of both rings.
             if self.af == 'ik' and bond.IsInRing():
@@ -371,6 +372,7 @@ class CoefCalculator:
             else:
                 rings_to_process = [None]
 
+            minor_rings = []
             for ring_atoms in rings_to_process:
                 if ring_atoms is not None:
                     atoms_to_use = ring_atoms
@@ -415,18 +417,23 @@ class CoefCalculator:
                 logger.debug("query_result: %s", query_result)
 
                 old_idxs = ()
+                minor_cycles = []
                 for res in query_result:
                     if len(res) == 4 and all(cur in atoms_to_use for cur in res):
                         old_idxs = res
                         break
                     elif len(res) != 4:
-                        logger.warning("Skipping dihedral match with %d atoms (need 4): %s", len(res), res)
+                        if res not in minor_cycles:
+                            logger.warning("Skipping dihedral match with %d atoms (need 4): %s", len(res), res)
+                            minor_cycles.append(res)
 
                 if not old_idxs:
-                    logger.error(
-                        "No matching substructure found for fragment %s (atoms %s) in molecule — skipping dihedral",
-                        frag_smiles, atoms_to_use,
-                    )
+                    if atoms_to_use not in minor_rings:
+                        logger.error(
+                            "No matching substructure found for fragment %s (atoms %s) in molecule — skipping dihedral",
+                            frag_smiles, atoms_to_use,
+                        )
+                        minor_rings.append(atoms_to_use)
                     continue
 
                 self.frags[old_idxs] = self.unique_frags[frag_smiles]

@@ -479,8 +479,22 @@ class ConfSearchRunner:
             logger.info("Init dataset collected! %s", dataset)
         else:
             for idx in range(config.num_initial_points):
-                AllChem.EmbedMolecule(self.state.mol)
-                initial_query_points = self._extract_dofs_values(self.state.mol)
+                # Check conformer existance
+                mol_copy = Chem.RWMol(self.state.mol)
+                mol_copy.RemoveAllConformers()
+
+                res = AllChem.EmbedMolecule(mol_copy, AllChem.ETKDGv3())
+                if res == -1:
+                    res = AllChem.EmbedMolecule(mol_copy, randomSeed=idx, useRandomCoords=True)
+                if res == -1:
+                    # Fallback: use same geometry from .mol file
+                    logger.warning(
+                        "EmbedMolecule failed for initial point %d "
+                        "Using original .mol geometry.", idx
+                    )
+                    mol_copy = self.state.mol
+
+                initial_query_points = self._extract_dofs_values(mol_copy)
                 observed_point = observer(initial_query_points)
                 if not self.state.last_opt_ok:
                     logger.warning(

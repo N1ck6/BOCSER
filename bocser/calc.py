@@ -325,12 +325,12 @@ def _check_rings_intact(
             a = ring[j]
             b = ring[(j + 1) % len(ring)]
             if a not in coords or b not in coords:
-                logger.warning("Атом %d или %d не найден в XYZ блоке", a, b)
+                logger.warning("Atom %d or %d is not found in XYZ block", a, b)
                 return False
             dist = np.linalg.norm(coords[a] - coords[b])
             if dist > bond_threshold:
                 logger.warning(
-                    "Кольцевая связь %d-%d разомкнулась: длина %.3f Å > %.3f Å",
+                    "Ring bond %d-%d opened: length %.3f Å > %.3f Å",
                     a, b, dist, bond_threshold
                 )
                 return False
@@ -382,7 +382,7 @@ def calc_energy(
 
     if ik_loss is not None:
         if not _check_rings_intact(xyz_upd, original_mol, cfg.bond_length_threshold * 2.5):
-            logger.warning("Кольцо разомкнуто в кандидате — пропускаем ORCA")
+            logger.warning("Ring has opened in candidate — skipping ORCA")
             return cfg.broken_struct_energy, False
 
     opt_status = True
