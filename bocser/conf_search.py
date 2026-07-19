@@ -449,11 +449,18 @@ class ConfSearchRunner:
         )
 
         # Compute normalizing energy (in kcal/mol)
-        self.state.norm_energy, _ = calc_energy(
+        self.state.norm_energy, ok = calc_energy(
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
             original_mol=self.state.mol
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
+        if not ok:
+            raise RuntimeError(
+                f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
+                f"(norm_energy={self.state.norm_energy}). "
+                f"If this is a transition state with stretched bonds, set ts: true and "
+                f"increase ts_ring_bond_threshold in config."
+            )
 
         observer = trieste.objectives.utils.mk_observer(self._func_objective)
 
@@ -487,14 +494,21 @@ class ConfSearchRunner:
                 if res == -1:
                     res = AllChem.EmbedMolecule(mol_copy, randomSeed=idx, useRandomCoords=True)
                 if res == -1:
-                    # Fallback: use same geometry from .mol file
+                    # Fallback: use geometry from .mol file
                     logger.warning(
                         "EmbedMolecule failed for initial point %d "
-                        "Using original .mol geometry.", idx
+                        "Using original .mol geometry with random dihedral perturbation.", idx
                     )
                     mol_copy = self.state.mol
+                    # Perturbation: random dihedrals instead of geometry from a file
+                    random_dihedrals = tf.constant(
+                        [[np.random.uniform(0, 2*np.pi) for _ in range(self.state.search_dim)]],
+                        dtype=tf.float64
+                    )
+                    initial_query_points = random_dihedrals
+                else:
+                    initial_query_points = self._extract_dofs_values(mol_copy)
 
-                initial_query_points = self._extract_dofs_values(mol_copy)
                 observed_point = observer(initial_query_points)
                 if not self.state.last_opt_ok:
                     logger.warning(
@@ -563,7 +577,25 @@ class ConfSearchRunner:
 
         logger.debug("Initial data: %s", dataset)
 
-        model.optimize(dataset)
+        # Check if all values are the same
+        obs = dataset.observations.numpy().flatten()
+        if np.all(obs >= config.broken_struct_energy * 0.9):
+            logger.error(
+                "All %d observations are broken_struct_energy (%.1f). "
+                "GP training will be numerically unstable. "
+                "Check norm_energy calculation and ring geometry.",
+                len(obs), config.broken_struct_energy
+            )
+
+        try:
+            model.optimize(dataset)
+        except Exception as e:
+            logger.error(
+                "GP optimization failed: %s. "
+                "Likely cause: degenerate dataset (all observations are broken_struct_energy). "
+                "Skipping hyperparameter update for this step.",
+                e
+            )
 
         self.state.model_chk = gpflow.utilities.deepcopy(model.model)
         self.state.current_minima = tf.reduce_min(dataset.observations).numpy()

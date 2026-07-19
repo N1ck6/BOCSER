@@ -308,6 +308,7 @@ def _check_rings_intact(
     intact in proposed structure.
     bond_threshold: the maximum allowed bond length.
     """
+    cfg.ts
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
     start = 2 if lines[0].strip().isdigit() else 0
     lines = lines[start:]
@@ -381,7 +382,9 @@ def calc_energy(
         return broken_energy, False
 
     if ik_loss is not None:
-        if not _check_rings_intact(xyz_upd, original_mol, cfg.bond_length_threshold * 2.5):
+        bond_length = cfg.bond_length_threshold * 2.5 # 1.75 for normal
+        if cfg.ts: bond_length += 0.75 # more length for ts
+        if not _check_rings_intact(xyz_upd, original_mol, bond_length):
             logger.warning("Ring has opened in candidate — skipping ORCA")
             return cfg.broken_struct_energy, False
 
