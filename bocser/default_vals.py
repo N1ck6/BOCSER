@@ -11,7 +11,8 @@ class ConfSearchConfig:
     num_of_procs : int = 8
     orca_method : str = "lda sto-3g"
     broken_struct_energy : float = 100.
-    bond_length_threshold : float = 0.7
+    bond_length_threshold : float = 0.7 # Deprecated
+    ts_bond_slack: float = 0.25
     ts : bool = False
     use_grass : bool = False
     path_to_grass : str = ""

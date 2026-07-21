@@ -24,6 +24,38 @@ import run_state
 
 HARTRI_TO_KCAL = 627.509474063 
 
+# Used in check_is_broken to detect atom clashes
+_VDW_RADII: dict[str, float] = {
+    'H':  1.20, 'C':  1.70, 'N':  1.55, 'O':  1.52,
+    'F':  1.47, 'P':  1.80, 'S':  1.80, 'Cl': 1.75,
+    'Br': 1.85, 'I':  1.98, 'Se': 1.90, 'Si': 2.10,
+}
+
+# Used in _check_rings_intact to detect broken ring bonds
+_COVALENT_RADII: dict[str, float] = {
+    'H':  0.31, 'C':  0.76, 'N':  0.71, 'O':  0.66,
+    'F':  0.57, 'P':  1.07, 'S':  1.05, 'Cl': 1.02,
+    'Br': 1.20, 'I':  1.39, 'Se': 1.20, 'Si': 1.11,
+}
+
+# fallback: carbon
+_COVALENT_RADII_DEFAULT = 0.76
+_VDW_RADII_DEFAULT = 1.70
+
+
+def _clash_threshold(sym_a: str, sym_b: str) -> float:
+    """Minimum allowed distance between two atoms before they are considered clashing."""
+    ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
+    rb = _VDW_RADII.get(sym_b, _VDW_RADII_DEFAULT)
+    return ra + rb # - 0.4 for only Serious clashes detection
+
+
+def _bond_break_threshold(sym_a: str, sym_b: str, delta: float = 0.1) -> float:
+    """Maximum allowed distance for a ring bond before it is considered broken."""
+    ra = _COVALENT_RADII.get(sym_a, _COVALENT_RADII_DEFAULT)
+    rb = _COVALENT_RADII.get(sym_b, _COVALENT_RADII_DEFAULT)
+    return ra + rb + delta # delta = 0.5 info from web
+
 #Alias for type of node about dihedral angle 
 #that consists of list with four atoms and value of degree
 dihedral = tuple[list[int], float]
@@ -270,48 +302,65 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
         return cfg.broken_struct_energy, False
 
 def check_is_broken(
-    xyz_block : str,
-    len_threshold : float | None = None
+    xyz_block: str,
+    len_threshold: float | None = None,
 ) -> bool:
-    # Determine bond-length threshold from config unless explicitly provided
-    if len_threshold is None:
-        cfg = _get_config_or_raise()
-        len_threshold = cfg.bond_length_threshold
+    """Return True if any two atoms in xyz_block are unphysically close.
+    When len_threshold is None sum of radii is used instead,
+    which is physically more accurate and avoids false positives for heavy atoms.
+    """
+    lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
 
-    coord_matrix = np.asarray(
-        list(
-            map(
-                lambda s: list(
-                    map(
-                        float, 
-                        s.split()[1:]
-                    )
-                ),
-                xyz_block.strip().split('\n')
-            )
-        )
-    )
-    for i in range(coord_matrix.shape[0]):
-        for j in range(i+1, coord_matrix.shape[0]):
-            #print(np.linalg.norm(coord_matrix[i, :] - coord_matrix[j, :]))
-            if np.linalg.norm(coord_matrix[i, :] - coord_matrix[j, :]) <= len_threshold:
+    # Strip XYZ header (first two lines) if present
+    if lines and lines[0].strip().lstrip('-').isdigit():
+        lines = lines[2:]
+
+    symbols = []
+    coords = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        symbols.append(parts[0])
+        coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    coord_matrix = np.array(coords)
+    n = coord_matrix.shape[0]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(coord_matrix[i] - coord_matrix[j])
+            if len_threshold is not None:
+                # Legacy behaviour: single global threshold
+                threshold = len_threshold
+            else:
+                threshold = _clash_threshold(symbols[i], symbols[j])
+            if dist <= threshold:
+                logger.warning(
+                    "Clash detected: atoms %d(%s) and %d(%s) distance=%.3f A "
+                    "<= threshold=%.3f A",
+                    i, symbols[i], j, symbols[j], dist, threshold
+                )
                 return True
     return False
 
 def _check_rings_intact(
     xyz_block: str,
     original_mol: Chem.rdchem.Mol,
-    bond_threshold: float = 1.8
+    bond_threshold: float | None = None,
 ) -> bool:
     """
     Verifies that all rings of molecule are remained 
     intact in proposed structure.
     bond_threshold: the maximum allowed bond length.
     """
-    cfg.ts
+
+    cfg = _get_config_or_raise()
+    ts_slack = cfg.ts_bond_slack if cfg.ts else 0.0
+
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
-    start = 2 if lines[0].strip().isdigit() else 0
-    lines = lines[start:]
+    if lines and lines[0].strip().lstrip('-').isdigit():
+        lines = lines[2:]
 
     coords = {}
     for i, line in enumerate(lines):
@@ -320,21 +369,36 @@ def _check_rings_intact(
             continue
         coords[i] = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
 
-    ring_info = original_mol.GetRingInfo()
-    for ring in ring_info.AtomRings():
+    for ring in original_mol.GetRingInfo().AtomRings():
         for j in range(len(ring)):
             a = ring[j]
             b = ring[(j + 1) % len(ring)]
+
             if a not in coords or b not in coords:
-                logger.warning("Atom %d or %d is not found in XYZ block", a, b)
-                return False
-            dist = np.linalg.norm(coords[a] - coords[b])
-            if dist > bond_threshold:
                 logger.warning(
-                    "Ring bond %d-%d opened: length %.3f Å > %.3f Å",
-                    a, b, dist, bond_threshold
+                    "Ring atom %d or %d missing from xyz block", a, b
                 )
                 return False
+
+            dist = np.linalg.norm(coords[a] - coords[b])
+
+            if bond_threshold is not None:
+                threshold = bond_threshold
+            else:
+                sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
+                sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
+                threshold = _bond_break_threshold(sym_a, sym_b) + ts_slack
+
+            if dist > threshold:
+                sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
+                sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
+                logger.warning(
+                    "Ring bond %d(%s)-%d(%s) opened: length %.3f A "
+                    "> vdw threshold %.3f A (ts_slack=%.2f)",
+                    a, sym_a, b, sym_b, dist, threshold, ts_slack
+                )
+                return False
+
     return True
 
 def calc_energy(
@@ -372,19 +436,16 @@ def calc_energy(
 
     logger.debug("dihedrals after: %s", dihedrals)
 
-    if check_is_broken(xyz_upd, bond_len_threshold):
+    if check_is_broken(xyz_upd):
         broken_energy = cfg.broken_struct_energy
         logger.warning(
-            "Seems that some atoms in current structure are closer than %s! Returning broken_struct_energy=%s",
-            bond_len_threshold,
+            "Seems that some atoms in current structure are closer than the threshold! Returning broken_struct_energy=%s",
             broken_energy,
         )
         return broken_energy, False
 
     if ik_loss is not None:
-        bond_length = cfg.bond_length_threshold * 2.5 # 1.75 for normal
-        if cfg.ts: bond_length += 0.75 # more length for ts
-        if not _check_rings_intact(xyz_upd, original_mol, bond_length):
+        if not _check_rings_intact(xyz_upd, original_mol):
             logger.warning("Ring has opened in candidate — skipping ORCA")
             return cfg.broken_struct_energy, False
 
