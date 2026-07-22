@@ -24,14 +24,12 @@ import run_state
 
 HARTRI_TO_KCAL = 627.509474063 
 
-# Used in check_is_broken to detect atom clashes
 _VDW_RADII: dict[str, float] = {
     'H':  1.20, 'C':  1.70, 'N':  1.55, 'O':  1.52,
     'F':  1.47, 'P':  1.80, 'S':  1.80, 'Cl': 1.75,
     'Br': 1.85, 'I':  1.98, 'Se': 1.90, 'Si': 2.10,
 }
 
-# Used in _check_rings_intact to detect broken ring bonds
 _COVALENT_RADII: dict[str, float] = {
     'H':  0.31, 'C':  0.76, 'N':  0.71, 'O':  0.66,
     'F':  0.57, 'P':  1.07, 'S':  1.05, 'Cl': 1.02,
@@ -45,16 +43,17 @@ _VDW_RADII_DEFAULT = 1.70
 
 def _clash_threshold(sym_a: str, sym_b: str) -> float:
     """Minimum allowed distance between two atoms before they are considered clashing."""
+    return 0.7 # ON HOLD
+
     ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
     rb = _VDW_RADII.get(sym_b, _VDW_RADII_DEFAULT)
-    return ra + rb # - 0.4 for only Serious clashes detection
-
+    return ra + rb
 
 def _bond_break_threshold(sym_a: str, sym_b: str, delta: float = 0.1) -> float:
     """Maximum allowed distance for a ring bond before it is considered broken."""
-    ra = _COVALENT_RADII.get(sym_a, _COVALENT_RADII_DEFAULT)
-    rb = _COVALENT_RADII.get(sym_b, _COVALENT_RADII_DEFAULT)
-    return ra + rb + delta # delta = 0.5 info from web
+    ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
+    rb = _VDW_RADII.get(sym_b, _VDW_RADII_DEFAULT)
+    return ra + rb + delta
 
 #Alias for type of node about dihedral angle 
 #that consists of list with four atoms and value of degree
@@ -356,7 +355,7 @@ def _check_rings_intact(
     """
 
     cfg = _get_config_or_raise()
-    ts_slack = cfg.ts_bond_slack if cfg.ts else 0.0
+    ts_multiplier = 0.75 if cfg.ts else 0.5
 
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
     if lines and lines[0].strip().lstrip('-').isdigit():
@@ -387,15 +386,15 @@ def _check_rings_intact(
             else:
                 sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
                 sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
-                threshold = _bond_break_threshold(sym_a, sym_b) + ts_slack
+                threshold = _bond_break_threshold(sym_a, sym_b) * ts_multiplier
 
             if dist > threshold:
                 sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
                 sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
                 logger.warning(
                     "Ring bond %d(%s)-%d(%s) opened: length %.3f A "
-                    "> vdw threshold %.3f A (ts_slack=%.2f)",
-                    a, sym_a, b, sym_b, dist, threshold, ts_slack
+                    "> vdw threshold %.3f A",
+                    a, sym_a, b, sym_b, dist, threshold
                 )
                 return False
 
