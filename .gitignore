@@ -1,4 +1,3 @@
-tests/*
 /bocser/__pycache__/
 
 *.gbw
@@ -10,3 +9,13 @@ out.log
 test.py
 test.ipynb
 .ipynb_checkpoints/
+
+# Testing results
+tests/**/*
+!tests/**/
+
+!tests/**/*_all_points.json
+!tests/**/*_clustering_results.json
+!tests/**/*_final_ensemble.xyz
+!tests/**/*.mol
+!tests/**/*config.yaml
