@@ -320,6 +320,29 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
         cfg = _get_config_or_raise()
         return cfg.broken_struct_energy, False
 
+def _save_broken_struct(
+    coords_block: str,
+    broken_structs_dir: Union[str, None],
+    reason: str,
+) -> None:
+    """Save a discarded/broken candidate geometry for later inspection (e.g. in ChemCraft)."""
+
+    if not broken_structs_dir:
+        return
+    try:
+        lines = [l for l in coords_block.strip("\n").split("\n") if l.strip()]
+        n_atoms = len(lines)
+        struct_id = run_state.peek_structure_id()
+        Path(broken_structs_dir).mkdir(parents=True, exist_ok=True)
+        out_path = Path(broken_structs_dir) / f"{struct_id}_{reason}.xyz"
+        with open(out_path, "w") as fh:
+            fh.write(f"{n_atoms}\n{reason}\n")
+            fh.write("\n".join(lines))
+            fh.write("\n")
+        logger.info("Saved broken candidate (%s) to %s", reason, out_path)
+    except Exception:
+        logger.exception("Failed to save broken structure (%s) to %s", reason, broken_structs_dir)
+
 def check_is_broken(
     xyz_block: str,
     len_threshold: float | None = None,
@@ -430,6 +453,7 @@ def calc_energy(
         ik_loss=None,
         config: ConfSearchConfig = None,
         original_mol=None,
+        broken_structs_dir: Union[str, None] = None,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -461,11 +485,13 @@ def calc_energy(
             "Seems that some atoms in current structure are closer than the threshold! Returning broken_struct_energy=%s",
             broken_energy,
         )
+        _save_broken_struct(xyz_upd, broken_structs_dir, "clash")
         return broken_energy, False
 
     if ik_loss is not None:
         if not _check_rings_intact(xyz_upd, original_mol):
             logger.warning("Ring has opened in candidate — skipping ORCA")
+            _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open")
             return cfg.broken_struct_energy, False
 
     opt_status = True
@@ -494,6 +520,8 @@ def calc_energy(
     res, opt_status = find_energy_in_log(out_name) 
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
+    if not opt_status:
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed")
     return res, opt_status
 
 def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:

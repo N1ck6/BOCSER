@@ -93,6 +93,7 @@ class ConfSearchState:
     global_degrees: list = field(default_factory=list)
     asked_points: list = field(default_factory=list)
     minima: list = field(default_factory=list)
+    broken_structs_path: str = ""
     model_chk: Optional[Any] = None
     current_minima: float = 1e9
     acq_vals_log: list = field(default_factory=list)
@@ -184,6 +185,7 @@ class ConfSearchRunner:
             constrained_opt=True,
             ik_loss=self.state.ik_loss,
             original_mol=self.state.mol,
+            broken_structs_dir=self.state.broken_structs_path,
         )
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
@@ -203,6 +205,7 @@ class ConfSearchRunner:
             force_xyz_block=xyz_from_constrained,
             ik_loss=self.state.ik_loss,
             original_mol=self.state.mol,
+            broken_structs_dir=self.state.broken_structs_path,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -358,6 +361,10 @@ class ConfSearchRunner:
         Path(self.state.structures_path).mkdir(parents=True, exist_ok=True)
         minima_path = Path(self.state.working_folder) / f"{config.exp_name}_minima/"
         minima_path.mkdir(parents=True, exist_ok=True)
+
+        broken_path = Path(self.state.working_folder) / f"{config.exp_name}_broken/"
+        broken_path.mkdir(parents=True, exist_ok=True)
+        self.state.broken_structs_path = str(broken_path)
 
         if config.acquisition_function not in {"ei", "evm", "ik"}:
             logger.warning(
