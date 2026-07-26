@@ -109,6 +109,26 @@ def change_dihedrals(mol_file_name: str,
                     ff.MMFFAddAngleConstraint(a, b, c, False,
                                               np.rad2deg(value),
                                               np.rad2deg(value), 1e2)
+            
+            # Prevent deformation of discarded rings that IKLoss does not cover
+            ik_covered_bonds = {
+                frozenset(bond) for bl_dict in ik_loss.bond_lengths for bond in bl_dict
+            }
+            conf0 = mol.GetConformer()
+            for ring in mol.GetRingInfo().AtomRings():
+                if len(ring) >= 4:
+                    continue  # already constrained above
+                n = len(ring)
+                for k in range(n):
+                    a, b = ring[k], ring[(k + 1) % n]
+                    if frozenset((a, b)) in ik_covered_bonds:
+                        continue
+                    dist = conf0.GetAtomPosition(a).Distance(conf0.GetAtomPosition(b))
+                    ff.MMFFAddDistanceConstraint(a, b, False, dist, dist, 1e3)
+                for k in range(n):
+                    a, b, c = ring[k - 1], ring[k], ring[(k + 1) % n]
+                    angle_deg = rdMolTransforms.GetAngleDeg(conf0, a, b, c)
+                    ff.MMFFAddAngleConstraint(a, b, c, False, angle_deg, angle_deg, 1e2)
 
             for (a, b, c, d), value in dihedrals:
                 ff.MMFFAddTorsionConstraint(a, b, c, d, False,

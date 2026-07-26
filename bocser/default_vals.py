@@ -13,6 +13,8 @@ class ConfSearchConfig:
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7 # Deprecated
     ts : bool = False
+    ring_bond_threshold : float = 1.75
+    ts_ring_bond_threshold : float = 2.5
     use_grass : bool = False
     path_to_grass : str = ""
     grass_options : str = ""
