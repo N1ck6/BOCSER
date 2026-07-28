@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 import config_manager
 import run_state
 
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
 HARTRI_TO_KCAL = 627.509474063 
 
 _VDW_RADII: dict[str, float] = {
@@ -83,6 +85,17 @@ def change_dihedrals(mol_file_name: str,
                      full_block=False):
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+
+        heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() != 'H']
+        h_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'H']
+        mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
+
+        # Return reference geometry if no torsion angles are provided
+        if not dihedrals:
+            if full_block:
+                return Chem.MolToXYZBlock(mol)
+            return '\n'.join(Chem.MolToXYZBlock(mol).split('\n')[2:])
+        
         # Read acquisition function from central config (require config to be set)
         _cfg = _get_config_or_raise()
         _af = _cfg.acquisition_function
@@ -465,7 +478,6 @@ def calc_energy(
         cfg = _get_config_or_raise()
     else:
         cfg = config
-    bond_len_threshold = cfg.bond_length_threshold
 
     logger.debug("Calc with save_struct=%s", save_structs)
 
@@ -488,8 +500,7 @@ def calc_energy(
         _save_broken_struct(xyz_upd, broken_structs_dir, "clash")
         return broken_energy, False
 
-    if ik_loss is not None:
-        if not _check_rings_intact(xyz_upd, original_mol):
+    if ik_loss is not None and not _check_rings_intact(xyz_upd, original_mol):
             logger.warning("Ring has opened in candidate — skipping ORCA")
             _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open")
             return cfg.broken_struct_energy, False

@@ -368,7 +368,9 @@ class CoefCalculator:
                 ]
                 # skip 3-atom rings
                 bond_rings = [r for r in bond_rings if len(r) >= 4]
-                rings_to_process = bond_rings if bond_rings else [None]
+                if not bond_rings:
+                    continue
+                rings_to_process = bond_rings
             else:
                 rings_to_process = [None]
 

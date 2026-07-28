@@ -51,6 +51,10 @@ tf.config.run_functions_eagerly(True)
 import logging
 logger = logging.getLogger(__name__)
 
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+tf.autograph.set_verbosity(0)
+
+
 
 class PotentialFunction:
     """Wrapper for mean function coefficients used in kernel computations."""
@@ -458,15 +462,16 @@ class ConfSearchRunner:
         # Compute normalizing energy (in kcal/mol)
         self.state.norm_energy, ok = calc_energy(
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
-            original_mol=self.state.mol
+            original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
         if not ok:
             raise RuntimeError(
                 f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
-                f"(norm_energy={self.state.norm_energy}). "
-                f"If this is a transition state with stretched bonds, set ts: true and "
-                f"increase ts_ring_bond_threshold in config."
+                f"(norm_energy={self.state.norm_energy}). Check the log immediately above this "
+                f"error for the specific cause (atom clash, ring-opened, or ORCA optimization "
+                f"failure) — increasing thresholds will not help if the geometry itself is being "
+                f"altered before ORCA ever runs."
             )
 
         observer = trieste.objectives.utils.mk_observer(self._func_objective)
@@ -495,9 +500,11 @@ class ConfSearchRunner:
             for idx in range(config.num_initial_points):
                 # Check conformer existance
                 mol_copy = Chem.RWMol(self.state.mol)
+                mol_copy = Chem.AddHs(mol_copy) # Silence RDkit warning
                 mol_copy.RemoveAllConformers()
-
                 res = AllChem.EmbedMolecule(mol_copy, AllChem.ETKDGv3())
+                mol_copy = Chem.RemoveHs(mol_copy)
+
                 if res == -1:
                     res = AllChem.EmbedMolecule(mol_copy, randomSeed=idx, useRandomCoords=True)
                 if res == -1:
@@ -671,7 +678,8 @@ class ConfSearchRunner:
                 logger.debug("Unable to read current minima from acquisition function" )
             logger.info("Updated!")
 
-            logger.info("Step %s completed! Current dataset is: %s", step, dataset)
+            logger.info("Step %s completed!", step)
+            logger.debug("Current dataset is: %s", dataset)
 
             all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
             with open(all_minima_file, "w") as json_minima_writer:
