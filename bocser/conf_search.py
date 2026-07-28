@@ -605,11 +605,25 @@ class ConfSearchRunner:
             model.optimize(dataset)
         except Exception as e:
             logger.error(
-                "GP optimization failed: %s. "
-                "Likely cause: degenerate dataset (all observations are broken_struct_energy). "
-                "Skipping hyperparameter update for this step.",
-                e
+                "Initial GP optimization failed: %s. "
+                "Likely cause: degenerate dataset — all observations are broken_struct_energy (%.1f). "
+                "Check norm_energy calculation and ring geometry in .mol file.",
+                e, config.broken_struct_energy
             )
+            # Диагностика датасета
+            obs = dataset.observations.numpy().flatten()
+            n_broken = int(np.sum(obs >= config.broken_struct_energy * 0.9))
+            logger.error(
+                "Dataset diagnostics: %d points total, %d broken (>=%.1f), "
+                "min=%.3f, max=%.3f",
+                len(obs), n_broken, config.broken_struct_energy * 0.9,
+                float(obs.min()), float(obs.max())
+            )
+            raise RuntimeError(
+                f"Cannot start BO loop: initial GP optimization failed. "
+                f"{n_broken}/{len(obs)} dataset points are broken_struct_energy. "
+                f"See log for details."
+            ) from e
 
         self.state.model_chk = gpflow.utilities.deepcopy(model.model)
         self.state.current_minima = tf.reduce_min(dataset.observations).numpy()
@@ -668,7 +682,15 @@ class ConfSearchRunner:
             else:
                 logger.warning("Last optimization finished with error, skipping trj parsing!")
             model.update(dataset)
-            model.optimize(dataset)
+            model.update(dataset)
+            try:
+                model.optimize(dataset)
+            except Exception as e:
+                logger.warning(
+                    "GP optimization failed at step %d: %s. "
+                    "Continuing with current hyperparameters.",
+                    step, e
+                )
 
             logger.info("Updating model checkpoint!")
             self.state.model_chk = gpflow.utilities.deepcopy(model.model)
@@ -679,7 +701,18 @@ class ConfSearchRunner:
             logger.info("Updated!")
 
             logger.info("Step %s completed!", step)
-            logger.debug("Current dataset is: %s", dataset)
+            obs = dataset.observations.numpy().flatten()
+            n_broken = int(np.sum(obs >= config.broken_struct_energy * 0.9))
+            logger.info(
+                "Step %d completed. Dataset: %d points, best=%.3f, "
+                "broken=%d, mean_valid=%.3f",
+                step,
+                len(obs),
+                float(obs.min()),
+                n_broken,
+                float(obs[obs < config.broken_struct_energy * 0.9].mean())
+                if n_broken < len(obs) else float("nan"),
+            )
 
             all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
             with open(all_minima_file, "w") as json_minima_writer:
