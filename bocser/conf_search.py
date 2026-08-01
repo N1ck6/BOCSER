@@ -110,6 +110,11 @@ class ConfSearchState:
     config: Optional[ConfSearchConfig] = None
 
 
+def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
+    """Return True if energy is within tol of broken_struct_energy sentinel."""
+    return abs(energy - broken_ref) <= tol
+
+
 class ConfSearchRunner:
     """
     Orchestrator for Bayesian Optimization-based conformational search.
@@ -489,13 +494,40 @@ class ConfSearchRunner:
                 load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
             load_ensemble_filename = str(load_ensemble_filename)
             logger.info("Loading init points from given ensemble!")
-            dataset = Dataset(
-                *EnsembleProcessor(
-                    load_ensemble_filename,
-                    dihedral_idxs=self.state.dihedral_ids,
-                ).normalize_energy(self.state.norm_energy).get_tf_data()
+            ep = EnsembleProcessor(
+                load_ensemble_filename,
+                dihedral_idxs=self.state.dihedral_ids,
             )
-            logger.info("Init dataset collected! %s", dataset)
+            ensemble_min = min(ep.energies)
+            logger.info(
+                "Ensemble normalization: using ensemble minimum %.3f kcal/mol "
+                "instead of ORCA norm_energy %.3f kcal/mol.",
+                ensemble_min, self.state.norm_energy,
+            )
+            self.state.norm_energy = ensemble_min
+            ep.normalize_energy(ensemble_min)
+            dataset = Dataset(*ep.get_tf_data())
+            
+            obs = dataset.observations.numpy().flatten()
+            obs_range = obs.max() - obs.min()
+            obs_mean = obs.mean()
+            logger.info(
+                "Dataset energy range check: min=%.2f, max=%.2f, range=%.2f, mean=%.2f kcal/mol",
+                obs.min(), obs.max(), obs_range, obs_mean
+            )
+            if obs_range > 200 or abs(obs_mean) > 100:
+                logger.error(
+                    "ENERGY RANGE WARNING: dataset observations span %.1f kcal/mol "
+                    "with mean=%.1f. GP is configured for ~0-50 kcal/mol range. "
+                    "This WILL cause Inf in GP hyperparameters. "
+                    "Check ensemble normalization — norm_energy=%.3f may be incompatible "
+                    "with ensemble energy scale.",
+                    obs_range, obs_mean, self.state.norm_energy
+                )
+                raise RuntimeError(
+                    f"Dataset energy range ({obs_range:.1f} kcal/mol) is too large for GP. "
+                    f"Use ensemble_min normalization instead of ORCA norm_energy for TS ensembles."
+                )
         else:
             for idx in range(config.num_initial_points):
                 # Check conformer existance
@@ -580,6 +612,40 @@ class ConfSearchRunner:
 
         kernel, search_space, observer = self._build_model_and_acquisition()
         dataset = self._initialize_dataset(observer)
+        
+        obs = dataset.observations.numpy().flatten()
+        obs_std = float(np.std(obs))
+        obs_mean = float(np.mean(obs))
+        obs_range = float(obs.max() - obs.min())
+
+        logger.info(
+            "Dataset stats before GP init: mean=%.2f, std=%.2f, range=%.2f kcal/mol",
+            obs_mean, obs_std, obs_range
+        )
+        
+        if obs_range > 200 or abs(obs_mean) > 100:
+            raise RuntimeError(
+                f"Dataset energy range ({obs_range:.1f} kcal/mol, mean={obs_mean:.1f}) "
+                f"is too large for GP. Check ensemble normalization."
+            )
+
+        # Adapt hyperparameters to initial data scale.
+        init_variance = max(0.07, obs_std ** 2 * 0.1)   # 10% from the variance of observations
+        init_lengthscale = 0.5                          # typical distance between dihedra in rad
+
+        kernel.kernels[1].base_kernel.variance.assign(init_variance)
+        # kernel.kernels[1].base_kernel.lengthscales.assign(
+        #     [init_lengthscale] * self.state.search_dim
+        # )
+        kernel.kernels[2].base_kernel.variance.assign(init_variance)
+        kernel.kernels[2].base_kernel.lengthscales.assign(
+            [init_lengthscale] * self.state.search_dim
+        )
+
+        logger.info(
+            "GP kernel initialized: variance=%.4f, lengthscales=%.3f",
+            init_variance, init_lengthscale
+        )
 
         gpr = gpflow.models.GPR(dataset.astuple(), kernel)
         gpflow.set_trainable(gpr.likelihood, False)
@@ -593,9 +659,10 @@ class ConfSearchRunner:
 
         # Check if all values are the same
         obs = dataset.observations.numpy().flatten()
-        if np.all(obs >= config.broken_struct_energy * 0.9):
+        n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
+        if n_broken == len(obs):
             logger.error(
-                "All %d observations are broken_struct_energy (%.1f). "
+                "All %d observations are sentinel broken_struct_energy=%.1f (tol=±5). "
                 "GP training will be numerically unstable. "
                 "Check norm_energy calculation and ring geometry.",
                 len(obs), config.broken_struct_energy
@@ -612,7 +679,7 @@ class ConfSearchRunner:
             )
             # Диагностика датасета
             obs = dataset.observations.numpy().flatten()
-            n_broken = int(np.sum(obs >= config.broken_struct_energy * 0.9))
+            n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
             logger.error(
                 "Dataset diagnostics: %d points total, %d broken (>=%.1f), "
                 "min=%.3f, max=%.3f",
@@ -657,8 +724,30 @@ class ConfSearchRunner:
                 last_opt_status = json.load(file)
             logger.debug("Last opt status: %s", last_opt_status)
 
-            dataset = result.try_get_final_dataset()
-            model = result.try_get_final_model()
+            try:
+                dataset = result.try_get_final_dataset()
+                model = result.try_get_final_model()
+            except Exception as e:
+                logger.error(
+                    "Step %d: could not get final dataset/model from trieste result: %s. "
+                    "Keeping previous dataset and model. "
+                    "Likely cause: GP hyperparameter optimization failed (Inf/NaN). "
+                    "This usually means dataset observations are in a bad range — "
+                    "check norm_energy and ensemble normalization.",
+                    step, e
+                )
+                # Continue with old dataset, model
+                model.update(dataset)
+                try:
+                    model.optimize(dataset)
+                except Exception as e2:
+                    logger.error(
+                        "Step %d: fallback model.optimize also failed: %s. "
+                        "Continuing with stale hyperparameters.",
+                        step, e2
+                    )
+                continue
+
             logger.debug("Last asked point was %s", self.state.asked_points[-1])
 
             deepest_minima.append(tf.reduce_min(dataset.observations).numpy())
@@ -702,7 +791,7 @@ class ConfSearchRunner:
 
             logger.info("Step %s completed!", step)
             obs = dataset.observations.numpy().flatten()
-            n_broken = int(np.sum(obs >= config.broken_struct_energy * 0.9))
+            n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
             logger.info(
                 "Step %d completed. Dataset: %d points, best=%.3f, "
                 "broken=%d, mean_valid=%.3f",
