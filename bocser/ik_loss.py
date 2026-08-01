@@ -276,6 +276,6 @@ class IKLoss:
                 elems=total_motions,
             )
 
-            total_loss = total_loss + ik_loss
+            total_loss = total_loss + tf.reduce_sum(ik_loss)
 
         return total_loss

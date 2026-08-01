@@ -411,7 +411,7 @@ def _check_rings_intact(
     """
 
     cfg = _get_config_or_raise()
-    ts_multiplier = 0.75 if cfg.ts else 0.5
+    ts_multiplier = 0.9 if cfg.ts else 0.5
 
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
     if lines and lines[0].strip().lstrip('-').isdigit():
