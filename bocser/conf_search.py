@@ -634,13 +634,9 @@ class ConfSearchRunner:
         init_lengthscale = 0.5                          # typical distance between dihedra in rad
 
         kernel.kernels[1].base_kernel.variance.assign(init_variance)
-        # kernel.kernels[1].base_kernel.lengthscales.assign(
-        #     [init_lengthscale] * self.state.search_dim
-        # )
+        
         kernel.kernels[2].base_kernel.variance.assign(init_variance)
-        kernel.kernels[2].base_kernel.lengthscales.assign(
-            [init_lengthscale] * self.state.search_dim
-        )
+        kernel.kernels[2].base_kernel.lengthscales.assign(init_lengthscale)
 
         logger.info(
             "GP kernel initialized: variance=%.4f, lengthscales=%.3f",

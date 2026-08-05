@@ -275,6 +275,40 @@ def start_calc(gjf_name: str, scan=False):
     
     timeout_minutes = cfg.orca_poll_timeout_minutes
     subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name])
+
+    # cleanup heavy ORCA files after calculations
+    _cleanup_orca_tempfiles(gjf_path)
+
+_ORCA_JUNK_SUFFIXES = {
+    ".gbw", ".densities", ".tmp", ".ges",
+    ".prop", ".bas", ".engrad", ".pcgrad",
+    ".hess", ".bibtex",
+}
+
+def _cleanup_orca_tempfiles(inp_path: Path) -> None:
+    """Delete large ORCA scratch files after each calculation.
+    
+    Keeps: .inp, .out, .xyz, _trj.xyz, .sh
+    Deletes: .gbw, .densities, .tmp and other scratch files.
+    """
+    stem = inp_path.stem
+    parent = inp_path.parent
+    deleted_bytes = 0
+
+    for f in parent.iterdir():
+        if f.stem == stem and f.suffix in _ORCA_JUNK_SUFFIXES:
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                deleted_bytes += size
+                logger.debug("Deleted ORCA scratch file: %s (%.1f MB)", f.name, size/1e6)
+            except OSError as e:
+                logger.warning("Could not delete %s: %s", f.name, e)
+
+    if deleted_bytes > 0:
+        logger.info(
+            "Cleaned up ORCA scratch files: %.1f MB freed", deleted_bytes / 1e6
+        )
     
 def _qc_calcs_dir(mol_file_name: str) -> Path:
     """Return path to the QC calculation subfolder, creating it if needed."""
