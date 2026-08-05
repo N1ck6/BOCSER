@@ -1,10 +1,10 @@
-mol_file_name : "tests/NonBR/NonBR.mol"
+mol_file_name : "tests/NonBR1/NonBR.mol"
 exp_name: "NonBR"
 spin_multiplicity : 1
 charge : 0
 orca_exec_command: "/opt/orca_6.1.0/orca"
 num_of_procs : 8
-orca_method: "M062X def2-TZVP"
+orca_method: "M062X 6-31+G(d)"
 orca_poll_timeout_minutes: 300
 broken_struct_energy : 100.0
 ts: true
