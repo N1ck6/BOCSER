@@ -1,6 +1,5 @@
-from dataclasses import dataclass
-
-from typing import Union
+from dataclasses import dataclass, field
+from typing import List, Tuple, Union
 
 @dataclass
 class ConfSearchConfig:
@@ -29,3 +28,14 @@ class ConfSearchConfig:
     exp_name : str = "cs"
     load_ensemble : Union[str, None] = None
     acquisition_function : str = "iv"
+    ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
+    ts_bond_max_length: float = 5.0
+    fixed_double_bonds: List[Tuple[int, int]] = field(default_factory=list)  # 1-индексация, как в исходном .mol
+
+    def __post_init__(self): # Форматировать в список кортежей двойных связей
+        self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]
+        self.fixed_double_bonds = [tuple(int(x) for x in pair) for pair in self.fixed_double_bonds]
+        for name in ("ts_bonds", "fixed_double_bonds"):
+            for pair in getattr(self, name):
+                if len(pair) != 2:
+                    raise ValueError(f"{name} entries must be [atom_a, atom_b] pairs, got {pair}")

@@ -119,6 +119,8 @@ def change_dihedrals(mol_file_name: str,
         heavy_idx, h_idx = _heavy_and_h_order(mol)
         mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
 
+        ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
+
         # Return reference geometry if no torsion angles are provided
         if not dihedrals:
             if full_block:
@@ -139,11 +141,17 @@ def change_dihedrals(mol_file_name: str,
                 Chem.MolToMolFile(mol, tmp.name)
                 tmp_mol = Chem.RWMol(Chem.MolFromMolFile(tmp.name, removeHs=False))
 
+            for a, b in ts_bond_set: # Remove TS bonds to allow free movement
+                if tmp_mol.GetBondBetweenAtoms(a, b) is not None:
+                    tmp_mol.RemoveBond(a, b)
+
             mp = AllChem.MMFFGetMoleculeProperties(tmp_mol, mmffVariant='MMFF94')
             ff = AllChem.MMFFGetMoleculeForceField(tmp_mol, mp)
 
             for bl_dict in ik_loss.bond_lengths:
                 for (a, b), value in bl_dict.items():
+                    if frozenset((a, b)) in ts_bond_set:
+                        continue  # TS-bond is not fixed
                     ff.MMFFAddDistanceConstraint(a, b, False, value, value, 1e3)
 
             for va_dict in ik_loss.valence_angles:
@@ -163,6 +171,8 @@ def change_dihedrals(mol_file_name: str,
                 n = len(ring)
                 for k in range(n):
                     a, b = ring[k], ring[(k + 1) % n]
+                    if frozenset((a, b)) in ts_bond_set:
+                        continue
                     if frozenset((a, b)) in ik_covered_bonds:
                         continue
                     dist = conf0.GetAtomPosition(a).Distance(conf0.GetAtomPosition(b))
@@ -475,7 +485,7 @@ def _check_rings_intact(
 
     cfg = _get_config_or_raise()
     ts_multiplier = 0.8 if cfg.ts else 0.5
-    ts_multiplier = 0.9 if cfg.ts else 0.5
+    ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
 
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
     if lines and lines[0].strip().lstrip('-').isdigit():
@@ -492,7 +502,9 @@ def _check_rings_intact(
         for j in range(len(ring)):
             a = ring[j]
             b = ring[(j + 1) % len(ring)]
-
+            if frozenset((a, b)) in ts_bond_set:
+                continue
+            
             if a not in coords or b not in coords:
                 logger.warning(
                     "Ring atom %d or %d missing from xyz block", a, b
@@ -554,6 +566,7 @@ def calc_energy(
         config: ConfSearchConfig = None,
         original_mol=None,
         broken_structs_dir: Union[str, None] = None,
+        ts_bonds=None, ts_bond_max_length=5.0,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'

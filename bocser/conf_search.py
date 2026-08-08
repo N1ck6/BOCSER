@@ -196,6 +196,8 @@ class ConfSearchRunner:
             ik_loss=self.state.ik_loss,
             original_mol=self.state.mol,
             broken_structs_dir=self.state.broken_structs_path,
+            ts_bonds=self.state.ts_bonds,
+            ts_bond_max_length=self.state.config.ts_bond_max_length,
         )
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
@@ -216,6 +218,8 @@ class ConfSearchRunner:
             ik_loss=self.state.ik_loss,
             original_mol=self.state.mol,
             broken_structs_dir=self.state.broken_structs_path,
+            ts_bonds=self.state.ts_bonds,
+            ts_bond_max_length=self.state.config.ts_bond_max_length,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -383,6 +387,14 @@ class ConfSearchRunner:
             )
             config.acquisition_function = "evm"
 
+        self.state.ts_bonds = [
+            (raw1_to_with_h_canonical(a, self.state.mol_file_name),
+            raw1_to_with_h_canonical(b, self.state.mol_file_name))
+            for a, b in config.ts_bonds
+        ]
+        if self.state.ts_bonds:
+            logger.info("TS-связи (config 1-idx -> canonical 0-idx): %s -> %s", config.ts_bonds, self.state.ts_bonds)
+
         logger.info("Coef calculator creating")
 
         self.state.mol = Chem.RemoveHs(Chem.MolFromMolFile(self.state.mol_file_name))
@@ -469,6 +481,7 @@ class ConfSearchRunner:
         self.state.norm_energy, ok = calc_energy(
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
             original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
+            ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
         if not ok:
