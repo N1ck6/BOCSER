@@ -130,7 +130,7 @@ H    0.0    1.0    0.0
 H    0.0    0.0    1.0
 """
         # All atoms are at least 1.0 Angstrom apart, threshold is 0.7
-        is_broken = check_is_broken(xyz_block, len_threshold=0.7)
+        is_broken, _ = check_is_broken(xyz_block, len_threshold=0.7)
         assert is_broken is False
 
     def test_check_is_broken_close_atoms(self):
@@ -140,7 +140,7 @@ C    0.0    0.0    0.0
 H    0.5    0.0    0.0
 """
         # H is only 0.5 Angstrom from C, threshold is 0.7
-        is_broken = check_is_broken(xyz_block, len_threshold=0.7)
+        is_broken, _ = check_is_broken(xyz_block, len_threshold=0.7)
         assert is_broken is True
 
     def test_check_is_broken_empty_block(self):
@@ -155,7 +155,7 @@ H    0.5    0.0    0.0
         xyz_block = """
 C    0.0    0.0    0.0
 """
-        is_broken = check_is_broken(xyz_block, len_threshold=0.7)
+        is_broken, _ = check_is_broken(xyz_block, len_threshold=0.7)
         assert is_broken is False
 
 

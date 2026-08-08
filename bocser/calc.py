@@ -21,6 +21,7 @@ import logging
 logger = logging.getLogger(__name__)
 import config_manager
 import run_state
+from functools import lru_cache
 
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -79,15 +80,43 @@ def dist_between_atoms(mol : Chem.rdchem.Mol, i : int, j : int) -> float:
     
     return np.sqrt((pos_i.x - pos_j.x) ** 2 + (pos_i.y - pos_j.y) ** 2 + (pos_i.z - pos_j.z) ** 2)
 
+def _heavy_and_h_order(mol) -> tuple[list[int], list[int]]:
+    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() != 'H']
+    h_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'H']
+    return heavy_idx, h_idx
+
+@lru_cache(maxsize=8)
+def _with_h_order_cached(mol_file_name: str) -> tuple:
+    mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+    heavy_idx, h_idx = _heavy_and_h_order(mol)
+    return tuple(heavy_idx + h_idx)
+
+def raw1_to_with_h_canonical(raw_1idx: int, mol_file_name: str) -> int:
+    """1-индексный номер атома из исходного .mol -> 0-индексный, использующийся в функциях"""
+    order = _with_h_order_cached(mol_file_name)
+    return order.index(raw_1idx - 1)
+
+def raw1_to_heavy_canonical(raw_1idx: int, mol_file_name: str) -> int:
+    """То же самое, но в канонической нумерации для heavy"""
+    mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+    heavy_idx, _ = _heavy_and_h_order(mol)
+    raw0 = raw_1idx - 1
+    if raw0 not in heavy_idx:
+        raise ValueError(f"Atom {raw_1idx} — hydrogen; "
+                          f"Double bonds are specified only between heavy atoms.")
+    return heavy_idx.index(raw0)
+
+def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
+    """Opposite of raw1_to_with_h_canonical"""
+    order = _with_h_order_cached(mol_file_name)
+    return order[canon_idx] + 1
+
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]],
-                     ik_loss=None,
-                     full_block=False):
+                     ik_loss=None, full_block=False, ts_bonds=None):
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
-
-        heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() != 'H']
-        h_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'H']
+        heavy_idx, h_idx = _heavy_and_h_order(mol)
         mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
 
         # Return reference geometry if no torsion angles are provided
@@ -371,6 +400,7 @@ def _save_broken_struct(
     coords_block: str,
     broken_structs_dir: Union[str, None],
     reason: str,
+    atoms_raw1: Union[tuple, None] = None,
 ) -> None:
     """Save a discarded/broken candidate geometry for later inspection (e.g. in ChemCraft)."""
 
@@ -381,9 +411,10 @@ def _save_broken_struct(
         n_atoms = len(lines)
         struct_id = run_state.peek_structure_id()
         Path(broken_structs_dir).mkdir(parents=True, exist_ok=True)
-        out_path = Path(broken_structs_dir) / f"{struct_id}_{reason}.xyz"
+        atom_tag = "_".join(str(a) for a in atoms_raw1) + "_" if atoms_raw1 else ""
+        out_path = Path(broken_structs_dir) / f"{struct_id}_{atom_tag}{reason}.xyz"
         with open(out_path, "w") as fh:
-            fh.write(f"{n_atoms}\n{reason}\n")
+            fh.write(f"{n_atoms}\n{atom_tag}{reason}\n")
             fh.write("\n".join(lines))
             fh.write("\n")
         logger.info("Saved broken candidate (%s) to %s", reason, out_path)
@@ -393,7 +424,7 @@ def _save_broken_struct(
 def check_is_broken(
     xyz_block: str,
     len_threshold: float | None = None,
-) -> bool:
+) -> tuple[bool, Union[tuple[int, int], None]]:
     """Return True if any two atoms in xyz_block are unphysically close.
     When len_threshold is None sum of radii is used instead,
     which is physically more accurate and avoids false positives for heavy atoms.
@@ -419,25 +450,23 @@ def check_is_broken(
     for i in range(n):
         for j in range(i + 1, n):
             dist = np.linalg.norm(coord_matrix[i] - coord_matrix[j])
-            if len_threshold is not None:
-                # Legacy behaviour: single global threshold
-                threshold = len_threshold
-            else:
-                threshold = _clash_threshold(symbols[i], symbols[j])
+            # Legacy behaviour: single global threshold
+            threshold = len_threshold if len_threshold is not None else _clash_threshold(symbols[i], symbols[j])
             if dist <= threshold:
                 logger.warning(
                     "Clash detected: atoms %d(%s) and %d(%s) distance=%.3f A "
                     "<= threshold=%.3f A",
                     i, symbols[i], j, symbols[j], dist, threshold
                 )
-                return True
-    return False
+                return True, (i, j)
+    return False, None
 
 def _check_rings_intact(
     xyz_block: str,
     original_mol: Chem.rdchem.Mol,
     bond_threshold: float | None = None,
-) -> bool:
+    ts_bonds=None,
+) -> tuple[bool, Union[tuple[int, int], None]]:
     """
     Verifies that all rings of molecule are remained 
     intact in proposed structure.
@@ -445,6 +474,7 @@ def _check_rings_intact(
     """
 
     cfg = _get_config_or_raise()
+    ts_multiplier = 0.8 if cfg.ts else 0.5
     ts_multiplier = 0.9 if cfg.ts else 0.5
 
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
@@ -486,9 +516,32 @@ def _check_rings_intact(
                     "> vdw threshold %.3f A",
                     a, sym_a, b, sym_b, dist, threshold
                 )
-                return False
+                return False, (a, b)
 
-    return True
+    return True, None
+
+def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) -> tuple[bool, Union[tuple[int, int], None]]:
+    """Checks if TS-bonds are within max_length, because RingInfo does not see bonds with H"""
+    if not ts_bonds:
+        return True
+    lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
+    if lines and lines[0].strip().lstrip('-').isdigit():
+        lines = lines[2:]
+    coords = {}
+    for i, line in enumerate(lines):
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        coords[i] = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+    for a, b in ts_bonds:
+        if a not in coords or b not in coords:
+            logger.warning("TS-bond %d-%d: atom missing in xyz", a, b)
+            return False
+        dist = np.linalg.norm(coords[a] - coords[b])
+        if dist > max_length:
+            logger.warning("TS-bond %d-%d surpassed the limit: %.3f A > %.3f A", a, b, dist, max_length)
+            return False, (a, b)
+    return True, None
 
 def calc_energy(
         mol_file_name: str,
@@ -518,25 +571,33 @@ def calc_energy(
     xyz_upd = None
 
     logger.debug("dihedrals before: %s", dihedrals)
-    if force_xyz_block:
-        xyz_upd = force_xyz_block
-    else:
-        xyz_upd = change_dihedrals(mol_file_name, dihedrals, ik_loss)
-
+    xyz_upd = force_xyz_block if force_xyz_block else change_dihedrals(mol_file_name, dihedrals, ik_loss, ts_bonds=ts_bonds)
     logger.debug("dihedrals after: %s", dihedrals)
 
-    if check_is_broken(xyz_upd):
+    broken, clash_atoms = check_is_broken(xyz_upd)
+    if broken:
         broken_energy = cfg.broken_struct_energy
         logger.warning(
             "Seems that some atoms in current structure are closer than the threshold! Returning broken_struct_energy=%s",
             broken_energy,
         )
-        _save_broken_struct(xyz_upd, broken_structs_dir, "clash")
+        atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in clash_atoms) if clash_atoms else None
+        _save_broken_struct(xyz_upd, broken_structs_dir, "clash", atoms_raw1)
         return broken_energy, False
 
-    if ik_loss is not None and not _check_rings_intact(xyz_upd, original_mol):
+    if ts_bonds:
+        within_limit, exceeded_atoms = _check_ts_bonds_within_limit(xyz_upd, ts_bonds, ts_bond_max_length)
+        if not within_limit:
+            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in exceeded_atoms) if exceeded_atoms else None
+            _save_broken_struct(xyz_upd, broken_structs_dir, "ts_bond_exceeded", atoms_raw1)
+            return cfg.broken_struct_energy, False
+
+    if ik_loss is not None:
+        rings_intact, opened_atoms = _check_rings_intact(xyz_upd, original_mol, ts_bonds=ts_bonds)
+        if not rings_intact:
             logger.warning("Ring has opened in candidate — skipping ORCA")
-            _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open")
+            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in opened_atoms) if opened_atoms else None
+            _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open", atoms_raw1)
             return cfg.broken_struct_energy, False
 
     opt_status = True

@@ -31,6 +31,7 @@ from calc import (
     parse_points_from_trj,
     _qc_calcs_dir,
     _check_rings_intact,
+    raw1_to_with_h_canonical,
 )
 from run_state import increase_structure_id
 import config_manager
