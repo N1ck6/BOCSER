@@ -34,7 +34,8 @@ class CoefCalculator:
         skip_triple_equal_terminal_atoms=True,
         aromatic_to_aliphatic : bool = True,         
         degrees : np.ndarray = np.linspace(0, 2 * np.pi, 37).reshape(37, 1),
-        db_connector : Union[Connector, None] = None
+        db_connector : Union[Connector, None] = None,
+        fixed_double_bonds: set = None
     ) -> None:
         """
             mol - rdkit molecule
@@ -57,6 +58,7 @@ class CoefCalculator:
         self.multipl = config.spin_multiplicity
         self.af = config.acquisition_function
         self.degrees = degrees
+        self.fixed_double_bonds = fixed_double_bonds or set()
 
         # Key is SMILES, val is idx
         self.unique_frags = {}
@@ -151,6 +153,9 @@ class CoefCalculator:
 
         # If bond isn't single
         if bond.GetBondType() != Chem.BondType.SINGLE:
+            return False
+        # User defined double bonds
+        if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.fixed_double_bonds:
             return False
 
         if not self.skip_triple_equal_terminal_atoms:
@@ -279,6 +284,9 @@ class CoefCalculator:
 
                 dihedral_idxs = []
                 for d in dihedrals:
+                    if frozenset((d[1], d[2])) in self.fixed_double_bonds:
+                        dihedral_idxs.append(-2) # Fixed
+                        continue
                     found = False
                     for f in self.frags.keys():
                         if all(atom in f for atom in d):
@@ -362,6 +370,8 @@ class CoefCalculator:
             # systems (e.g. decalin) where a shared bond must contribute to
             # the ring-closure constraints of both rings.
             if self.af == 'ik' and bond.IsInRing():
+                if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.fixed_double_bonds:
+                    continue
                 bond_rings = [
                     set(ring) for ring in ring_info.AtomRings()
                     if bond.GetBeginAtomIdx() in ring and bond.GetEndAtomIdx() in ring
@@ -623,3 +633,27 @@ class CoefCalculator:
             logger.debug("%s", "|".join(map(str, cur)))
 
         return result
+
+
+def detect_double_bonds(mol: Chem.rdchem.Mol) -> list[tuple[int, int]]:
+    """Canonical (heavy-only, 0-idx) atoms pairs of double bonds."""
+    return sorted(
+        tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+        for b in mol.GetBonds() if b.GetBondType() == Chem.BondType.DOUBLE
+    )
+
+
+def log_and_combine_double_bonds(mol, user_specified: list[tuple[int, int]]) -> set:
+    auto = detect_double_bonds(mol)
+    logger.info("#Not used# Auto detected double bonds (canonical 0-idx): %s", auto)
+    if user_specified:
+        logger.info("User set double bonds (canonical 0-idx): %s", user_specified)
+        for a, b in user_specified:
+            bond = mol.GetBondBetweenAtoms(a, b)
+            if bond is None:
+                logger.warning("fixed_double_bonds (%d,%d): no bonds detected between specified atoms.", a, b)
+            elif bond.GetBondType() != Chem.BondType.DOUBLE:
+                logger.warning("fixed_double_bonds (%d,%d): bond detected, but not double (type=%s).", a, b, bond.GetBondType())
+    combined = {frozenset(p) for p in user_specified} # | {frozenset(p) for p in auto} Not automated for now!!!
+    logger.info("Resulting set of double bonds (%d total): %s", len(combined), sorted(tuple(sorted(p)) for p in combined))
+    return combined

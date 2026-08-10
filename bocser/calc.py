@@ -22,10 +22,13 @@ logger = logging.getLogger(__name__)
 import config_manager
 import run_state
 from functools import lru_cache
+from typing import NamedTuple
 
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-HARTRI_TO_KCAL = 627.509474063 
+HARTRI_TO_KCAL = 627.509474063
+
+_CONSTRAINT_LETTER = {"bond": "B", "angle": "A", "dihedral": "D"}
 
 _VDW_RADII: dict[str, float] = {
     'H':  1.20, 'C':  1.70, 'N':  1.55, 'O':  1.52,
@@ -62,6 +65,10 @@ def _bond_break_threshold(sym_a: str, sym_b: str, delta: float = 0.1) -> float:
 #that consists of list with four atoms and value of degree
 dihedral = tuple[list[int], float]
 
+class Constraint(NamedTuple):
+    type: str      # "bond" | "angle" | "dihedral"
+    atoms: tuple   # canonical 0-idx (with-H)
+    value: float   # angle/dihedral, A for bond
 
 def _get_config_or_raise() -> ConfSearchConfig:
     """Return the runtime config or raise RuntimeError if it's not set.
@@ -113,7 +120,7 @@ def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
 
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]],
-                     ik_loss=None, full_block=False, ts_bonds=None):
+                     ik_loss=None, full_block=False, ts_bonds=None, fixed_dihedrals=None):
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
         heavy_idx, h_idx = _heavy_and_h_order(mol)
@@ -122,7 +129,7 @@ def change_dihedrals(mol_file_name: str,
         ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
 
         # Return reference geometry if no torsion angles are provided
-        if not dihedrals:
+        if not dihedrals and not fixed_dihedrals:
             if full_block:
                 return Chem.MolToXYZBlock(mol)
             return '\n'.join(Chem.MolToXYZBlock(mol).split('\n')[2:])
@@ -183,9 +190,11 @@ def change_dihedrals(mol_file_name: str,
                     ff.MMFFAddAngleConstraint(a, b, c, False, angle_deg, angle_deg, 1e2)
 
             for (a, b, c, d), value in dihedrals:
-                ff.MMFFAddTorsionConstraint(a, b, c, d, False,
-                                            np.rad2deg(-value),
-                                            np.rad2deg(-value), 1)
+                ff.MMFFAddTorsionConstraint(a, b, c, d, False, np.rad2deg(-value), np.rad2deg(-value), 1)
+
+            for atoms, value in (fixed_dihedrals or []):
+                a, b, c, d = atoms
+                ff.MMFFAddTorsionConstraint(a, b, c, d, False, np.rad2deg(-value), np.rad2deg(-value), 1e2)
 
             ff.Minimize(maxIts=1000)
             mol = tmp_mol
@@ -233,7 +242,8 @@ def generate_oinp(
         method_of_calc : str,
         charge : int,
         multipl : int,
-        constrained_opt : bool = False
+        constrained_opt : bool = False,
+        hard_constraints: list = None,
     ) -> None:
     """
         generates orca .inp file
@@ -253,17 +263,25 @@ def generate_oinp(
             tmp.write(coords)
         else:
             opt_cmd = "OptTS" if cfg.ts else "Opt"
-                
             tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
+
+            all_constraints = list(hard_constraints or [])
             if constrained_opt:
+                dihedrals_deg = to_degrees(dihedrals)
+                all_constraints += [
+                    Constraint("dihedral", tuple(a), d) for a, d in dihedrals_deg
+                ]
+
+            if all_constraints:
                 tmp.write("%geom Constraints\n")
-                dihedrals = to_degrees(dihedrals)
-                for cur in dihedrals:
-                    a, d = cur
-                    tmp.write("{ D " + " ".join(map(str, a)) + " " + str(d) + " C }\n")
+                for c in all_constraints:
+                    letter = _CONSTRAINT_LETTER[c.type]
+                    atoms_str = " ".join(str(a) for a in c.atoms)
+                    tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
                 tmp.write("end\n")
-                tmp.write("end\n")    
+                tmp.write("end\n")
+
             tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
             tmp.write(coords)
             tmp.write("END\n")
@@ -567,6 +585,7 @@ def calc_energy(
         original_mol=None,
         broken_structs_dir: Union[str, None] = None,
         ts_bonds=None, ts_bond_max_length=5.0,
+        fixed_dihedrals=None,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -584,7 +603,15 @@ def calc_energy(
     xyz_upd = None
 
     logger.debug("dihedrals before: %s", dihedrals)
-    xyz_upd = force_xyz_block if force_xyz_block else change_dihedrals(mol_file_name, dihedrals, ik_loss, ts_bonds=ts_bonds)
+
+    if force_xyz_block:
+        xyz_upd = force_xyz_block
+    else:
+        xyz_upd = change_dihedrals(
+            mol_file_name, dihedrals, ik_loss,
+            ts_bonds=ts_bonds, fixed_dihedrals=fixed_dihedrals,
+        )
+    
     logger.debug("dihedrals after: %s", dihedrals)
 
     broken, clash_atoms = check_is_broken(xyz_upd)
@@ -624,6 +651,11 @@ def calc_energy(
         except Exception:
             # fallback to remove via shell
             subprocess.run(["rm", "-f", out_name])
+
+    hard_constraints = []
+    for atoms, value in (fixed_dihedrals or []):
+        hard_constraints.append(Constraint("dihedral", tuple(atoms), round(np.rad2deg(value), 6)))
+    
     generate_oinp(
         xyz_upd,
         dihedrals,
@@ -633,6 +665,7 @@ def calc_energy(
         method_of_calc=cfg.orca_method,
         charge=cfg.charge,
         multipl=cfg.spin_multiplicity,
+        hard_constraints=hard_constraints,
     )
     start_calc(inp_name)
     

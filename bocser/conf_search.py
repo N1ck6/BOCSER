@@ -32,10 +32,14 @@ from calc import (
     _qc_calcs_dir,
     _check_rings_intact,
     raw1_to_with_h_canonical,
+    raw1_to_heavy_canonical,
 )
 from run_state import increase_structure_id
 import config_manager
-from coef_calc import CoefCalculator
+from coef_calc import (
+    CoefCalculator,
+    log_and_combine_double_bonds,
+)
 from db_connector import LocalConnector
 from ensemble_processor import EnsembleProcessor
 from evm import ExplorationalVarianceMinimizer
@@ -198,6 +202,7 @@ class ConfSearchRunner:
             broken_structs_dir=self.state.broken_structs_path,
             ts_bonds=self.state.ts_bonds,
             ts_bond_max_length=self.state.config.ts_bond_max_length,
+            fixed_dihedrals=self.state.fixed_dihedrals,
         )
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
@@ -220,6 +225,7 @@ class ConfSearchRunner:
             broken_structs_dir=self.state.broken_structs_path,
             ts_bonds=self.state.ts_bonds,
             ts_bond_max_length=self.state.config.ts_bond_max_length,
+            fixed_dihedrals=self.state.fixed_dihedrals,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -400,12 +406,20 @@ class ConfSearchRunner:
         self.state.mol = Chem.RemoveHs(Chem.MolFromMolFile(self.state.mol_file_name))
         
         scans_dir = str(Path(self.state.working_folder) / f"{self.state.exp_name}_scans/")
-        
+
+        user_double_bonds = [
+            (raw1_to_heavy_canonical(a, self.state.mol_file_name),
+            raw1_to_heavy_canonical(b, self.state.mol_file_name))
+            for a, b in config.fixed_double_bonds
+        ]
+        fixed_double_bonds = log_and_combine_double_bonds(self.state.mol, user_double_bonds)
+
         coef_calc = CoefCalculator(
             mol=self.state.mol,
             config=config,
             dir_for_inps=scans_dir,
             db_connector=LocalConnector(self.state.db_file),
+            fixed_double_bonds=fixed_double_bonds,
         )
         coef_matrix = coef_calc.coef_matrix()
 
@@ -422,6 +436,16 @@ class ConfSearchRunner:
             dihedral_list_all, ring_atoms_list, ik_loss_dihedrals_idxs = coef_calc.get_ring_dihedrals(
                 self.state.mol
             )
+
+            self.state.fixed_dihedrals = []
+            for cycle_d, cycle_idx in zip(dihedral_list_all, ik_loss_dihedrals_idxs):
+                for d, idx in zip(cycle_d, cycle_idx):
+                    if idx == -2:
+                        val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
+                        self.state.fixed_dihedrals.append((list(d), val))
+            if self.state.fixed_dihedrals:
+                logger.info("Fixed torsions (at double bonds): %s", self.state.fixed_dihedrals)
+
             if ik_loss_dihedrals_idxs:
                 self.state.ik_loss = IKLoss.from_rdkit(self.state.mol, ring_atoms_list)
                 self.state.ik_loss_dihedrals_idxs = ik_loss_dihedrals_idxs
@@ -482,6 +506,7 @@ class ConfSearchRunner:
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
             original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
             ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
+            fixed_dihedrals=self.state.fixed_dihedrals,
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
         if not ok:
