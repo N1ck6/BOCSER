@@ -98,13 +98,19 @@ def _with_h_order_cached(mol_file_name: str) -> tuple:
     heavy_idx, h_idx = _heavy_and_h_order(mol)
     return tuple(heavy_idx + h_idx)
 
+def build_reference_with_h_mol(mol_file_name: str):
+    """Canonical (with-H) renumber, needed for saving bond/dihedral value: 'current'."""
+    mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+    heavy_idx, h_idx = _heavy_and_h_order(mol)
+    return Chem.RenumberAtoms(mol, heavy_idx + h_idx)
+
 def raw1_to_with_h_canonical(raw_1idx: int, mol_file_name: str) -> int:
-    """1-индексный номер атома из исходного .mol -> 0-индексный, использующийся в функциях"""
+    """1-idx number from .mol -> 0-idx"""
     order = _with_h_order_cached(mol_file_name)
     return order.index(raw_1idx - 1)
 
 def raw1_to_heavy_canonical(raw_1idx: int, mol_file_name: str) -> int:
-    """То же самое, но в канонической нумерации для heavy"""
+    """Same canonical, but to heavy once"""
     mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
     heavy_idx, _ = _heavy_and_h_order(mol)
     raw0 = raw_1idx - 1
@@ -118,18 +124,47 @@ def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
     order = _with_h_order_cached(mol_file_name)
     return order[canon_idx] + 1
 
+def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list:
+    """config.extra_constraints (1-idx, raw .mol) -> list[Constraint]"""
+    if not raw_constraints:
+        return []
+    ref_mol = build_reference_with_h_mol(mol_file_name)
+    conf = ref_mol.GetConformer()
+    result = []
+    for raw in raw_constraints:
+        ctype = raw["type"]
+        canon_atoms = tuple(raw1_to_with_h_canonical(a, mol_file_name) for a in raw["atoms"])
+        value = raw["value"]
+        if value == "current" or value is None:
+            if ctype == "bond":
+                value = rdMolTransforms.GetBondLength(conf, *canon_atoms)
+            elif ctype == "angle":
+                value = rdMolTransforms.GetAngleDeg(conf, *canon_atoms)
+            elif ctype == "dihedral":
+                value = rdMolTransforms.GetDihedralDeg(conf, *canon_atoms)
+        else:
+            value = float(value)
+        c = Constraint(ctype, canon_atoms, round(value, 6))
+        logger.info(
+            "extra_constraint: type=%s raw_atoms(1-idx, с H)=%s -> canonical(0-idx)=%s value=%.4f",
+            ctype, raw["atoms"], canon_atoms, value,
+        )
+        result.append(c)
+    return result
+
 def change_dihedrals(mol_file_name: str,
-                     dihedrals: list[list[tuple[tuple[int,int,int,int], float]]],
-                     ik_loss=None, full_block=False, ts_bonds=None, fixed_dihedrals=None):
+                     dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
+                    full_block=False, ts_bonds=None, fixed_dihedrals=None, extra_constraints=None):
+    ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
+
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
         heavy_idx, h_idx = _heavy_and_h_order(mol)
         mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
 
-        ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
 
         # Return reference geometry if no torsion angles are provided
-        if not dihedrals and not fixed_dihedrals:
+        if not dihedrals and not fixed_dihedrals and not extra_constraints:
             if full_block:
                 return Chem.MolToXYZBlock(mol)
             return '\n'.join(Chem.MolToXYZBlock(mol).split('\n')[2:])
@@ -163,9 +198,7 @@ def change_dihedrals(mol_file_name: str,
 
             for va_dict in ik_loss.valence_angles:
                 for (a, b, c), value in va_dict.items():
-                    ff.MMFFAddAngleConstraint(a, b, c, False,
-                                              np.rad2deg(value),
-                                              np.rad2deg(value), 1e2)
+                    ff.MMFFAddAngleConstraint(a, b, c, False, np.rad2deg(value), np.rad2deg(value), 1e2)
             
             # Prevent deformation of discarded rings that IKLoss does not cover
             ik_covered_bonds = {
@@ -178,9 +211,7 @@ def change_dihedrals(mol_file_name: str,
                 n = len(ring)
                 for k in range(n):
                     a, b = ring[k], ring[(k + 1) % n]
-                    if frozenset((a, b)) in ts_bond_set:
-                        continue
-                    if frozenset((a, b)) in ik_covered_bonds:
+                    if frozenset((a, b)) in ts_bond_set or frozenset((a, b)) in ik_covered_bonds:
                         continue
                     dist = conf0.GetAtomPosition(a).Distance(conf0.GetAtomPosition(b))
                     ff.MMFFAddDistanceConstraint(a, b, False, dist, dist, 1e3)
@@ -195,6 +226,15 @@ def change_dihedrals(mol_file_name: str,
             for atoms, value in (fixed_dihedrals or []):
                 a, b, c, d = atoms
                 ff.MMFFAddTorsionConstraint(a, b, c, d, False, np.rad2deg(-value), np.rad2deg(-value), 1e2)
+
+            for c in (extra_constraints or []):
+                if c.type == "bond":
+                    ff.MMFFAddDistanceConstraint(*c.atoms, False, c.value, c.value, 1e3)
+                elif c.type == "angle":
+                    ff.MMFFAddAngleConstraint(*c.atoms, False, c.value, c.value, 1e2)
+                elif c.type == "dihedral":
+                    a, b, cc, d = c.atoms
+                    ff.MMFFAddTorsionConstraint(a, b, cc, d, False, -c.value, -c.value, 1e2)
 
             ff.Minimize(maxIts=1000)
             mol = tmp_mol
@@ -236,14 +276,14 @@ def read_xyz(name : str) -> list[str]:
 
 def generate_oinp(
         coords : str, 
-        dihedrals : list[dihedral],
+        dihedrals : list[dihedral], # BO-targets; only when constrained_opt=True
         gjf_name : str, 
         num_of_procs : int, 
         method_of_calc : str,
         charge : int,
         multipl : int,
         constrained_opt : bool = False,
-        hard_constraints: list = None,
+        hard_constraints: list = None,   # every ORCA call (pre-opt И full opt) 
     ) -> None:
     """
         generates orca .inp file
@@ -586,6 +626,7 @@ def calc_energy(
         broken_structs_dir: Union[str, None] = None,
         ts_bonds=None, ts_bond_max_length=5.0,
         fixed_dihedrals=None,
+        extra_constraints=None,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -602,14 +643,19 @@ def calc_energy(
 
     xyz_upd = None
 
-    logger.debug("dihedrals before: %s", dihedrals)
+    hard_constraints = []
+    for atoms, value in (fixed_dihedrals or []):
+        hard_constraints.append(Constraint("dihedral", tuple(atoms), round(np.rad2deg(value), 6)))
 
+    logger.debug("dihedrals before: %s", dihedrals)
+    
     if force_xyz_block:
         xyz_upd = force_xyz_block
     else:
         xyz_upd = change_dihedrals(
             mol_file_name, dihedrals, ik_loss,
             ts_bonds=ts_bonds, fixed_dihedrals=fixed_dihedrals,
+            extra_constraints=extra_constraints,
         )
     
     logger.debug("dihedrals after: %s", dihedrals)
@@ -651,10 +697,6 @@ def calc_energy(
         except Exception:
             # fallback to remove via shell
             subprocess.run(["rm", "-f", out_name])
-
-    hard_constraints = []
-    for atoms, value in (fixed_dihedrals or []):
-        hard_constraints.append(Constraint("dihedral", tuple(atoms), round(np.rad2deg(value), 6)))
     
     generate_oinp(
         xyz_upd,

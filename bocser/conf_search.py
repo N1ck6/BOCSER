@@ -33,6 +33,7 @@ from calc import (
     _check_rings_intact,
     raw1_to_with_h_canonical,
     raw1_to_heavy_canonical,
+    resolve_extra_constraints,
 )
 from run_state import increase_structure_id
 import config_manager
@@ -113,6 +114,7 @@ class ConfSearchState:
     search_dim: int = 0
     mol: Optional[Chem.Mol] = None
     config: Optional[ConfSearchConfig] = None
+    extra_constraints: list = field(default_factory=list)
 
 
 def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
@@ -203,6 +205,7 @@ class ConfSearchRunner:
             ts_bonds=self.state.ts_bonds,
             ts_bond_max_length=self.state.config.ts_bond_max_length,
             fixed_dihedrals=self.state.fixed_dihedrals,
+            extra_constraints=self.state.extra_constraints,
         )
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
@@ -226,6 +229,7 @@ class ConfSearchRunner:
             ts_bonds=self.state.ts_bonds,
             ts_bond_max_length=self.state.config.ts_bond_max_length,
             fixed_dihedrals=self.state.fixed_dihedrals,
+            extra_constraints=self.state.extra_constraints,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -375,6 +379,16 @@ class ConfSearchRunner:
             mol_file = mol_file.resolve()
         self.state.mol_file_name = str(mol_file)
 
+        self.state.extra_constraints = resolve_extra_constraints(config.extra_constraints, self.state.mol_file_name)
+        if self.state.extra_constraints:
+            logger.info("Загружено %d пользовательских extra_constraints", len(self.state.extra_constraints))
+
+        logger.info(
+            "Итоговые жёсткие ORCA-констрейны (%d): double-bond торсионы=%s, extra_constraints=%s",
+            len(self.state.fixed_dihedrals) + len(self.state.extra_constraints),
+            self.state.fixed_dihedrals, self.state.extra_constraints,
+        )
+
         self.state.exp_name = config.exp_name
         self.state.structures_path = str(Path(self.state.working_folder) / f"{config.exp_name}/")
 
@@ -506,7 +520,7 @@ class ConfSearchRunner:
             self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
             original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
             ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
-            fixed_dihedrals=self.state.fixed_dihedrals,
+            fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
         )
         logger.info("Norm energy: %s", self.state.norm_energy)
         if not ok:

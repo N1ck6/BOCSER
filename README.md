@@ -48,6 +48,25 @@ spin_multiplicity: 1
 acquisition_function: "evm"   # "ei", "evm", or "ik"
 num_initial_points: 5
 max_steps: 100
+fixed_double_bonds: # torsion with double bonds are not oprimized
+  - [3, 24]
+  - [9, 23]
+
+ts_bonds: # transition state bonds, which are allowed to be stretched up to 5 Å
+  - [3, 9]
+
+extra_constraints:
+  - type: bond
+    atoms: [9, 17]
+    value: 1.54          # value in Å
+
+  - type: angle
+    atoms: [9, 17, 18]
+    value: current        # fix value from mol
+
+  - type: dihedral
+    atoms: [1, 2, 3, 4]
+    value: 180.0          # degrees
 ```
 
 ---

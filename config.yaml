@@ -16,3 +16,9 @@ rolling_mean_threshold : 0
 num_initial_points : 381
 max_steps : 100
 acquisition_function : "ik"
+fixed_double_bonds:
+  - [3, 24]
+  - [9, 23]
+  - [12, 15]
+  - [16, 17]
+  - [10, 11]

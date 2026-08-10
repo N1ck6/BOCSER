@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict
+
+_CONSTRAINT_ATOM_COUNT = {"bond": 2, "angle": 3, "dihedral": 4}
 
 @dataclass
 class ConfSearchConfig:
@@ -31,6 +33,7 @@ class ConfSearchConfig:
     ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
     ts_bond_max_length: float = 5.0
     fixed_double_bonds: List[Tuple[int, int]] = field(default_factory=list)  # 1-индексация, как в исходном .mol
+    extra_constraints: List[Dict] = field(default_factory=list)
 
     def __post_init__(self): # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]
@@ -39,3 +42,20 @@ class ConfSearchConfig:
             for pair in getattr(self, name):
                 if len(pair) != 2:
                     raise ValueError(f"{name} entries must be [atom_a, atom_b] pairs, got {pair}")
+
+        normalized = []
+        for i, raw in enumerate(self.extra_constraints):
+            if "type" not in raw or "atoms" not in raw:
+                raise ValueError(f"extra_constraints[{i}]: нужны поля 'type' и 'atoms', получено {raw}")
+            ctype = raw["type"]
+            if ctype not in _CONSTRAINT_ATOM_COUNT:
+                raise ValueError(f"extra_constraints[{i}]: type должен быть bond/angle/dihedral, получено {ctype!r}")
+            atoms = tuple(int(a) for a in raw["atoms"])
+            if len(atoms) != _CONSTRAINT_ATOM_COUNT[ctype]:
+                raise ValueError(
+                    f"extra_constraints[{i}]: для type={ctype} нужно "
+                    f"{_CONSTRAINT_ATOM_COUNT[ctype]} атомов, получено {len(atoms)}: {atoms}"
+                )
+            value = raw.get("value", "current")
+            normalized.append({"type": ctype, "atoms": atoms, "value": value})
+        self.extra_constraints = normalized
