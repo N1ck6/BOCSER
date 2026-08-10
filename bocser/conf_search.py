@@ -383,12 +383,6 @@ class ConfSearchRunner:
         if self.state.extra_constraints:
             logger.info("Загружено %d пользовательских extra_constraints", len(self.state.extra_constraints))
 
-        logger.info(
-            "Итоговые жёсткие ORCA-констрейны (%d): double-bond торсионы=%s, extra_constraints=%s",
-            len(self.state.fixed_dihedrals) + len(self.state.extra_constraints),
-            self.state.fixed_dihedrals, self.state.extra_constraints,
-        )
-
         self.state.exp_name = config.exp_name
         self.state.structures_path = str(Path(self.state.working_folder) / f"{config.exp_name}/")
 
