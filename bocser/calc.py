@@ -313,13 +313,18 @@ def generate_oinp(
                     Constraint("dihedral", tuple(a), d) for a, d in dihedrals_deg
                 ]
 
-            if all_constraints:
-                tmp.write("%geom Constraints\n")
-                for c in all_constraints:
-                    letter = _CONSTRAINT_LETTER[c.type]
-                    atoms_str = " ".join(str(a) for a in c.atoms)
-                    tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
-                tmp.write("end\n")
+            need_geom = bool(all_constraints) or cfg.ts
+            if need_geom:
+                tmp.write("%geom\n")
+                if all_constraints:
+                    tmp.write("Constraints\n")
+                    for c in all_constraints:
+                        letter = _CONSTRAINT_LETTER[c.type]
+                        atoms_str = " ".join(str(a) for a in c.atoms)
+                        tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
+                    tmp.write("end\n")
+                if cfg.ts:
+                    tmp.write("Calc_Hess true\n")
                 tmp.write("end\n")
 
             tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
@@ -646,8 +651,14 @@ def calc_energy(
     hard_constraints = []
     for atoms, value in (fixed_dihedrals or []):
         hard_constraints.append(Constraint("dihedral", tuple(atoms), round(np.rad2deg(value), 6)))
-
+    hard_constraints.extend(extra_constraints or [])
+    
     logger.debug("dihedrals before: %s", dihedrals)
+    logger.debug(
+        "ORCA hard_constraints (%d): %s",
+        len(hard_constraints),
+        hard_constraints,
+    )
     
     if force_xyz_block:
         xyz_upd = force_xyz_block
