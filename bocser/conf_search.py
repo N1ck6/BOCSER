@@ -103,6 +103,7 @@ class ConfSearchState:
     global_degrees: list = field(default_factory=list)
     asked_points: list = field(default_factory=list)
     minima: list = field(default_factory=list)
+    ensemble_processor: Optional[Any] = None
     broken_structs_path: str = ""
     model_chk: Optional[Any] = None
     current_minima: float = 1e9
@@ -509,22 +510,45 @@ class ConfSearchRunner:
             [2 * np.pi for _ in range(self.state.search_dim)],
         )
 
+        config = self.state.config
+
         # Compute normalizing energy (in kcal/mol)
-        self.state.norm_energy, ok = calc_energy(
-            self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
-            original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
-            ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
-            fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
-        )
-        logger.info("Norm energy: %s", self.state.norm_energy)
-        if not ok:
-            raise RuntimeError(
-                f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
-                f"(norm_energy={self.state.norm_energy}). Check the log immediately above this "
-                f"error for the specific cause (atom clash, ring-opened, or ORCA optimization "
-                f"failure) — increasing thresholds will not help if the geometry itself is being "
-                f"altered before ORCA ever runs."
+        if config.load_ensemble:
+            ensemble_path = self._resolve_ensemble_path()
+            logger.info(
+                "load_ensemble was set (%s); skipping ORCA norm_energy calculation on mol, "
+                "min energy from ensemble selected instead.",
+                ensemble_path,
             )
+            self.state.ensemble_processor = EnsembleProcessor(
+                ensemble_path, dihedral_idxs=self.state.dihedral_ids,
+            )
+            if not self.state.ensemble_processor.energies:
+                raise RuntimeError(
+                    f"load_ensemble at {ensemble_path}: no conformers/energies found. "
+                    f"norm_energy can't be calculated."
+                )
+            self.state.norm_energy = min(self.state.ensemble_processor.energies)
+            logger.info(
+                "Norm energy on %d structures: %s",
+                len(self.state.ensemble_processor.energies), self.state.norm_energy,
+            )
+        else:
+            self.state.norm_energy, ok = calc_energy(
+                self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
+                original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
+                ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
+                fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
+            )
+            logger.info("Norm energy: %s", self.state.norm_energy)
+            if not ok:
+                raise RuntimeError(
+                    f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
+                    f"(norm_energy={self.state.norm_energy}). Check the log immediately above this "
+                    f"error for the specific cause (atom clash, ring-opened, or ORCA optimization "
+                    f"failure) — increasing thresholds will not help if the geometry itself is being "
+                    f"altered before ORCA ever runs."
+                )
 
         observer = trieste.objectives.utils.mk_observer(self._func_objective)
 
@@ -536,25 +560,22 @@ class ConfSearchRunner:
         dataset = None
 
         if config.load_ensemble:
-            load_ensemble_filename = Path(config.load_ensemble)
-            if not load_ensemble_filename.is_absolute():
-                load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
-            load_ensemble_filename = str(load_ensemble_filename)
-            logger.info("Loading init points from given ensemble!")
-            ep = EnsembleProcessor(
-                load_ensemble_filename,
-                dihedral_idxs=self.state.dihedral_ids,
-            )
-            ensemble_min = min(ep.energies)
-            logger.info(
-                "Ensemble normalization: using ensemble minimum %.3f kcal/mol "
-                "instead of ORCA norm_energy %.3f kcal/mol.",
-                ensemble_min, self.state.norm_energy,
-            )
-            self.state.norm_energy = ensemble_min
-            ep.normalize_energy(ensemble_min)
-            dataset = Dataset(*ep.get_tf_data())
+            ep = self.state.ensemble_processor
+            if ep is None:
+                logger.warning(
+                    "ensemble_processor was not created ahead — checking load_ensemble again."
+                )
+                ep = EnsembleProcessor(
+                    self._resolve_ensemble_path(), dihedral_idxs=self.state.dihedral_ids,
+                )
             
+            logger.info(
+                "Loading init points from given ensemble! Normalizing against norm_energy=%.3f kcal/mol.",
+                self.state.norm_energy,
+            )
+            ep.normalize_energy(self.state.norm_energy)
+            dataset = Dataset(*ep.get_tf_data())
+
             obs = dataset.observations.numpy().flatten()
             obs_range = obs.max() - obs.min()
             obs_mean = obs.mean()
@@ -933,6 +954,14 @@ class ConfSearchRunner:
             {"query_points": query_points.tolist(), "observations": observations.tolist()},
             open(all_points_file, "w"),
         )
+
+    def _resolve_ensemble_path(self) -> str:
+        """Returns absolute path to load_ensemble."""
+        config = self.state.config
+        load_ensemble_filename = Path(config.load_ensemble)
+        if not load_ensemble_filename.is_absolute():
+            load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
+        return str(load_ensemble_filename)
 
 
 def main():
