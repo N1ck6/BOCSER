@@ -5,9 +5,17 @@ This module provides ConfSearchRunner, a class-based orchestrator that encapsula
 all state and behavior for the conformational search workflow.
 """
 
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+import warnings
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="gpflow")
+from rdkit import Chem, RDLogger
+RDLogger.DisableLog("rdApp.warning")
+from rdkit.Chem import AllChem
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
-import os
 import json
 from pathlib import Path
 import numpy as np
@@ -20,8 +28,6 @@ from trieste.space import Box
 from trieste.models.gpflow.models import GaussianProcessRegression
 from trieste.acquisition.rule import EfficientGlobalOptimization
 from trieste.acquisition.function import ExpectedImprovement
-from rdkit import Chem
-from rdkit.Chem import AllChem
 
 from transform_kernel import TransformKernel
 from coef_from_grid import pes_tf, pes_tf_grad
@@ -194,20 +200,24 @@ class ConfSearchRunner:
 
         # Pre-opt
         logger.info("Optimizing constrained struct")
-        en, preopt_status = calc_energy(
-            self.state.mol_file_name,
-            list(zip(self.state.dihedral_ids, dihedrals)),
-            self.state.norm_energy,
-            True,
-            constrained_opt=True,
-            ik_loss=self.state.ik_loss,
-            original_mol=self.state.mol,
-            broken_structs_dir=self.state.broken_structs_path,
-            ts_bonds=self.state.ts_bonds,
-            ts_bond_max_length=self.state.config.ts_bond_max_length,
-            fixed_dihedrals=self.state.fixed_dihedrals,
-            extra_constraints=self.state.extra_constraints,
-        )
+        try:
+            en, preopt_status = calc_energy(
+                self.state.mol_file_name,
+                list(zip(self.state.dihedral_ids, dihedrals)),
+                self.state.norm_energy,
+                True,
+                constrained_opt=True,
+                ik_loss=self.state.ik_loss,
+                original_mol=self.state.mol,
+                broken_structs_dir=self.state.broken_structs_path,
+                ts_bonds=self.state.ts_bonds,
+                ts_bond_max_length=self.state.config.ts_bond_max_length,
+                fixed_dihedrals=self.state.fixed_dihedrals,
+                extra_constraints=self.state.extra_constraints,
+            )
+        except Exception:
+            logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
+            en, preopt_status = self.state.config.broken_struct_energy, False
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
         if not preopt_status:
@@ -784,8 +794,12 @@ class ConfSearchRunner:
 
             last_opt_status = None
             status_file = Path(self.state.working_folder) / f"{self.state.exp_name}_last_opt_status.json"
-            with open(status_file, "r") as file:
-                last_opt_status = json.load(file)
+            if status_file.is_file():
+                with open(status_file, "r") as file:
+                    last_opt_status = json.load(file)
+            else:
+                logger.error("Status file %s not found after step %s — probably, objective feel before creating it.", status_file, step)
+                last_opt_status = {"LAST_OPT_OK": False}
             logger.debug("Last opt status: %s", last_opt_status)
 
             try:
