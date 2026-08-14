@@ -7,7 +7,7 @@ dihedral_logs.db
 grad_log
 out.log
 test.py
-test.ipynb
+*.ipynb
 .ipynb_checkpoints/
 
 # Testing results

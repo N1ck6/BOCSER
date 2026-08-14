@@ -478,6 +478,7 @@ def _save_broken_struct(
     broken_structs_dir: Union[str, None],
     reason: str,
     atoms_raw1: Union[tuple, None] = None,
+    extra_files: Union[list, None] = None,
 ) -> None:
     """Save a discarded/broken candidate geometry for later inspection (e.g. in ChemCraft)."""
 
@@ -494,6 +495,11 @@ def _save_broken_struct(
             fh.write(f"{n_atoms}\n{atom_tag}{reason}\n")
             fh.write("\n".join(lines))
             fh.write("\n")
+
+        for src in extra_files or []:
+            src = Path(src)
+            if src.is_file():
+                shutil.copy2(src, Path(broken_structs_dir) / f"{struct_id}_{atom_tag}{reason}{src.suffix}")
         logger.info("Saved broken candidate (%s) to %s", reason, out_path)
     except Exception:
         logger.exception("Failed to save broken structure (%s) to %s", reason, broken_structs_dir)
@@ -730,7 +736,8 @@ def calc_energy(
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed")
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed",
+                            extra_files=[out_name, inp_name])
     return res, opt_status
 
 def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
