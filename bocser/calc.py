@@ -310,21 +310,38 @@ def generate_oinp(
             tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
-            all_constraints = list(hard_constraints or [])
+            hard_by_axis = {}
+            all_constraints = []
+            for c in (hard_constraints or []):
+                if c.type == "dihedral":
+                    axis = frozenset((c.atoms[1], c.atoms[2]))
+                    if axis in hard_by_axis:
+                        logger.warning(
+                            "Dublicate dihedral-constraint on axis %s: %s",
+                            tuple(axis), c,
+                        )
+                    hard_by_axis[axis] = c
+                all_constraints.append(c)
+
             if constrained_opt:
                 dihedrals_deg = to_degrees(dihedrals)
-                all_constraints += [
-                    Constraint("dihedral", tuple(a), d) for a, d in dihedrals_deg
-                ]
+                for atoms, value in dihedrals_deg:
+                    axis = frozenset((atoms[1], atoms[2]))
+                    if axis in hard_by_axis:
+                        logger.info(
+                            "BO-target for zxis %s was skipped in .inp: fixed with %s=%s.",
+                            tuple(axis), hard_by_axis[axis].type, hard_by_axis[axis].value,
+                        )
+                        continue
+                    all_constraints.append(Constraint("dihedral", tuple(atoms), value))
 
             need_geom = bool(all_constraints) or cfg.ts
             if need_geom:
-                tmp.write("%geom\n")
                 if all_constraints:
-                    tmp.write("Constraints\n")
+                    tmp.write("%geom Constraints\n")
                     for c in all_constraints:
                         letter = _CONSTRAINT_LETTER[c.type]
-                        atoms_str = " ".join(str(a) for a in c.atoms)
+                        atoms_str = " ".join(str(a + 1) for a in c.atoms)
                         tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
                     tmp.write("end\n")
                 if cfg.ts:

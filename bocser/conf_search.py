@@ -444,9 +444,21 @@ class ConfSearchRunner:
 
         logger.info("Coef calculator created!")
 
+        skipped_fixed_axes = []
         for ids, coefs in coef_matrix:
+            central_axis = frozenset((ids[1], ids[2]))
+            if central_axis in fixed_double_bonds:
+                skipped_fixed_axes.append(ids)
+                continue
             self.state.dihedral_ids.append(ids)
             self.state.mean_func_coefs.append(coefs)
+
+        if skipped_fixed_axes:
+            logger.warning(
+                "%d dihedral(s) in coef_matrix() were fixed in fixed_double_bonds and were "
+                "excluded from search_dim. Points: %s",
+                len(skipped_fixed_axes), skipped_fixed_axes,
+            )
 
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
