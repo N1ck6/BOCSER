@@ -237,6 +237,8 @@ class CoefCalculator:
         if not rings:
             logger.warning("Rings are not found in molecule, IK unavailable")
             return [], [], []
+        
+        frag_key_to_position = {key: i for i, key in enumerate(self.frags.keys())}
 
         edges = []
         for bond in mol.GetBonds():
@@ -290,7 +292,7 @@ class CoefCalculator:
                     found = False
                     for f in self.frags.keys():
                         if all(atom in f for atom in d):
-                            dihedral_idxs.append(self.frags[f])
+                            dihedral_idxs.append(frag_key_to_position[f])
                             found = True
                             break
                     if not found:
@@ -446,6 +448,15 @@ class CoefCalculator:
                             frag_smiles, atoms_to_use,
                         )
                         minor_rings.append(atoms_to_use)
+                    continue
+
+                real_axis = frozenset((old_idxs[1], old_idxs[2]))
+                if real_axis in self.fixed_double_bonds:
+                    logger.info(
+                        "get_idxs_to_rotate() choose axis %s for bond %s-%s — "
+                        "fragment was fixed, so it is skipped",
+                        old_idxs, bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(),
+                    )
                     continue
 
                 self.frags[old_idxs] = self.unique_frags[frag_smiles]
@@ -645,7 +656,7 @@ def detect_double_bonds(mol: Chem.rdchem.Mol) -> list[tuple[int, int]]:
 
 def log_and_combine_double_bonds(mol, user_specified: list[tuple[int, int]]) -> set:
     auto = detect_double_bonds(mol)
-    logger.info("#Not used# Auto detected double bonds (canonical 0-idx): %s", auto)
+    logger.info("Auto detected double bonds (canonical 0-idx): %s", auto)
     if user_specified:
         logger.info("User set double bonds (canonical 0-idx): %s", user_specified)
         for a, b in user_specified:
@@ -654,6 +665,6 @@ def log_and_combine_double_bonds(mol, user_specified: list[tuple[int, int]]) -> 
                 logger.warning("fixed_double_bonds (%d,%d): no bonds detected between specified atoms.", a, b)
             elif bond.GetBondType() != Chem.BondType.DOUBLE:
                 logger.warning("fixed_double_bonds (%d,%d): bond detected, but not double (type=%s).", a, b, bond.GetBondType())
-    combined = {frozenset(p) for p in user_specified} # | {frozenset(p) for p in auto} Not automated for now!!!
+    combined = {frozenset(p) for p in user_specified} | {frozenset(p) for p in auto}
     logger.info("Resulting set of double bonds (%d total): %s", len(combined), sorted(tuple(sorted(p)) for p in combined))
     return combined

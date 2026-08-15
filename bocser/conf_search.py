@@ -444,21 +444,15 @@ class ConfSearchRunner:
 
         logger.info("Coef calculator created!")
 
-        skipped_fixed_axes = []
         for ids, coefs in coef_matrix:
             central_axis = frozenset((ids[1], ids[2]))
             if central_axis in fixed_double_bonds:
-                skipped_fixed_axes.append(ids)
-                continue
+                raise RuntimeError(
+                    f"Axis {ids} is fixed, but still exists in  "
+                    f"coef_matrix()/self.frags — filtration in CoefCalculator is incomplete. "
+                )
             self.state.dihedral_ids.append(ids)
             self.state.mean_func_coefs.append(coefs)
-
-        if skipped_fixed_axes:
-            logger.warning(
-                "%d dihedral(s) in coef_matrix() were fixed in fixed_double_bonds and were "
-                "excluded from search_dim. Points: %s",
-                len(skipped_fixed_axes), skipped_fixed_axes,
-            )
 
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
@@ -495,6 +489,16 @@ class ConfSearchRunner:
 
         self.state.search_dim = len(self.state.dihedral_ids)
         logger.info("Cur search dim is %s", self.state.search_dim)
+
+        for cycle_idx in ik_loss_dihedrals_idxs:
+            for idx in cycle_idx:
+                if idx >= 0 and idx >= self.state.search_dim:
+                    raise RuntimeError(
+                        f"IK dihedral index {idx} is out of range search_dim={self.state.search_dim}. "
+                        f"ik_loss_dihedrals_idxs={ik_loss_dihedrals_idxs}. "
+                        f"Check frag_key_to_position in get_ring_dihedrals() and filter "
+                        f"fixed_double_bonds в get_interesting_frags()."
+                    )
 
     def _build_model_and_acquisition(self) -> Tuple[Any, Any, Any]:
         """Build GPR model, BO optimizer, and acquisition rule."""
@@ -810,22 +814,29 @@ class ConfSearchRunner:
                 with open(status_file, "r") as file:
                     last_opt_status = json.load(file)
             else:
-                logger.error("Status file %s not found after step %s — probably, objective feel before creating it.", status_file, step)
                 last_opt_status = {"LAST_OPT_OK": False}
+                logger.error("Status file missing — acq/objective failed before dump")
             logger.debug("Last opt status: %s", last_opt_status)
 
             try:
                 dataset = result.try_get_final_dataset()
                 model = result.try_get_final_model()
             except Exception as e:
-                logger.error(
-                    "Step %d: could not get final dataset/model from trieste result: %s. "
-                    "Keeping previous dataset and model. "
-                    "Likely cause: GP hyperparameter optimization failed (Inf/NaN). "
-                    "This usually means dataset observations are in a bad range — "
-                    "check norm_energy and ensemble normalization.",
-                    step, e
-                )
+                if "GatherV2" in str(e) or "not in [0" in str(e):
+                    logger.error(
+                        "Step %s: trieste result unavailable due to an indexing error in "
+                        "acquisition-function. Keeping previous dataset and model.",
+                        step,
+                    )
+                else:
+                    logger.error(
+                        "Step %d: could not get final dataset/model from trieste result: %s. "
+                        "Keeping previous dataset and model. "
+                        "Likely cause: GP hyperparameter optimization failed (Inf/NaN). "
+                        "This usually means dataset observations are in a bad range — "
+                        "check norm_energy and ensemble normalization.",
+                        step, e
+                    )
                 # Continue with old dataset, model
                 model.update(dataset)
                 try:

@@ -146,14 +146,16 @@ class improvement_variance(AcquisitionFunctionClass):
 def safe_gather_with_none(x, indices):
     x = tf.convert_to_tensor(x)
     indices = tf.ragged.constant(indices, dtype=tf.int32)
-
+    n_axes = tf.shape(x)[-1]
     nan = tf.constant(float("nan"), x.dtype)
 
     def gather_one(xb):
         def gather_flat(idx):
-            safe_idx = tf.maximum(idx, 0)
+            valid = idx >= 0
+
+            safe_idx = tf.clip_by_value(idx, 0, n_axes - 1)
             val = tf.gather(xb, safe_idx)
-            return tf.where(idx > -1, val, nan)
+            return tf.where(valid, val, nan)
 
         return tf.ragged.map_flat_values(gather_flat, indices)
 

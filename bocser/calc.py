@@ -341,7 +341,7 @@ def generate_oinp(
                     tmp.write("%geom Constraints\n")
                     for c in all_constraints:
                         letter = _CONSTRAINT_LETTER[c.type]
-                        atoms_str = " ".join(str(a + 1) for a in c.atoms)
+                        atoms_str = " ".join(str(a) for a in c.atoms)
                         tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
                     tmp.write("end\n")
                 if cfg.ts:
