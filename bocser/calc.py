@@ -183,15 +183,15 @@ def change_dihedrals(mol_file_name: str,
                 Chem.MolToMolFile(mol, tmp.name)
                 tmp_mol = Chem.RWMol(Chem.MolFromMolFile(tmp.name, removeHs=False))
 
-            for a, b in ts_bond_set: # Remove TS bonds to allow free movement
-                if tmp_mol.GetBondBetweenAtoms(a, b) is not None:
-                    tmp_mol.RemoveBond(a, b)
-            if ts_bond_set:
-                Chem.FastFindRings(tmp_mol)
+            # for a, b in ts_bond_set: # Remove TS bonds to allow free movement
+            #     if tmp_mol.GetBondBetweenAtoms(a, b) is not None:
+            #         tmp_mol.RemoveBond(a, b)
+            # if ts_bond_set:
+            #     Chem.FastFindRings(tmp_mol)
 
             mp = AllChem.MMFFGetMoleculeProperties(tmp_mol, mmffVariant='MMFF94')
-            if mp is None:
-                raise RuntimeError("MMFFGetMoleculeProperties returned None after removing TS bonds")
+            # if mp is None:
+            #     raise RuntimeError("MMFFGetMoleculeProperties returned None after removing TS bonds")
             ff = AllChem.MMFFGetMoleculeForceField(tmp_mol, mp)
 
             for bl_dict in ik_loss.bond_lengths:
