@@ -111,6 +111,7 @@ class ConfSearchState:
     minima: list = field(default_factory=list)
     ensemble_processor: Optional[Any] = None
     broken_structs_path: str = ""
+    success_out_dir: str = ""
     model_chk: Optional[Any] = None
     current_minima: float = 1e9
     acq_vals_log: list = field(default_factory=list)
@@ -210,6 +211,7 @@ class ConfSearchRunner:
                 ik_loss=self.state.ik_loss,
                 original_mol=self.state.mol,
                 broken_structs_dir=self.state.broken_structs_path,
+                success_out_dir=self.state.success_out_dir,
                 ts_bonds=self.state.ts_bonds,
                 ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals,
@@ -237,6 +239,7 @@ class ConfSearchRunner:
             ik_loss=self.state.ik_loss,
             original_mol=self.state.mol,
             broken_structs_dir=self.state.broken_structs_path,
+            success_out_dir=self.state.success_out_dir,
             ts_bonds=self.state.ts_bonds,
             ts_bond_max_length=self.state.config.ts_bond_max_length,
             fixed_dihedrals=self.state.fixed_dihedrals,
@@ -405,6 +408,10 @@ class ConfSearchRunner:
         broken_path.mkdir(parents=True, exist_ok=True)
         self.state.broken_structs_path = str(broken_path)
 
+        success_path = Path(self.state.working_folder) / f"{config.exp_name}_success/"
+        success_path.mkdir(parents=True, exist_ok=True)
+        self.state.success_out_dir = str(success_path)
+
         if config.acquisition_function not in {"ei", "evm", "ik"}:
             logger.warning(
                 "Acquisition function should be one of the following: 'ei', 'evm', 'ik'; got %s; Continue with default: 'evm'",
@@ -563,7 +570,8 @@ class ConfSearchRunner:
             self.state.norm_energy, ok = calc_energy(
                 self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
                 original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
-                ts_bonds=self.state.ts_bonds, ts_bond_max_length=self.state.config.ts_bond_max_length,
+                success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
+                ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
             )
             logger.info("Norm energy: %s", self.state.norm_energy)

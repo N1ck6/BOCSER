@@ -345,6 +345,8 @@ def generate_oinp(
                         tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
                     tmp.write("end\n")
                 if cfg.ts:
+                    max_iter = cfg.ts_max_iter if constrained_opt else cfg.ts_max_iter * 2
+                    tmp.write(f"MaxIter {max_iter}\n")
                     tmp.write("Calc_Hess true\n")
                 tmp.write("end\n")
 
@@ -462,6 +464,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
     import re
     energy_re = re.compile(r"FINAL SINGLE POINT ENERGY\s+(-?\d+\.\d+)")
     alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
+    terminated_re = re.compile(r"\*{4}ORCA TERMINATED NORMALLY\*{4}")
 
     try:
         with open(log_name, 'r', errors='ignore') as fh:
@@ -469,6 +472,16 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
             from collections import deque
             last_lines = deque(fh, maxlen=500)
             joined = "\n".join(last_lines)
+
+            if not terminated_re.search(joined):
+                # Don't search for energy if run didn't succeed
+                logger.warning(
+                    "ORCA TERMINATED NORMALLY not found in %s (last %d lines); "
+                    "treating optimization as failed, not parsing energy.",
+                    log_name, len(last_lines),
+                )
+                cfg = _get_config_or_raise()
+                return cfg.broken_struct_energy, False
 
             m = energy_re.search(joined)
             if not m:
@@ -520,6 +533,20 @@ def _save_broken_struct(
         logger.info("Saved broken candidate (%s) to %s", reason, out_path)
     except Exception:
         logger.exception("Failed to save broken structure (%s) to %s", reason, broken_structs_dir)
+
+def _save_successful_out(out_name: str, constrained_opt: bool, success_out_dir: Union[str, None]) -> None:
+    """Copy a successfully converged ORCA .out file of final (unconstrained)
+    optimization stage conformers."""
+    if not success_out_dir:
+        return
+    try:
+        Path(success_out_dir).mkdir(parents=True, exist_ok=True)
+        struct_id = run_state.peek_structure_id()
+        dest = Path(success_out_dir) / f"{struct_id}_{"PreOPT" if constrained_opt else "OPT"}_{Path(out_name).name}"
+        shutil.copy(out_name, dest)
+        logger.debug("Saved successful conformer .out to %s", dest)
+    except Exception:
+        logger.exception("Failed to save successful .out file %s to %s", out_name, success_out_dir)
 
 def check_is_broken(
     xyz_block: str,
@@ -656,6 +683,7 @@ def calc_energy(
         config: ConfSearchConfig = None,
         original_mol=None,
         broken_structs_dir: Union[str, None] = None,
+        success_out_dir: Union[str, None] = None,
         ts_bonds=None, ts_bond_max_length=5.0,
         fixed_dihedrals=None,
         extra_constraints=None,
@@ -754,7 +782,9 @@ def calc_energy(
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
         _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed",
-                            extra_files=[out_name, inp_name])
+                            extra_files=[out_name])
+    else:
+        _save_successful_out(out_name, constrained_opt, success_out_dir)
     return res, opt_status
 
 def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
