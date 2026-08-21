@@ -457,7 +457,7 @@ def inp_to_out_name(inp_file_name : str) -> str:
     cfg = _get_config_or_raise()
     return (inp_file_name[:-4] + ".out") if not cfg.ts or not cfg.use_grass else (os.path.dirname(inp_file_name) + "/outfile.out")
 
-def find_energy_in_log(log_name : str) -> tuple[float, bool]:
+def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
     """
         finds energy of structure in log file
     """
@@ -465,12 +465,14 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
     energy_re = re.compile(r"FINAL SINGLE POINT ENERGY\s+(-?\d+\.\d+)")
     alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
     terminated_re = re.compile(r"\*{4}ORCA TERMINATED NORMALLY\*{4}")
+    cycle_re  = re.compile(r"GEOMETRY OPTIMIZATION CYCLE\s+(\d+)", re.IGNORECASE)
+    maxiter_re = re.compile(r"MAX NUMBER OF ITERATIONS REACHED", re.IGNORECASE)
 
     try:
         with open(log_name, 'r', errors='ignore') as fh:
             # scan from end to find the last occurrence without loading whole huge files
             from collections import deque
-            last_lines = deque(fh, maxlen=500)
+            last_lines = deque(fh, maxlen=2000)
             joined = "\n".join(last_lines)
 
             if not terminated_re.search(joined):
@@ -481,27 +483,35 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool]:
                     log_name, len(last_lines),
                 )
                 cfg = _get_config_or_raise()
-                return cfg.broken_struct_energy, False
+                return cfg.broken_struct_energy, False, None
+
+            cycles = [int(c) for c in cycle_re.findall(joined)]
+            n_cycles = max(cycles) if cycles else None
+            if maxiter_re.search(joined):
+                logger.info("ORCA hit MaxIter (last cycle = %s) in %s", n_cycles)
 
             m = energy_re.search(joined)
             if not m:
                 m = alt_re.search(joined)
-            if m:
-                try:
-                    en = float(m.group(1))
-                    return en, True
-                except Exception:
-                    logger.exception("Failed to parse energy from line: %s", m.group(0))
-                    cfg = _get_config_or_raise()
-                    return cfg.broken_struct_energy, False
-            # no energy line found -> optimization likely failed; return broken_struct_energy
-            logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
-            cfg = _get_config_or_raise()
-            return cfg.broken_struct_energy, False
+            
+            if not m:
+                # no energy line found -> optimization likely failed; return broken_struct_energy
+                logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
+                cfg = _get_config_or_raise()
+                return cfg.broken_struct_energy, False, None
+            try:
+                en = float(m.group(1))
+
+
+                return en, True, n_cycles
+            except Exception:
+                logger.exception("Failed to parse energy from line: %s", m.group(0))
+                cfg = _get_config_or_raise()
+                return cfg.broken_struct_energy, False, None
     except FileNotFoundError:
         logger.error("No log file: %s. Returning broken_struct_energy", log_name)
         cfg = _get_config_or_raise()
-        return cfg.broken_struct_energy, False
+        return cfg.broken_struct_energy, False, None
 
 def _save_broken_struct(
     coords_block: str,
@@ -777,7 +787,13 @@ def calc_energy(
     )
     start_calc(inp_name)
     
-    res, opt_status = find_energy_in_log(out_name) 
+    res, opt_status, n_cycles = find_energy_in_log(out_name)
+    
+    logger.info(
+        "ORCA finished: success=%s  cycles=%s  energy=%.6f  file=%s",
+        opt_status, n_cycles, res, out_name
+    )
+
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
