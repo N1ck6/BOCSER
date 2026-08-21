@@ -466,7 +466,10 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
     alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
     terminated_re = re.compile(r"\*{4}ORCA TERMINATED NORMALLY\*{4}")
     cycle_re  = re.compile(r"GEOMETRY OPTIMIZATION CYCLE\s+(\d+)", re.IGNORECASE)
-    maxiter_re = re.compile(r"MAX NUMBER OF ITERATIONS REACHED", re.IGNORECASE)
+    maxiter_re = re.compile(
+        r"The optimization did not converge but reached the maximum number of\s+optimization cycles",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     try:
         with open(log_name, 'r', errors='ignore') as fh:
@@ -474,6 +477,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
             from collections import deque
             last_lines = deque(fh, maxlen=2000)
             joined = "\n".join(last_lines)
+            cfg = _get_config_or_raise()
 
             if not terminated_re.search(joined):
                 # Don't search for energy if run didn't succeed
@@ -482,35 +486,32 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
                     "treating optimization as failed, not parsing energy.",
                     log_name, len(last_lines),
                 )
-                cfg = _get_config_or_raise()
                 return cfg.broken_struct_energy, False, None
 
             cycles = [int(c) for c in cycle_re.findall(joined)]
             n_cycles = max(cycles) if cycles else None
-            if maxiter_re.search(joined):
-                logger.info("ORCA hit MaxIter (last cycle = %s) in %s", n_cycles)
 
-            m = energy_re.search(joined)
-            if not m:
-                m = alt_re.search(joined)
-            
+            if maxiter_re.search(joined):
+                # Iteration threshhold is hit, point can be not a minimum
+                logger.warning(
+                    "ORCA reached MaxIter (cycle=%s) in %s — returning broken_struct_energy",
+                    n_cycles, log_name,
+                )
+                return cfg.broken_struct_energy, False, n_cycles
+
+            m = energy_re.search(joined) or alt_re.search(joined)
             if not m:
                 # no energy line found -> optimization likely failed; return broken_struct_energy
                 logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
-                cfg = _get_config_or_raise()
                 return cfg.broken_struct_energy, False, None
-            try:
-                en = float(m.group(1))
-
-
-                return en, True, n_cycles
-            except Exception:
-                logger.exception("Failed to parse energy from line: %s", m.group(0))
-                cfg = _get_config_or_raise()
-                return cfg.broken_struct_energy, False, None
+            
+            return float(m.group(1)), True, n_cycles
+            
     except FileNotFoundError:
         logger.error("No log file: %s. Returning broken_struct_energy", log_name)
-        cfg = _get_config_or_raise()
+        return cfg.broken_struct_energy, False, None
+    except Exception:
+        logger.exception("Failed to parse energy from line: %s", m.group(0))
         return cfg.broken_struct_energy, False, None
 
 def _save_broken_struct(
@@ -552,7 +553,7 @@ def _save_successful_out(out_name: str, constrained_opt: bool, success_out_dir: 
     try:
         Path(success_out_dir).mkdir(parents=True, exist_ok=True)
         struct_id = run_state.peek_structure_id()
-        dest = Path(success_out_dir) / f"{struct_id}_{"PreOPT" if constrained_opt else "OPT"}_{Path(out_name).name}"
+        dest = Path(success_out_dir) / f"{struct_id}_{'PreOPT' if constrained_opt else 'OPT'}_{Path(out_name).name}"
         shutil.copy(out_name, dest)
         logger.debug("Saved successful conformer .out to %s", dest)
     except Exception:
@@ -790,8 +791,8 @@ def calc_energy(
     res, opt_status, n_cycles = find_energy_in_log(out_name)
     
     logger.info(
-        "ORCA finished: success=%s  cycles=%s  energy=%.6f  file=%s",
-        opt_status, n_cycles, res, out_name
+        "ORCA finished: success=%s  cycles=%s  energy=%.6f",
+        opt_status, n_cycles, res
     )
 
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
