@@ -35,6 +35,7 @@ class ConfSearchConfig:
     fixed_double_bonds: List[Tuple[int, int]] = field(default_factory=list)  # 1-индексация, как в исходном .mol
     extra_constraints: List[Dict] = field(default_factory=list)
     ts_max_iter: int = 45
+    clear_working_folder: bool = False
 
     def __post_init__(self): # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]

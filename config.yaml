@@ -16,6 +16,7 @@ rolling_mean_threshold : 0
 max_steps : 10
 acquisition_function : "ik"
 ts_max_iter: 55
+clear_working_folder: True
 fixed_double_bonds:
   - [3, 24]
   - [9, 23]

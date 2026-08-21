@@ -17,6 +17,7 @@ from rdkit.Chem import AllChem
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import json
+import shutil
 from pathlib import Path
 import numpy as np
 import tensorflow as tf
@@ -380,8 +381,10 @@ class ConfSearchRunner:
         """Initialize the search from configuration."""
         if not self.state.config:
             raise RuntimeError("Config not loaded. Call load_config first.")
-
         config = self.state.config
+
+        if config.clear_working_folder:
+            self._clear_working_folder()
 
         logger.info("Performing conf. search with config: %s", config)
 
@@ -675,6 +678,44 @@ class ConfSearchRunner:
             )
 
         return dataset
+
+    def _clear_working_folder(self) -> None:
+        """Remove all files/subfolders in working_folder except the mol file,
+        the ensemble file (if provided), so restarting a run never gets
+        contaminated by a previous run's outputs."""
+        config = self.state.config
+        working_folder = Path(self.state.working_folder)
+
+        keep = set()
+        mol_path = Path(config.mol_file_name)
+        if not mol_path.is_absolute():
+            mol_path = (working_folder / mol_path).resolve()
+        keep.add(mol_path.resolve())
+
+        if config.load_ensemble:
+            ens_path = Path(config.load_ensemble)
+            if not ens_path.is_absolute():
+                ens_path = (working_folder / ens_path).resolve()
+            keep.add(ens_path.resolve())
+
+        if getattr(self.state, "config_path", None):
+            keep.add(Path(self.state.config_path).resolve())
+        keep.add(Path(self.state.db_file).resolve())
+
+        logger.info("clear_working_folder=True: wiping %s except %s", working_folder, keep)
+
+        for item in working_folder.iterdir():
+            resolved = item.resolve()
+            if resolved in keep:
+                continue
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+                logger.debug("Removed %s", item)
+            except Exception:
+                logger.exception("Failed to remove %s during working-folder cleanup", item)
 
     def _build_rule(self) -> Any:
         """Build acquisition rule based on configuration."""
