@@ -41,6 +41,7 @@ from calc import (
     raw1_to_with_h_canonical,
     raw1_to_heavy_canonical,
     resolve_extra_constraints,
+    compute_mol_hash,
 )
 from run_state import increase_structure_id
 import config_manager
@@ -570,22 +571,35 @@ class ConfSearchRunner:
                 len(self.state.ensemble_processor.energies), self.state.norm_energy,
             )
         else:
-            self.state.norm_energy, ok = calc_energy(
-                self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
-                original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
-                success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
-                ts_bond_max_length=self.state.config.ts_bond_max_length,
-                fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
-            )
-            logger.info("Norm energy: %s", self.state.norm_energy)
-            if not ok:
-                raise RuntimeError(
-                    f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
-                    f"(norm_energy={self.state.norm_energy}). Check the log immediately above this "
-                    f"error for the specific cause (atom clash, ring-opened, or ORCA optimization "
-                    f"failure) — increasing thresholds will not help if the geometry itself is being "
-                    f"altered before ORCA ever runs."
+            theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
+            mol_hash = compute_mol_hash(self.state.mol_file_name, config.charge, config.spin_multiplicity)
+            db = LocalConnector(self.state.db_file)
+
+            cached = db.get_norm_energy(mol_hash, theory_level)
+            if cached is not None:
+                logger.info("norm_energy cache (theory=%s): %.6f kcal/mol — skipping ORCA calc.",
+                            theory_level, cached)
+                self.state.norm_energy = cached
+            else:
+                self.state.norm_energy, ok = calc_energy(
+                    self.state.mol_file_name, dihedrals=[], norm_energy=0.0, ik_loss=self.state.ik_loss,
+                    original_mol=self.state.mol, broken_structs_dir=self.state.broken_structs_path,
+                    success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
+                    ts_bond_max_length=self.state.config.ts_bond_max_length,
+                    fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
                 )
+                logger.info("Norm energy: %s", self.state.norm_energy)
+                if not ok:
+                    raise RuntimeError(
+                        f"Initial geometry of {self.state.mol_file_name} failed energy calculation "
+                        f"(norm_energy={self.state.norm_energy}). Check the log immediately above this "
+                        f"error for the specific cause (atom clash, ring-opened, or ORCA optimization "
+                        f"failure) — increasing thresholds will not help if the geometry itself is being "
+                        f"altered before ORCA ever runs."
+                    )
+                db.set_norm_energy(mol_hash, theory_level, self.state.norm_energy,
+                            source_mol_file=self.state.mol_file_name)
+                logger.info("norm_energy cached (theory=%s).", theory_level)
 
         observer = trieste.objectives.utils.mk_observer(self._func_objective)
 
