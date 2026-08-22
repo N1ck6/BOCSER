@@ -48,11 +48,15 @@ _VDW_RADII_DEFAULT = 1.70
 
 def _clash_threshold(sym_a: str, sym_b: str) -> float:
     """Minimum allowed distance between two atoms before they are considered clashing."""
-    return 0.7 # ON HOLD
+    cfg = config_manager.get_config()
+    scale = cfg.clash_vdw_scale if cfg is not None else 0.0
+
+    if scale <= 0.0:
+        return 0.7  # legacy behaviour, unchanged default
 
     ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
     rb = _VDW_RADII.get(sym_b, _VDW_RADII_DEFAULT)
-    return ra + rb
+    return scale * (ra + rb)
 
 def _bond_break_threshold(sym_a: str, sym_b: str, delta: float = 0.1) -> float:
     """Maximum allowed distance for a ring bond before it is considered broken."""

@@ -13,6 +13,8 @@ class ConfSearchConfig:
     orca_method : str = "lda sto-3g"
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7 # Deprecated
+    clash_vdw_scale: float = 0.0  # 0.0 = legacy fixed 0.7 Å threshold.
+                                  # >0.0 = use clash_vdw_scale * (vdw_radius_a + vdw_radius_b) instead.
     ts : bool = False
     ring_bond_threshold : float = 1.75
     ts_ring_bond_threshold : float = 2.5
