@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 from default_vals import ConfSearchConfig
+from config_loader import ConfigError
 import subprocess
 import shutil
 from pathlib import Path
@@ -126,6 +127,28 @@ def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
     """Opposite of raw1_to_with_h_canonical"""
     order = _with_h_order_cached(mol_file_name)
     return order[canon_idx] + 1
+
+def _validate_extra_constraints_atoms(self, config: ConfSearchConfig) -> None:
+    if not config.extra_constraints:
+        return
+
+    ref_mol = Chem.MolFromMolFile(self.state.mol_file_name, removeHs=False)
+    n_atoms = ref_mol.GetNumAtoms()
+
+    errors = []
+    for i, c in enumerate(config.extra_constraints):
+        for raw_idx in c["atoms"]:
+            # config uses 1-indexed atom numbers as in the raw .mol file
+            if not (1 <= raw_idx <= n_atoms):
+                errors.append(
+                    f"extra_constraints[{i}] (type={c['type']}): atom index {raw_idx} "
+                    f"is out of range — molecule has {n_atoms} atoms (1-indexed, with H)."
+                )
+
+    if errors:
+        msg = "Invalid extra_constraints in config:\n" + "\n".join(errors)
+        logger.error(msg)
+        raise ConfigError(msg)
 
 def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list:
     """config.extra_constraints (1-idx, raw .mol) -> list[Constraint]"""

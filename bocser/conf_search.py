@@ -41,6 +41,7 @@ from calc import (
     raw1_to_with_h_canonical,
     raw1_to_heavy_canonical,
     resolve_extra_constraints,
+    _validate_extra_constraints_atoms,
     compute_mol_hash,
 )
 from run_state import increase_structure_id
@@ -397,6 +398,7 @@ class ConfSearchRunner:
             mol_file = mol_file.resolve()
         self.state.mol_file_name = str(mol_file)
 
+        _validate_extra_constraints_atoms(config)
         self.state.extra_constraints = resolve_extra_constraints(config.extra_constraints, self.state.mol_file_name)
         if self.state.extra_constraints:
             logger.info("Загружено %d пользовательских extra_constraints", len(self.state.extra_constraints))
