@@ -398,7 +398,22 @@ def start_calc(gjf_name: str, scan=False):
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
     
     timeout_minutes = cfg.orca_poll_timeout_minutes
-    subprocess.run(["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name])
+    proc = subprocess.run(
+        ["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name],
+        capture_output=True, text=True,
+    )
+
+    if proc.returncode != 0:
+        logger.error(
+            "sbatch submission FAILED for %s (returncode=%s). stdout=%r stderr=%r. "
+            "This is an infrastructure failure, not a chemistry failure — "
+            "the resulting '.out' will not exist",
+            sbatch_name, proc.returncode, proc.stdout.strip(), proc.stderr.strip(),
+        )
+        raise RuntimeError(
+            f"sbatch submission failed for {sbatch_name} (code {proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
 
     # cleanup heavy ORCA files after calculations
     _cleanup_orca_tempfiles(gjf_path)
