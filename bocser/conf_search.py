@@ -863,11 +863,11 @@ class ConfSearchRunner:
                 result = bo.optimize(1, dataset, model, rule, fit_initial_model=False)
                 logger.info("Optimization step %s succeed!", step)
             except Exception:
-                logger.warning("Optimization failed")
-                try:
-                    logger.debug("Optimization result dataset: %s", result.astuple()[1][-1].dataset)
-                except Exception:
-                    logger.debug("No optimization result dataset available")
+                logger.exception(
+                    "trieste bo.optimize() raised on step %s — skipping this step, "
+                    "keeping previous dataset/model unchanged.", step
+                )
+                continue
 
             logger.debug("After step: %s", self.state.last_opt_ok)
 
