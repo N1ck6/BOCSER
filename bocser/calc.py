@@ -12,10 +12,9 @@ from sklearn.cluster import KMeans
 
 from default_vals import ConfSearchConfig
 import subprocess
-import shlex
 import shutil
 from pathlib import Path
-
+import hashlib
 import tempfile
 import logging
 logger = logging.getLogger(__name__)
@@ -930,3 +929,11 @@ def parse_points_from_trj(
         ],
         minima_node
     )
+
+def compute_mol_hash(mol_file_name: str, charge: int, multipl: int) -> str:
+    """Canonical, filename-independent identity for norm_energy caching."""
+    mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
+    mol = Chem.RemoveHs(mol)
+    smiles = Chem.MolToSmiles(mol, canonical=True)
+    key = f"{smiles}|q={charge}|m={multipl}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()

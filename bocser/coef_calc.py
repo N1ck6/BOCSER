@@ -417,38 +417,50 @@ class CoefCalculator:
 
                 logger.debug("rot_frag_smiles: %s idxs_to_rotate: %s", frag_smiles, self.get_idxs_to_rotate(frag_mol))
 
-                query_result = self.mol.GetSubstructMatches(
-                    Chem.MolFromSmiles(
-                        self._sanitize_smiles(
-                            Chem.rdmolfiles.MolFragmentToSmiles(
-                                frag_mol,
-                                atomsToUse=self.get_idxs_to_rotate(frag_mol)
+                if ring_atoms is not None:
+                    # compute the dihedral axis directly instead of round-tripping through the shared fragment.
+                    b_idx, e_idx = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+                    b_nbrs = [a.GetIdx() for a in self.mol.GetAtomWithIdx(b_idx).GetNeighbors() if a.GetIdx() != e_idx]
+                    e_nbrs = [a.GetIdx() for a in self.mol.GetAtomWithIdx(e_idx).GetNeighbors() if a.GetIdx() != b_idx]
+                    if not b_nbrs or not e_nbrs:
+                        logger.error(
+                            "Ring bond %d-%d has no substituent on one side — skipping dihedral",
+                            b_idx, e_idx,
+                        )
+                        continue
+                    old_idxs = (b_nbrs[0], b_idx, e_idx, e_nbrs[0])
+                else:
+                    query_result = self.mol.GetSubstructMatches(
+                        Chem.MolFromSmiles(
+                            self._sanitize_smiles(
+                                Chem.rdmolfiles.MolFragmentToSmiles(
+                                    frag_mol,
+                                    atomsToUse=self.get_idxs_to_rotate(frag_mol)
+                                )
                             )
                         )
                     )
-                )
+                    logger.debug("query_result: %s", query_result)
 
-                logger.debug("query_result: %s", query_result)
+                    old_idxs = ()
+                    minor_cycles = []
+                    for res in query_result:
+                        if len(res) == 4 and all(cur in atoms_to_use for cur in res):
+                            old_idxs = res
+                            break
+                        elif len(res) != 4:
+                            if res not in minor_cycles:
+                                logger.warning("Skipping dihedral match with %d atoms (need 4): %s", len(res), res)
+                                minor_cycles.append(res)
 
-                old_idxs = ()
-                minor_cycles = []
-                for res in query_result:
-                    if len(res) == 4 and all(cur in atoms_to_use for cur in res):
-                        old_idxs = res
-                        break
-                    elif len(res) != 4:
-                        if res not in minor_cycles:
-                            logger.warning("Skipping dihedral match with %d atoms (need 4): %s", len(res), res)
-                            minor_cycles.append(res)
-
-                if not old_idxs:
-                    if atoms_to_use not in minor_rings:
-                        logger.error(
-                            "No matching substructure found for fragment %s (atoms %s) in molecule — skipping dihedral",
-                            frag_smiles, atoms_to_use,
-                        )
-                        minor_rings.append(atoms_to_use)
-                    continue
+                    if not old_idxs:
+                        if atoms_to_use not in minor_rings:
+                            logger.error(
+                                "No matching substructure found for fragment %s (atoms %s) in molecule — skipping dihedral",
+                                frag_smiles, atoms_to_use,
+                            )
+                            minor_rings.append(atoms_to_use)
+                        continue
 
                 real_axis = frozenset((old_idxs[1], old_idxs[2]))
                 if real_axis in self.fixed_double_bonds:
