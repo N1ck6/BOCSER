@@ -941,7 +941,6 @@ class ConfSearchRunner:
             else:
                 logger.warning("Last optimization finished with error, skipping trj parsing!")
             model.update(dataset)
-            model.update(dataset)
             try:
                 model.optimize(dataset)
             except Exception as e:
