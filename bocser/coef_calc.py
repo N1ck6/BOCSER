@@ -11,6 +11,7 @@ from default_vals import ConfSearchConfig
 from calc import start_calc
 from coef_from_grid import calc_coefs
 from db_connector import Connector
+import config_manager
 
 import networkx as nx
 from ik_loss import CyclicCollection
@@ -594,13 +595,26 @@ class CoefCalculator:
 
     def get_scans_of_dihedrals(self) -> np.ndarray:
         """
-            Returns list of energie dependecies
+            Returns list of energie dependecies.
+            Independent torsion-scan fragments are submitted to SLURM
+            concurrently instead of one-by-one, so wall-clock time scales
+            with the slowest single scan rather than the sum of all scans.
         """
+        from calc import submit_calc, wait_for_jobs
 
         inp_files = self.generate_scan_inps_from_mol()
-        for cur in inp_files:
-            if not (self.scanfile2smiles[cur] in self.fetched_coefs):
-               start_calc(cur, scan=True)    
+
+        to_run = [
+            cur for cur in inp_files
+            if self.scanfile2smiles[cur] not in self.fetched_coefs
+        ]
+
+        if to_run:
+            job_ids = [submit_calc(cur, scan=True) for cur in to_run]
+            logger.info("Submitted %d independent torsion scans concurrently: %s", len(job_ids), job_ids)
+            cfg = config_manager.get_config()
+            wait_for_jobs(job_ids, timeout_minutes=cfg.orca_poll_timeout_minutes)
+
         return self.get_energies_from_scans(inp_files)
 
     def calc(self) -> list[list[float]]:

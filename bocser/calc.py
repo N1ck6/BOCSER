@@ -178,6 +178,69 @@ def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list
         result.append(c)
     return result
 
+def submit_calc(gjf_name: str, scan=False) -> str:
+    """Submit an ORCA job to SLURM WITHOUT waiting for completion (no `-W`).
+    Returns the SLURM job id so callers can poll/wait on a batch of jobs
+    submitted together. Mirrors start_calc() otherwise (sbatch script content,
+    cleanup happens later, per-job, after the wait step)."""
+    cfg = _get_config_or_raise()
+    orca_cmd = cfg.orca_exec_command
+
+    gjf_path = Path(gjf_name).resolve()
+    gjf_dir = gjf_path.parent
+    gjf_base = gjf_path.stem
+    sbatch_name = str(gjf_dir / (gjf_base + ".sh"))
+    template_to_copy = _select_sbatch_template(gjf_dir, cfg)
+    shutil.copy(template_to_copy, sbatch_name)
+
+    with open(sbatch_name, "a") as fh:
+        if cfg.ts and cfg.use_grass and not scan:
+            fh.write(f"python -u {cfg.path_to_grass} {gjf_name} -OPATH {orca_cmd[:-4]} -p orca -onp {cfg.num_of_procs} -oms \"{cfg.orca_method}\" {cfg.grass_options} > {gjf_name[:-4]}.grass\n")
+        else:
+            fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
+
+    proc = subprocess.run(
+        ["sbatch", "-o", "/dev/null", sbatch_name],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        logger.error("sbatch submission FAILED for %s: %s", sbatch_name, proc.stderr.strip() or proc.stdout.strip())
+        raise RuntimeError(f"sbatch submission failed for {sbatch_name}: {proc.stderr.strip()}")
+
+    # sbatch stdout is typically "Submitted batch job 123456"
+    job_id = proc.stdout.strip().split()[-1]
+    logger.info("Submitted %s as SLURM job %s (not waiting yet)", gjf_name, job_id)
+    return job_id
+
+
+def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
+    """Block until all given SLURM job ids finish, or timeout. Uses a simple
+    polling loop against squeue rather than one blocking sbatch -W per job,
+    so independent jobs actually run concurrently on the cluster."""
+    import time
+    deadline = time.monotonic() + timeout_minutes * 60
+    pending = set(job_ids)
+
+    while pending and time.monotonic() < deadline:
+        proc = subprocess.run(
+            ["squeue", "-h", "-j", ",".join(pending), "-o", "%i"],
+            capture_output=True, text=True,
+        )
+        still_running = set(proc.stdout.split())
+        finished = pending - still_running
+        if finished:
+            logger.debug("Jobs finished: %s", finished)
+        pending = still_running
+        if pending:
+            time.sleep(10)
+
+    if pending:
+        logger.warning(
+            "Timeout (%d min) reached with %d jobs still pending: %s. "
+            "Continuing — their .out files may be incomplete/missing.",
+            timeout_minutes, len(pending), pending,
+        )
+
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
                     full_block=False, ts_bonds=None, fixed_dihedrals=None, extra_constraints=None):
