@@ -480,16 +480,14 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
     alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
     terminated_re = re.compile(r"\*{4}ORCA TERMINATED NORMALLY\*{4}")
     cycle_re  = re.compile(r"GEOMETRY OPTIMIZATION CYCLE\s+(\d+)", re.IGNORECASE)
-    maxiter_re = re.compile(
-        r"The optimization did not converge but reached the maximum number of\s+optimization cycles",
-        re.IGNORECASE | re.DOTALL,
-    )
+    maxiter_re = re.compile(r"The optimization did not converge but reached the maximum number of", re.IGNORECASE)
+    m = None
 
     try:
         with open(log_name, 'r', errors='ignore') as fh:
             # scan from end to find the last occurrence without loading whole huge files
             from collections import deque
-            last_lines = deque(fh, maxlen=2000)
+            last_lines = deque(fh, maxlen=4000)
             joined = "\n".join(last_lines)
             cfg = _get_config_or_raise()
 
@@ -507,10 +505,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
 
             if maxiter_re.search(joined):
                 # Iteration threshhold is hit, point can be not a minimum
-                logger.warning(
-                    "ORCA reached MaxIter (cycle=%s) in %s — returning broken_struct_energy",
-                    n_cycles, log_name,
-                )
+                logger.warning("ORCA reached MaxIter (cycle=%s) — returning broken_struct_energy", n_cycles)
                 return cfg.broken_struct_energy, False, n_cycles
 
             m = energy_re.search(joined) or alt_re.search(joined)
@@ -526,6 +521,8 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
         return cfg.broken_struct_energy, False, None
     except Exception:
         logger.exception("Failed to parse energy from line: %s", m.group(0))
+        matched_text = m.group(0) if m is not None else "<no match — exception occurred before energy regex ran>"
+        logger.exception("Failed to parse energy from log (matched text: %s)", matched_text)
         return cfg.broken_struct_energy, False, None
 
 def _save_broken_struct(
