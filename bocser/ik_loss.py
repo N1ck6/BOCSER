@@ -198,9 +198,9 @@ class IKLoss:
         row3 = tf.stack([zeros, sin_a, cos_a, zeros], axis=1)
         row4 = tf.stack([zeros, zeros, zeros, ones], axis=1)
 
-        # Stack rows to form matrices, then squeeze batch axis if needed
+        # Drop trailing size-1 axis without risk of squeezing `batch` if it happens to also be 1.
         mats = tf.stack([row1, row2, row3, row4], axis=1)
-        return tf.squeeze(mats)
+        return tf.squeeze(mats, axis=-1)
 
     def build_T_matrices(self, angles_list: List[tf.Tensor]) -> List[tf.Tensor]:
         """Build T matrices for the provided dihedral-angle batches.
