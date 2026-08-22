@@ -132,6 +132,16 @@ def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
     """Return True if energy is within tol of broken_struct_energy sentinel."""
     return abs(energy - broken_ref) <= tol
 
+def _print_progress(step: int, max_steps: int, best_energy: float, n_points: int, n_broken: int) -> None:
+    """Visible one-line progress print to stdout, independent of the
+    logging configuration (which may be routed only to a file)."""
+    print(
+        f"[BOCSER] step {step:>4}/{max_steps}  "
+        f"best_energy={best_energy:>10.3f} kcal/mol  "
+        f"points={n_points:>4}  broken={n_broken:>3}",
+        flush=True,
+    )
+
 
 class ConfSearchRunner:
     """
@@ -966,13 +976,11 @@ class ConfSearchRunner:
             logger.info(
                 "Step %d completed. Dataset: %d points, best=%.3f, "
                 "broken=%d, mean_valid=%.3f",
-                step,
-                len(obs),
-                float(obs.min()),
-                n_broken,
+                step, len(obs), float(obs.min()), n_broken,
                 float(obs[obs < config.broken_struct_energy * 0.9].mean())
                 if n_broken < len(obs) else float("nan"),
             )
+            _print_progress(step, config.max_steps, float(obs.min()), len(obs), n_broken)
 
             all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
             with open(all_minima_file, "w") as json_minima_writer:
@@ -1013,6 +1021,9 @@ class ConfSearchRunner:
 
         if not early_termination_flag:
             logger.info("Max number of steps has been reached!")
+            print(f"[BOCSER] Finished: reached max_steps={config.max_steps}", flush=True)
+        else:
+            print(f"[BOCSER] Finished early: convergence criterion met at step {step}", flush=True)
 
         logger.info("MINIMA: %s", self.state.minima)
         self._save_results(dataset)
