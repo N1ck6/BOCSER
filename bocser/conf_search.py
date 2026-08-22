@@ -716,11 +716,17 @@ class ConfSearchRunner:
             keep.add(Path(self.state.config_path).resolve())
         keep.add(Path(self.state.db_file).resolve())
 
+        protected_suffixes = {".mol", ".log", ".db", ".yaml"}
+        for item in working_folder.iterdir():
+            if item.is_file() and item.suffix.lower() in protected_suffixes:
+                keep.add(item.resolve())
+
         logger.info("clear_working_folder=True: wiping %s except %s", working_folder, keep)
 
         for item in working_folder.iterdir():
             resolved = item.resolve()
             if resolved in keep:
+                logger.debug("Preserving %s (protected: config/ensemble/.db/.mol/.log/.yaml)", item)
                 continue
             try:
                 if item.is_dir():
