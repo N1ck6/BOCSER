@@ -80,16 +80,43 @@ class LocalConnector(Connector):
 
     def get_norm_energy(self, mol_hash: str, theory_level: str) -> Optional[float]:
         self.ensure_norm_energy_table()
-        rows = self.get_request(
-            f"SELECT norm_energy FROM norm_energies "
-            f"WHERE mol_hash = \"{mol_hash}\" AND theory_level = \"{theory_level}\""
+        rows = self.get_request_params(
+            "SELECT norm_energy FROM norm_energies WHERE mol_hash = ? AND theory_level = ?",
+            (mol_hash, theory_level),
         )
         return rows[0][0] if rows else None
 
     def set_norm_energy(self, mol_hash: str, theory_level: str, value: float, source_mol_file: str = "") -> None:
         self.ensure_norm_energy_table()
-        self.set_request(
+        self.set_request_params(
             "INSERT OR REPLACE INTO norm_energies (mol_hash, theory_level, norm_energy, source_mol_file) "
-            f"VALUES (\"{mol_hash}\", \"{theory_level}\", {value!r}, \"{source_mol_file}\")"
+            "VALUES (?, ?, ?, ?)",
+            (mol_hash, theory_level, value, source_mol_file),
         )
+
+    def set_request_params(self, request: str, params: tuple) -> None:
+        """Parameterized (?, ?, ...) — safe against special characters in SMILES/strings."""
+        connection = sqlite3.connect(self.db_filename)
+        try:
+            cursor = connection.cursor()
+            cursor.execute(request, params)
+            connection.commit()
+        except Exception as e:
+            logger.exception("Something went wrong with db (parameterized)")
+            raise e
+        finally:
+            connection.close()
+
+    def get_request_params(self, request: str, params: tuple) -> List:
+        connection = sqlite3.connect(self.db_filename)
+        try:
+            cursor = connection.cursor()
+            result = cursor.execute(request, params).fetchall()
+            connection.commit()
+            return result
+        except Exception as e:
+            logger.exception("Something went wrong with db (parameterized)")
+            raise e
+        finally:
+            connection.close()
 

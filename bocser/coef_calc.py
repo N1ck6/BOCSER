@@ -528,18 +528,15 @@ class CoefCalculator:
 
         angle_number = 0
 
-        select_request = 'select a1, a2, a3, b1, b2, b3, c from dihedrals where ((dihedral_smiles = \"{smiles}\" and (method = \"{method}\")))'
-
         for sub_mol in self.get_interesting_frags():
 
             cur_mol = sub_mol
             cur_mol_smiles = Chem.MolToSmiles(Chem.RemoveHs(cur_mol))
 
-            db_response = self.db_connector.get_request(
-                select_request.format(
-                    smiles=cur_mol_smiles,
-                    method=self.method_of_calc.lower()
-                )
+            db_response = self.db_connector.get_request_params(
+                "SELECT a1, a2, a3, b1, b2, b3, c FROM dihedrals "
+                "WHERE dihedral_smiles = ? AND method = ?",
+                (cur_mol_smiles, self.method_of_calc.lower()),
             )
             
             if len(db_response) > 0:
@@ -631,24 +628,17 @@ class CoefCalculator:
             res.append(calc_coefs(self.degrees, energies))
         
         logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", len(inp_filenames) - len(self.fetched_coefs), len(self.fetched_coefs))
-        
-        insert_request_template = 'insert into dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) values (\"{smiles}\", \"{method}\", {a1}, {a2}, {a3}, {b1}, {b2}, {b3}, {c})'
-        
+                
         for inp_filename, coefs in zip(inp_filenames, res):
             if self.scanfile2smiles[inp_filename] in self.fetched_coefs:
                 continue
-            self.db_connector.set_request(
-                insert_request_template.format(**{
-                    'smiles' : self.scanfile2smiles[inp_filename],
-                    'method' : self.method_of_calc.lower(),
-                    'a1' : coefs[0],
-                    'a2' : coefs[1],
-                    'a3' : coefs[2],
-                    'b1' : coefs[3],
-                    'b2' : coefs[4],
-                    'b3' : coefs[5],
-                    'c' : coefs[6]
-                })
+            self.db_connector.set_request_params(
+                "INSERT INTO dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.scanfile2smiles[inp_filename], self.method_of_calc.lower(),
+                    coefs[0], coefs[1], coefs[2], coefs[3], coefs[4], coefs[5], coefs[6],
+                ),
             )
 
         return res
