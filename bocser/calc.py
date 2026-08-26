@@ -128,11 +128,11 @@ def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
     order = _with_h_order_cached(mol_file_name)
     return order[canon_idx] + 1
 
-def _validate_extra_constraints_atoms(self, config: ConfSearchConfig) -> None:
+def _validate_extra_constraints_atoms(config: ConfSearchConfig) -> None:
     if not config.extra_constraints:
         return
 
-    ref_mol = Chem.MolFromMolFile(self.state.mol_file_name, removeHs=False)
+    ref_mol = Chem.MolFromMolFile(config.mol_file_name, removeHs=False)
     n_atoms = ref_mol.GetNumAtoms()
 
     errors = []
