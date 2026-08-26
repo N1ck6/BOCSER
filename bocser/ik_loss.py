@@ -186,6 +186,7 @@ class IKLoss:
         dimension(s) implied by `a`.
         """
         a = tf.convert_to_tensor(a, dtype=tf.float64)
+        was_scalar = (a.shape.ndims == 0)
         a = tf.reshape(a, (-1, 1))
 
         cos_a = tf.cos(a)
@@ -197,10 +198,15 @@ class IKLoss:
         row2 = tf.stack([zeros, cos_a, -sin_a, zeros], axis=1)
         row3 = tf.stack([zeros, sin_a, cos_a, zeros], axis=1)
         row4 = tf.stack([zeros, zeros, zeros, ones], axis=1)
-
-        # Drop trailing size-1 axis without risk of squeezing `batch` if it happens to also be 1.
+        
         mats = tf.stack([row1, row2, row3, row4], axis=1)
-        return tf.squeeze(mats, axis=-1)
+        # Drop trailing size-1 axis without risk of squeezing `batch` if it happens to also be 1.
+        mats = tf.stack(mats, axis=-1)
+        
+        if was_scalar:
+            mats = tf.squeeze(mats, axis=0)
+
+        return mats
 
     def build_T_matrices(self, angles_list: List[tf.Tensor]) -> List[tf.Tensor]:
         """Build T matrices for the provided dihedral-angle batches.
