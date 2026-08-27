@@ -81,10 +81,22 @@ class IKLoss:
             for cycle_angles in valence_angles
         ]
 
-        self.T_matrices = [
-            tf.stack([self.T_matrix(da) for da in cycle_dihedrals])
-            for cycle_dihedrals in dihedral_angles
-        ]
+        # The reference T-matrices are constructed once from the original one
+        # geometries — one scalar per ring position. Clearly calling
+        # T_matrix_single (not T_matrix), with context for clear logs
+        self.T_matrices = []
+        for cycle_idx, cycle_dihedrals in enumerate(dihedral_angles):
+            cycle_T_matrices = []
+            for pos_idx, da in enumerate(cycle_dihedrals):
+                try:
+                    cycle_T_matrices.append(self.T_matrix_single(da))
+                except ValueError as e:
+                    raise ValueError(
+                        f"IKLoss.__init__: не удалось построить эталонную "
+                        f"T-матрицу для кольца #{cycle_idx}, позиция #{pos_idx} "
+                        f"(значение={da!r}): {e}"
+                    ) from e
+            self.T_matrices.append(tf.stack(cycle_T_matrices))
 
     @classmethod
     def from_rdkit(cls, mol: Chem.Mol, all_ring_atoms: List[List[int]]) -> "IKLoss":
@@ -178,35 +190,62 @@ class IKLoss:
         )
 
     @staticmethod
-    def T_matrix(a: tf.Tensor) -> tf.Tensor:
-        """Return a batch of 4x4 rotation-translation matrices for angles a.
+    def T_matrix_single(a) -> tf.Tensor:
+        """Constructs ONE 4x4 T-matrix from ONE scalar angle (radians).
 
-        Input `a` may be a scalar, 1D tensor or batched tensor. The returned
-        shape will be `[..., 4, 4]` where `...` corresponds to the batch
-        dimension(s) implied by `a`.
+        Used EXCLUSIVELY for static reference ring matrices
+        in __init__ — one call per ring position taken from the
+        original (not proposed by BO) geometry. Never called on a batch.
         """
         a = tf.convert_to_tensor(a, dtype=tf.float64)
-        was_scalar = (a.shape.ndims == 0)
-        a = tf.reshape(a, (-1, 1))
+        if a.shape.ndims != 0:
+            raise ValueError(
+                f"T_matrix_single expects a pure scalar (ndims=0), "
+                f"received shape={a.shape} (ndims={a.shape.ndims}). "
+                f"For a batch of angles, use T_matrix(), not this function."
+            )
+
+        cos_a = tf.cos(a)
+        sin_a = tf.sin(a)
+        zero = tf.constant(0.0, dtype=tf.float64)
+        one = tf.constant(1.0, dtype=tf.float64)
+
+        return tf.stack([
+            tf.stack([one,  zero,   zero,  zero]),
+            tf.stack([zero, cos_a, -sin_a, zero]),
+            tf.stack([zero, sin_a,  cos_a, zero]),
+            tf.stack([zero, zero,   zero,  one]),
+        ])  # built directly, without a single squeeze
+    
+    @staticmethod
+    def T_matrix(a: tf.Tensor) -> tf.Tensor:
+        """Builds a BATCH of 4x4 T-matrices from a 1D tensor of angles (radians), shape [n].
+
+        Used EXCLUSIVELY in build_T_matrices() — for the column
+        of the proposed BO angles. ALWAYS returns a shape of [n,4,4], for
+        ANY n, including n==1 — the batch axis cannot be lost, because
+        it is not compressed anywhere.
+        """
+        a = tf.convert_to_tensor(a, dtype=tf.float64)
+        if a.shape.ndims != 1:
+            raise ValueError(
+                f"T_matrix expects a 1-D tensor of angles (shape [n]), "
+                f"received shape={a.shape} (ndims={a.shape.ndims}). "
+                f"For a single scalar, use T_matrix_single(), "
+                f"not this function."
+            )
 
         cos_a = tf.cos(a)
         sin_a = tf.sin(a)
         zeros = tf.zeros_like(a)
         ones = tf.ones_like(a)
 
-        row1 = tf.stack([ones, zeros, zeros, zeros], axis=1)
-        row2 = tf.stack([zeros, cos_a, -sin_a, zeros], axis=1)
-        row3 = tf.stack([zeros, sin_a, cos_a, zeros], axis=1)
-        row4 = tf.stack([zeros, zeros, zeros, ones], axis=1)
-        
-        mats = tf.stack([row1, row2, row3, row4], axis=1)
-        # Drop trailing size-1 axis without risk of squeezing `batch` if it happens to also be 1.
-        mats = tf.stack(mats, axis=-1)
-        
-        if was_scalar:
-            mats = tf.squeeze(mats, axis=0)
+        row1 = tf.stack([ones,  zeros,  zeros,  zeros], axis=1)
+        row2 = tf.stack([zeros, cos_a, -sin_a,  zeros], axis=1)
+        row3 = tf.stack([zeros, sin_a,  cos_a,  zeros], axis=1)
+        row4 = tf.stack([zeros, zeros,  zeros,  ones ], axis=1)
 
-        return mats
+        return tf.stack([row1, row2, row3, row4], axis=1)
 
     def build_T_matrices(self, angles_list: List[tf.Tensor]) -> List[tf.Tensor]:
         """Build T matrices for the provided dihedral-angle batches.
@@ -219,8 +258,30 @@ class IKLoss:
         result: List[tf.Tensor] = []
 
         for i, angles in enumerate(angles_list):
+            angles = tf.convert_to_tensor(angles, dtype=tf.float64)
+            if angles.shape.ndims != 2:
+                raise ValueError(
+                    f"build_T_matrices: angles_list[{i}] must be a 2-D "
+                    f"tensor of shape [n, l] (n proposed points, l dihedrals "
+                    f"in this ring), received shape={angles.shape}."
+                )
+
             n = tf.shape(angles)[0]
-            l = tf.shape(angles)[1]
+            l = angles.shape[1]
+            if l is None:
+                raise ValueError(
+                    f"build_T_matrices: angles_list[{i}] has an unknown "
+                    f"static size along axis 1 (the number of ring dihedrals) — "
+                    f"it must be known in advance in order to construct "
+                    f"T-matrices by positions."
+                )
+            if l != len(self.T_matrices[i]):
+                raise ValueError(
+                    f"build_T_matrices: angles_list[{i}] has {l} dihedral "
+                    f"columns, but self.T_matrices[{i}] (built inside __init__ from "
+                    f"the reference geometry of the ring) contains {len(self.T_matrices[i])} "
+                    f"positions — the numbers must match."
+                )
 
             result_columns: List[tf.Tensor] = []
             for j in range(l):
