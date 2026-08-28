@@ -57,7 +57,7 @@ from dbscan import DBSCAN
 from default_vals import ConfSearchConfig
 from ik_loss import IKLoss
 from imp_var_with_ik import ImprovementVarianceWithIK
-
+import time
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
@@ -727,6 +727,9 @@ class ConfSearchRunner:
         if getattr(self.state, "config_path", None):
             keep.add(Path(self.state.config_path).resolve())
         keep.add(Path(self.state.db_file).resolve())
+        
+        ckpt_path = working_folder / f"{config.exp_name}_checkpoint.json"
+        keep.add(ckpt_path.resolve())
 
         protected_suffixes = {".mol", ".log", ".db", ".yaml"}
         for item in working_folder.iterdir():
@@ -738,7 +741,7 @@ class ConfSearchRunner:
         for item in working_folder.iterdir():
             resolved = item.resolve()
             if resolved in keep:
-                logger.debug("Preserving %s (protected: config/ensemble/.db/.mol/.log/.yaml)", item)
+                logger.debug("Preserving %s (protected: config/ensemble/.db/.mol/.log/.yaml/checkpoint)", item)
                 continue
             try:
                 if item.is_dir():
@@ -781,12 +784,164 @@ class ConfSearchRunner:
 
         return rule
 
+    def _checkpoint_path(self) -> Path:
+        return Path(self.state.working_folder) / f"{self.state.exp_name}_checkpoint.json"
+    
+    def _load_checkpoint_file(self) -> Optional[dict]:
+        """Load full checkpoint JSON (history of all saved steps)."""
+        path = self._checkpoint_path()
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            logger.exception(
+                "Checkpoint file %s is corrupted — ignoring.", path
+            )
+            return None
+        # Backward compat: old single-snapshot format → wrap as history
+        if isinstance(data, dict) and "history" not in data and "step" in data:
+            return {"history": [data]}
+        if not isinstance(data, dict) or "history" not in data:
+            logger.warning("Checkpoint file %s has unknown format — ignoring.", path)
+            return None
+        return data
+
+    def _save_checkpoint(self, dataset: Dataset, step: int) -> None:
+        """Append / update this step in the checkpoint history.
+
+        Full query_points + observations are stored so a later resume
+        rebuilds the same GP training set as if ORCA had been re-run.
+        """
+        snapshot = {
+            "step": step,
+            "query_points": dataset.query_points.numpy().tolist(),
+            "observations": dataset.observations.numpy().tolist(),
+            "minima": self.state.minima,
+            "current_minima": float(self.state.current_minima),
+            "acq_vals_log": list(self.state.acq_vals_log),
+        }
+
+        existing = self._load_checkpoint_file()
+        history = []
+        if existing is not None:
+            # Drop same/later steps so re-running from an earlier step stays consistent
+            history = [
+                h for h in existing.get("history", [])
+                if isinstance(h, dict) and h.get("step", -1) < step
+            ]
+        history.append(snapshot)
+
+        payload = {"history": history}
+        tmp_path = self._checkpoint_path().with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload))
+        tmp_path.replace(self._checkpoint_path())
+        logger.info("Checkpoint saved")
+    
+    def _resolve_checkpoint_snapshot(self) -> Optional[dict]:
+        """Pick a history entry according to config.checkpoint_step.
+
+        Rules:
+        - checkpoint_step is None → do not resume (normal run).
+        - no / empty checkpoint file → log, no resume.
+        - checkpoint_step > last available step → use last, log warning.
+        - checkpoint_step matches an entry → use it.
+        - otherwise (e.g. step missing in the middle, or < 1) → log, no resume.
+        """
+        config = self.state.config
+        requested = config.checkpoint_step
+        if requested is None:
+            return None
+
+        data = self._load_checkpoint_file()
+        if data is None:
+            logger.warning(
+                "checkpoint_step=%s set, but no usable checkpoint file at %s — starting fresh.",
+                requested, self._checkpoint_path(),
+            )
+            return None
+
+        history = [
+            h for h in data.get("history", [])
+            if isinstance(h, dict) and "step" in h
+        ]
+        if not history:
+            logger.warning(
+                "checkpoint_step=%s set, but checkpoint history is empty — starting fresh.",
+                requested,
+            )
+            return None
+
+        history_sorted = sorted(history, key=lambda h: h["step"])
+        steps_available = [h["step"] for h in history_sorted]
+        last = history_sorted[-1]
+
+        try:
+            req = int(requested)
+        except (TypeError, ValueError):
+            logger.warning(
+                "checkpoint_step=%r is not a valid integer — ignoring checkpoint.",
+                requested,
+            )
+            return None
+
+        if req < 1:
+            logger.warning(
+                "checkpoint_step=%d is out of range (need >= 1) — ignoring checkpoint.",
+                req,
+            )
+            return None
+
+        if req > last["step"]:
+            logger.warning(
+                "checkpoint_step=%d is greater than last saved step=%d (available=%s). "
+                "Using last checkpoint.",
+                req, last["step"], steps_available,
+            )
+            return last
+
+        for h in history_sorted:
+            if h["step"] == req:
+                logger.info(
+                    "Resuming from checkpoint_step=%d (%d dataset points, %d minima).",
+                    req, len(h.get("observations", [])), len(h.get("minima", [])),
+                )
+                return h
+
+        logger.warning(
+            "checkpoint_step=%d not found in checkpoint history (available=%s) — "
+            "ignoring checkpoint, starting fresh.",
+            req, steps_available,
+        )
+        return None
+
+    def _dataset_from_checkpoint(self, snapshot: dict) -> Dataset:
+        """Restore Dataset + runner state fields from a checkpoint snapshot."""
+        dataset = Dataset(
+            tf.constant(snapshot["query_points"], dtype=tf.float64),
+            tf.constant(snapshot["observations"], dtype=tf.float64),
+        )
+        self.state.minima = snapshot.get("minima", [])
+        self.state.current_minima = float(snapshot.get("current_minima", 1e9))
+        self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
+    
     def run(self) -> None:
         """Execute the full Bayesian optimization loop."""
         config = self.state.config
 
         kernel, search_space, observer = self._build_model_and_acquisition()
-        dataset = self._initialize_dataset(observer)
+        
+        ckpt = self._resolve_checkpoint_snapshot()
+        start_step = 1
+        if ckpt is not None:
+            dataset = self._dataset_from_checkpoint(ckpt)
+            logger.info(
+                "BO loop will continue from step %d (restored step %d).",
+                start_step, ckpt["step"],
+            )
+            start_step = ckpt["step"] + 1
+        else:
+            dataset = self._initialize_dataset(observer)
         
         obs = dataset.observations.numpy().flatten()
         obs_std = float(np.std(obs))
@@ -873,13 +1028,22 @@ class ConfSearchRunner:
 
         logger.info("MINIMA: %s", self.state.minima)
 
+        if start_step > config.max_steps:
+            logger.info(
+                "start_step=%d > max_steps=%d — nothing left to run; saving results.",
+                start_step, config.max_steps,
+            )
+            self._save_results(dataset)
+            return
+        
         for step in range(1, config.max_steps + 1):
             logger.debug("Previous last_opt_ok: %s", self.state.last_opt_ok)
             logger.debug("Step number %s", step)
 
             try:
+                t0 = time.monotonic()
                 result = bo.optimize(1, dataset, model, rule, fit_initial_model=False)
-                logger.info("Optimization step %s succeed!", step)
+                logger.info("Optimization step %s succeed! (bo.optimize took %.1f s)", step, time.monotonic() - t0)
             except Exception:
                 logger.exception(
                     "trieste bo.optimize() raised on step %s — skipping this step, "
@@ -985,6 +1149,11 @@ class ConfSearchRunner:
             all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
             with open(all_minima_file, "w") as json_minima_writer:
                 json.dump(self.state.minima, json_minima_writer)
+            
+            try:
+                self._save_checkpoint(dataset, step)
+            except Exception:
+                logger.exception("Failed to write checkpoint at step %s", step)
 
             if step < config.rolling_window_size:
                 continue
@@ -1072,6 +1241,10 @@ class ConfSearchRunner:
             {"query_points": query_points.tolist(), "observations": observations.tolist()},
             open(all_points_file, "w"),
         )
+        ckpt_path = self._checkpoint_path()
+        if ckpt_path.is_file():
+            ckpt_path.unlink()
+            logger.info("Run finished successfully — checkpoint file removed.")
 
     def _resolve_ensemble_path(self) -> str:
         """Returns absolute path to load_ensemble."""

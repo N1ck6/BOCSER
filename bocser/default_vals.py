@@ -38,6 +38,7 @@ class ConfSearchConfig:
     extra_constraints: List[Dict] = field(default_factory=list)
     ts_max_iter: int = 45
     clear_working_folder: bool = False
+    checkpoint_step: Union[int, None] = None   # None - default behaviour, else - start at chosen step
 
     def __post_init__(self): # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]

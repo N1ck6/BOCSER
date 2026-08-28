@@ -488,6 +488,7 @@ def start_calc(gjf_name: str, scan=False):
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
     
     timeout_minutes = cfg.orca_poll_timeout_minutes
+    logger.info("Submitting ORCA job %s to SLURM (sbatch -W, timeout=%d min)...", gjf_name, timeout_minutes)
     proc = subprocess.run(
         ["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name],
         capture_output=True, text=True,
