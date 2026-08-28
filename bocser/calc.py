@@ -449,7 +449,7 @@ def generate_oinp(
             tmp.write("\n\n")
             tmp.write(coords)
         else:
-            opt_cmd = "OptTS" if cfg.ts else "Opt"
+            opt_cmd = "OptTS" if (cfg.ts and not constrained_opt) else "Opt"
             tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
@@ -459,10 +459,7 @@ def generate_oinp(
                 if c.type == "dihedral":
                     axis = frozenset((c.atoms[1], c.atoms[2]))
                     if axis in hard_by_axis:
-                        logger.warning(
-                            "Dublicate dihedral-constraint on axis %s: %s",
-                            tuple(axis), c,
-                        )
+                        logger.warning("Dublicate dihedral-constraint on axis %s: %s", tuple(axis), c)
                     hard_by_axis[axis] = c
                 all_constraints.append(c)
 
@@ -471,14 +468,12 @@ def generate_oinp(
                 for atoms, value in dihedrals_deg:
                     axis = frozenset((atoms[1], atoms[2]))
                     if axis in hard_by_axis:
-                        logger.info(
-                            "BO-target for zxis %s was skipped in .inp: fixed with %s=%s.",
-                            tuple(axis), hard_by_axis[axis].type, hard_by_axis[axis].value,
-                        )
+                        logger.info("BO-target for axis %s was skipped in .inp: fixed with %s=%s.",
+                                    tuple(axis), hard_by_axis[axis].type, hard_by_axis[axis].value)
                         continue
                     all_constraints.append(Constraint("dihedral", tuple(atoms), value))
 
-            need_geom = bool(all_constraints) or cfg.ts
+            need_geom = bool(all_constraints) or (cfg.ts and not constrained_opt)
             if need_geom:
                 if all_constraints:
                     tmp.write("%geom Constraints\n")
@@ -487,10 +482,12 @@ def generate_oinp(
                         atoms_str = " ".join(str(a) for a in c.atoms)
                         tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
                     tmp.write("end\n")
-                if cfg.ts:
-                    max_iter = cfg.ts_max_iter if constrained_opt else cfg.ts_max_iter * 2
+                if cfg.ts and not constrained_opt:
+                    max_iter = cfg.ts_max_iter * 2
                     tmp.write(f"MaxIter {max_iter}\n")
                     tmp.write("Calc_Hess true\n")
+                elif constrained_opt:
+                    tmp.write(f"MaxIter {cfg.preopt_max_iter}\n")
                 tmp.write("end\n")
 
             tmp.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
