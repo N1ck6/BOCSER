@@ -127,9 +127,7 @@ class improvement_variance(AcquisitionFunctionClass):
             self._ik_loss_weight = tf.constant(self._ik_loss_weight,
                                                dtype=tf.float64)
 
-    @tf.function
     def __call__(self, x: TensorType) -> TensorType:
-
         mean, variance = self._model.predict(tf.squeeze(x, -2))
         normal = tfp.distributions.Normal(mean, tf.sqrt(variance))
         tau = self._eta + self._threshold

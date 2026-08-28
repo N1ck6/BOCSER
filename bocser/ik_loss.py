@@ -288,11 +288,11 @@ class IKLoss:
                 column_angles = angles[:, j]
                 column_has_nan = tf.math.is_nan(column_angles)
 
-                if tf.reduce_all(column_has_nan):
-                    T_col = tf.expand_dims(self.T_matrices[i][j], 0)
-                    T_col = tf.tile(T_col, [n, 1, 1])
-                else:
-                    T_col = self.T_matrix(column_angles)
+                T_col = tf.cond(
+                    tf.reduce_all(column_has_nan),
+                    lambda: tf.tile(tf.expand_dims(self.T_matrices[i][j], 0), [n, 1, 1]),
+                    lambda: self.T_matrix(column_angles),
+                )
 
                 result_columns.append(tf.expand_dims(T_col, 1))
 

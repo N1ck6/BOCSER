@@ -466,23 +466,9 @@ class ConfSearchRunner:
             db_connector=LocalConnector(self.state.db_file),
             fixed_double_bonds=fixed_double_bonds,
         )
-        coef_matrix = coef_calc.coef_matrix()
 
         logger.info("Coef calculator created!")
-
-        for ids, coefs in coef_matrix:
-            central_axis = frozenset((ids[1], ids[2]))
-            if central_axis in fixed_double_bonds:
-                raise RuntimeError(
-                    f"Axis {ids} is fixed, but still exists in  "
-                    f"coef_matrix()/self.frags — filtration in CoefCalculator is incomplete. "
-                )
-            self.state.dihedral_ids.append(ids)
-            self.state.mean_func_coefs.append(coefs)
-
-        logger.info("Dihedral ids: %s", self.state.dihedral_ids)
-        logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
-
+        
         try:
             dihedral_list_all, ring_atoms_list, ik_loss_dihedrals_idxs = coef_calc.get_ring_dihedrals(
                 self.state.mol
@@ -512,6 +498,21 @@ class ConfSearchRunner:
                 "Failed to prepare IK loss: %s. "
                 "Possible cause: unsupported ring topology. Falling back to evm.", e
             )
+        
+        coef_matrix = coef_calc.coef_matrix()
+
+        for ids, coefs in coef_matrix:
+            central_axis = frozenset((ids[1], ids[2]))
+            if central_axis in fixed_double_bonds:
+                raise RuntimeError(
+                    f"Axis {ids} is fixed, but still exists in  "
+                    f"coef_matrix()/self.frags — filtration in CoefCalculator is incomplete. "
+                )
+            self.state.dihedral_ids.append(ids)
+            self.state.mean_func_coefs.append(coefs)
+
+        logger.info("Dihedral ids: %s", self.state.dihedral_ids)
+        logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
 
         self.state.search_dim = len(self.state.dihedral_ids)
         logger.info("Cur search dim is %s", self.state.search_dim)

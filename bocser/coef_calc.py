@@ -287,17 +287,35 @@ class CoefCalculator:
 
                 dihedral_idxs = []
                 for d in dihedrals:
-                    if frozenset((d[1], d[2])) in self.fixed_double_bonds:
+                    central_bond = frozenset((d[1], d[2]))
+                    if central_bond in self.fixed_double_bonds:
                         dihedral_idxs.append(-2) # Fixed
                         continue
+                    
                     found = False
                     for f in self.frags.keys():
                         if all(atom in f for atom in d):
                             dihedral_idxs.append(frag_key_to_position[f])
                             found = True
                             break
+                        
                     if not found:
-                        dihedral_idxs.append(-1)
+                        already_has_axis_bond = any(
+                            frozenset((f[1], f[2])) == central_bond for f in self.frags.keys()
+                        )
+                        if already_has_axis_bond:
+                            # Axis for this bond already exists from another ring
+                            logger.info(
+                                "Ring window %s (bond %s) does not match the existing "
+                                "frag axis for this bond from a different ring — "
+                                "registering it as its own, additional GP dimension "
+                                "(fusion-atom branch point).",
+                                d, tuple(central_bond),
+                            )
+                        new_idx = len(self.frags)
+                        self.frags[d] = new_idx
+                        frag_key_to_position[d] = new_idx
+                        dihedral_idxs.append(new_idx)
 
                 all_dihedrals.append(dihedrals)
                 all_dihedral_idxs.append(dihedral_idxs)
@@ -649,16 +667,15 @@ class CoefCalculator:
             for all dihedral angels 
         """  
         unique_coefs = self.calc()
-        result = []        
-        logger.debug("Frags: %s", self.frags)
-
-        for idxs in self.frags:
-            result.append((list(idxs), unique_coefs[self.frags[idxs]]))
+        result = []
         
-        logger.debug("DB Content:")
-        for cur in self.db_connector.get_request('select * from dihedrals'):
-            logger.debug("%s", "|".join(map(str, cur)))
-
+        for idxs in self.frags:
+            coef_idx = self.frags[idxs]
+            if coef_idx >= len(unique_coefs):
+                logger.info("No Fourier coefs for ring-fusion axis %s — using flat mean function.", idxs)
+                result.append((list(idxs), (0.0,) * 7))
+            else:
+                result.append((list(idxs), unique_coefs[coef_idx]))
         return result
 
 
