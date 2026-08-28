@@ -128,6 +128,59 @@ def with_h_canonical_to_raw1(canon_idx: int, mol_file_name: str) -> int:
     order = _with_h_order_cached(mol_file_name)
     return order[canon_idx] + 1
 
+def _check_bond_topology_intact(
+    xyz_block: str,
+    original_mol: Chem.rdchem.Mol,
+    ts_bonds=None,
+    stretch_factor: float = None,
+) -> tuple[bool, Union[tuple[int, int], None]]:
+    """Verifies that ALL original_mol connections remain within physically reasonable
+    length limits in xyz_block — catches geometries, corrupted by MMFF
+    minimization/incompatible constants. TS links are excluded — they are allowed to stretch."""
+    cfg = _get_config_or_raise()
+    if stretch_factor is None:
+        stretch_factor = cfg.bond_stretch_factor
+
+    ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
+
+    lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
+    if lines and lines[0].strip().lstrip('-').isdigit():
+        lines = lines[2:]
+
+    coords = {}
+    for i, line in enumerate(lines):
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        coords[i] = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+
+    for bond in original_mol.GetBonds():
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if frozenset((a, b)) in ts_bond_set:
+            continue
+
+        if a not in coords or b not in coords:
+            logger.warning("Topology check: atom %d or %d missing from xyz block", a, b)
+            return False, (a, b)
+
+        sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
+        sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
+        ra = _COVALENT_RADII.get(sym_a, _COVALENT_RADII_DEFAULT)
+        rb = _COVALENT_RADII.get(sym_b, _COVALENT_RADII_DEFAULT)
+        max_len = (ra + rb) * stretch_factor
+
+        dist = np.linalg.norm(coords[a] - coords[b])
+        if dist > max_len:
+            logger.warning(
+                "Topology check FAILED: bond %d(%s)-%d(%s) = %.3f A "
+                "(expected <= %.3f A, %.1fx of the sum of covalent radii). "
+                "The geometry is unphysical EVEN BEFORE calling ORCA — the calculation is skipped.",
+                a, sym_a, b, sym_b, dist, max_len, stretch_factor,
+            )
+            return False, (a, b)
+
+    return True, None
+
 def _validate_extra_constraints_atoms(config: ConfSearchConfig) -> None:
     if not config.extra_constraints:
         return
@@ -851,6 +904,14 @@ def calc_energy(
         atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in clash_atoms) if clash_atoms else None
         _save_broken_struct(xyz_upd, broken_structs_dir, "clash", atoms_raw1)
         return broken_energy, False
+    
+    # catches broken bonds in xyz before ORCA
+    if original_mol is not None:
+        topology_ok, bad_bond = _check_bond_topology_intact(xyz_upd, original_mol, ts_bonds=ts_bonds)
+        if not topology_ok:
+            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in bad_bond) if bad_bond else None
+            _save_broken_struct(xyz_upd, broken_structs_dir, "topology_broken", atoms_raw1)
+            return cfg.broken_struct_energy, False
 
     if ts_bonds:
         within_limit, exceeded_atoms = _check_ts_bonds_within_limit(xyz_upd, ts_bonds, ts_bond_max_length)

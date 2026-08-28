@@ -40,6 +40,7 @@ class ConfSearchConfig:
     clear_working_folder: bool = False
     checkpoint_step: Union[int, None] = None   # None - default behaviour, else - start at chosen step
     tf_eager_mode: bool = False # Управляет tf.config.run_functions_eagerly() - отладка shape-ошибок, замедление расчетов acquisition
+    bond_stretch_factor: float = 1.4  # порог для _check_bond_topology_intact
 
     def __post_init__(self): # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]
