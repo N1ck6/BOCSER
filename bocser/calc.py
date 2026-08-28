@@ -383,6 +383,7 @@ def generate_oinp(
     """
     # Require runtime config to be set; config provides TS flag
     cfg = _get_config_or_raise()
+    gjf_name = str(gjf_name)
     parent = Path(gjf_name).parent
     parent.mkdir(parents=True, exist_ok=True)
 
@@ -474,6 +475,7 @@ def start_calc(gjf_name: str, scan=False):
 
     # Place the generated sbatch script next to the input file so scripts
     # and outputs live inside the working folder instead of the module cwd.
+    gjf_name = str(gjf_name)
     gjf_path = Path(gjf_name).resolve()
     gjf_dir = gjf_path.parent
     gjf_base = gjf_path.stem

@@ -61,8 +61,6 @@ import time
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
-tf.config.run_functions_eagerly(True)
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -271,7 +269,9 @@ class ConfSearchRunner:
 
     def _func_objective(self, cur: tf.Tensor) -> tf.Tensor:
         """Defines the objective function for the Bayesian optimization."""
-        return tf.map_fn(fn=lambda x: np.array([self._calc_point(x)]), elems=cur)
+        cur_np = cur.numpy() if hasattr(cur, "numpy") else np.asarray(cur)
+        results = [[self._calc_point(x)] for x in cur_np]
+        return tf.constant(results, dtype=tf.float64)
 
     def _extract_dofs_values(self, m: Chem.Mol) -> tf.Tensor:
         """Extract dihedral angles from a molecule conformer."""
@@ -395,6 +395,9 @@ class ConfSearchRunner:
             raise RuntimeError("Config not loaded. Call load_config first.")
         config = self.state.config
 
+        tf.config.run_functions_eagerly(config.tf_eager_mode)
+        logger.info("tf.config.run_functions_eagerly(%s)", config.tf_eager_mode)
+        
         if config.clear_working_folder:
             self._clear_working_folder()
 
