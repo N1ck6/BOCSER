@@ -233,6 +233,27 @@ class CoefCalculator:
             f"No non-terminal bond found in molecule {Chem.MolToSmiles(Chem.RemoveAllHs(mol))} — cannot determine dihedral indices"
         )
 
+    def _dedup_frags_by_central_bond(self):
+        """Keep exactly one 4-tuple key per physical central bond in self.frags.
+
+        Different substituent choices or reverse order previously produced
+        multiple keys for the same bond; all were emitted as simultaneous
+        hard D constraints in Pre-OPT .inp. Called before the IK position
+        map is built so dihedral_ids and ik_loss_dihedrals_idxs stay consistent.
+        """
+        unique = {}
+        for key, coef_idx in self.frags.items():
+            axis = frozenset((key[1], key[2]))
+            if axis not in unique:
+                unique[axis] = (key, coef_idx)
+            else:
+                logger.info(
+                    "Deduplicating frags: dropping %s for central bond %s "
+                    "(already have %s).",
+                    key, tuple(axis), unique[axis][0],
+                )
+        self.frags = {key: coef_idx for key, coef_idx in unique.values()}
+
     def get_ring_dihedrals(self, mol):
         all_rings = [list(r) for r in Chem.GetSymmSSSR(mol)]
         rings = [r for r in all_rings if len(r) >= 4]
@@ -241,6 +262,10 @@ class CoefCalculator:
         if not rings:
             logger.warning("Rings are not found in molecule, IK unavailable")
             return [], [], []
+
+        # Ensure self.frags is unique-by-axis before building the position
+        # map that IK indices will reference.
+        self._dedup_frags_by_central_bond()
         
         frag_key_to_position = {key: i for i, key in enumerate(self.frags.keys())}
 
@@ -317,8 +342,9 @@ class CoefCalculator:
                             logger.info(
                                 "Ring window %s (bond %s) does not exactly match existing "
                                 "frag axis %s (different substituent atom at a ring-fusion "
-                                "branch point) — reusing %s instead of creating a second, "
-                                "physically conflicting rotation axis for the same bond.",
+                                "branch point, or reverse order) — reusing %s instead of "
+                                "creating a second, physically conflicting rotation axis "
+                                "for the same bond.",
                                 d, tuple(central_bond), existing_axis, existing_axis,
                             )
                             dihedral_idxs.append(frag_key_to_position[existing_axis])
@@ -502,6 +528,20 @@ class CoefCalculator:
                         old_idxs, bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(),
                     )
                     continue
+                
+                existing_for_axis = None
+                for existing_key in self.frags:
+                    if frozenset((existing_key[1], existing_key[2])) == real_axis:
+                        existing_for_axis = existing_key
+                        break
+                if existing_for_axis is not None:
+                    if existing_for_axis != old_idxs:
+                        logger.info(
+                            "Skipping duplicate window %s for central bond %s "
+                            "(already registered as %s) — one axis per bond.",
+                            old_idxs, tuple(real_axis), existing_for_axis,
+                        )
+                    continue
 
                 self.frags[old_idxs] = self.unique_frags[frag_smiles]
 
@@ -681,10 +721,34 @@ class CoefCalculator:
         """  
         unique_coefs = self.calc()
         result = []
-        
+        # Prefer window with Fourier coefficients over a flat (ring-fusion) one.
+        seen_axes = {}
         for idxs in self.frags:
+            axis = frozenset((idxs[1], idxs[2]))
             coef_idx = self.frags[idxs]
-            if coef_idx >= len(unique_coefs):
+            has_real_coefs = coef_idx < len(unique_coefs)
+            if axis in seen_axes:
+                prev_idxs, prev_has_real = seen_axes[axis]
+                if has_real_coefs and not prev_has_real:
+                    # Replace the flat placeholder with the scanned one.
+                    seen_axes[axis] = (idxs, True)
+                    logger.info(
+                        "coef_matrix: preferring scanned window %s over flat "
+                        "ring-fusion window %s for central bond %s.",
+                        idxs, prev_idxs, tuple(axis),
+                    )
+                else:
+                    logger.info(
+                        "coef_matrix: dropping duplicate window %s for central "
+                        "bond %s (already keeping %s).",
+                        idxs, tuple(axis), prev_idxs,
+                    )
+                continue
+            seen_axes[axis] = (idxs, has_real_coefs)
+
+        for axis, (idxs, has_real) in seen_axes.items():
+            coef_idx = self.frags[idxs]
+            if not has_real:
                 logger.info("No Fourier coefs for ring-fusion axis %s — using flat mean function.", idxs)
                 result.append((list(idxs), (0.0,) * 7))
             else:
