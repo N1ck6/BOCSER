@@ -36,7 +36,8 @@ class CoefCalculator:
         aromatic_to_aliphatic : bool = True,         
         degrees : np.ndarray = np.linspace(0, 2 * np.pi, 37).reshape(37, 1),
         db_connector : Union[Connector, None] = None,
-        fixed_double_bonds: set = None
+        fixed_double_bonds: set = None,
+        ts_bonds: set = None,
     ) -> None:
         """
             mol - rdkit molecule
@@ -60,12 +61,11 @@ class CoefCalculator:
         self.af = config.acquisition_function
         self.degrees = degrees
         self.fixed_double_bonds = fixed_double_bonds or set()
-
+        self.ts_bond_set = {frozenset(b) for b in (ts_bonds or set())}
         # Key is SMILES, val is idx
         self.unique_frags = {}
         # Key is atom idxs, val is idx
         self.frags = {}
-
         self.db_connector = db_connector
         self.aromatic_to_aliphatic = aromatic_to_aliphatic
 
@@ -148,7 +148,7 @@ class CoefCalculator:
         if bond.IsInRing() and self.af != 'ik':
             return False
 
-        #If one of atoms is terminal
+        # If one of atoms is terminal
         if self.is_terminal_bond(bond):
             return False
 
@@ -157,6 +157,9 @@ class CoefCalculator:
             return False
         # User defined double bonds
         if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.fixed_double_bonds:
+            return False
+        # NEW: TS-bond length is a separate BO search dimension
+        if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.ts_bond_set:
             return False
 
         if not self.skip_triple_equal_terminal_atoms:
@@ -292,6 +295,10 @@ class CoefCalculator:
                         dihedral_idxs.append(-2) # Fixed
                         continue
                     
+                    if central_bond in self.ts_bond_set:
+                        dihedral_idxs.append(-3)  # TS-bond axis: IK tracks it via static reference, GP never controls it as a torsion
+                        continue
+
                     found = False
                     for f in self.frags.keys():
                         if all(atom in f for atom in d):
@@ -304,7 +311,6 @@ class CoefCalculator:
                             frozenset((f[1], f[2])) == central_bond for f in self.frags.keys()
                         )
                         if already_has_axis_bond:
-                            # Axis for this bond already exists from another ring
                             logger.info(
                                 "Ring window %s (bond %s) does not match the existing "
                                 "frag axis for this bond from a different ring — "
@@ -392,6 +398,8 @@ class CoefCalculator:
             # the ring-closure constraints of both rings.
             if self.af == 'ik' and bond.IsInRing():
                 if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.fixed_double_bonds:
+                    continue
+                if frozenset((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())) in self.ts_bond_set:
                     continue
                 bond_rings = [
                     set(ring) for ring in ring_info.AtomRings()
@@ -701,3 +709,33 @@ def log_and_combine_double_bonds(mol, user_specified: list[tuple[int, int]]) -> 
     combined = {frozenset(p) for p in user_specified} | {frozenset(p) for p in auto}
     logger.info("Resulting set of double bonds (%d total): %s", len(combined), sorted(tuple(sorted(p)) for p in combined))
     return combined
+
+def generate_bond_scan_inp(
+    xyz: str,
+    atom_a: int, atom_b: int,
+    filename: str,
+    num_of_procs: int,
+    method_of_calc: str,
+    charge: int, multipl: int,
+    lo: float, hi: float, nsteps: int = 20,
+) -> None:
+    """Relaxed scan of the bond length atom_a-atom_b from lo to hi."""
+    with open(filename, 'w+') as file:
+        file.write("!" + method_of_calc + " opt\n")
+        file.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
+        file.write("%geom Scan\n")
+        file.write(f"B {atom_a} {atom_b} = {lo}, {hi}, {nsteps}\n")
+        file.write("end\nend\n")
+        file.write("* xyz " + str(charge) + " " + str(multipl) + "\n")
+        file.write(xyz)
+        file.write("END\n")
+
+def parse_bond_scan_results(inp_name: str) -> tuple[np.ndarray, np.ndarray]:
+    res_file_name = inp_name[:-4] + ".relaxscanact.dat"
+    lengths, energies = [], []
+    with open(res_file_name, "r") as file:
+        for line in file:
+            parts = line.strip().split()
+            lengths.append(float(parts[0]))
+            energies.append(float(parts[1]))
+    return np.array(lengths), np.array(energies)

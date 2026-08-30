@@ -120,3 +120,30 @@ class LocalConnector(Connector):
         finally:
             connection.close()
 
+    def ensure_ts_bond_coefs_table(self) -> None:
+        self.set_request(
+            """CREATE TABLE IF NOT EXISTS ts_bond_coefs (
+                   mol_hash TEXT NOT NULL,
+                   theory_level TEXT NOT NULL,
+                   atom_pair_smiles TEXT NOT NULL,
+                   de REAL NOT NULL, a REAL NOT NULL, re REAL NOT NULL, c REAL NOT NULL,
+                   PRIMARY KEY (mol_hash, theory_level, atom_pair_smiles)
+               )"""
+        )
+
+    def get_ts_bond_coefs(self, mol_hash, theory_level, atom_pair_smiles):
+        self.ensure_ts_bond_coefs_table()
+        rows = self.get_request_params(
+            "SELECT de, a, re, c FROM ts_bond_coefs "
+            "WHERE mol_hash = ? AND theory_level = ? AND atom_pair_smiles = ?",
+            (mol_hash, theory_level, atom_pair_smiles),
+        )
+        return rows[0] if rows else None
+
+    def set_ts_bond_coefs(self, mol_hash, theory_level, atom_pair_smiles, coefs):
+        self.ensure_ts_bond_coefs_table()
+        self.set_request_params(
+            "INSERT OR REPLACE INTO ts_bond_coefs "
+            "(mol_hash, theory_level, atom_pair_smiles, de, a, re, c) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (mol_hash, theory_level, atom_pair_smiles, *[float(v) for v in coefs]),
+        )

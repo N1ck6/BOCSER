@@ -13,8 +13,7 @@ class ConfSearchConfig:
     orca_method : str = "lda sto-3g"
     broken_struct_energy : float = 100.
     bond_length_threshold : float = 0.7 # Deprecated
-    clash_vdw_scale: float = 0.0  # 0.0 = legacy fixed 0.7 Å threshold.
-                                  # >0.0 = use clash_vdw_scale * (vdw_radius_a + vdw_radius_b) instead.
+    clash_vdw_scale: float = 0.0  # 0.0 = legacy fixed 0.7 Å threshold; >0.0 = use clash_vdw_scale * (vdw_radius_a + vdw_radius_b) instead.
     ts : bool = False
     ring_bond_threshold : float = 1.75
     ts_ring_bond_threshold : float = 2.5
@@ -34,6 +33,9 @@ class ConfSearchConfig:
     acquisition_function : str = "iv"
     ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
     ts_bond_max_length: float = 5.0
+    vary_ts_bond_lengths: bool = True
+    ts_bond_min_length: float = 1.0
+    ts_bond_kernel_lengthscale: float = 0.5 # lengthscale RBF-ядра по измерениям длины TS-связи (единицы Å)
     fixed_double_bonds: List[Tuple[int, int]] = field(default_factory=list)  # 1-индексация, как в исходном .mol
     extra_constraints: List[Dict] = field(default_factory=list)
     ts_max_iter: int = 45
@@ -43,13 +45,20 @@ class ConfSearchConfig:
     bond_stretch_factor: float = 1.4  # порог для _check_bond_topology_intact
     preopt_max_iter: int = 100
 
-    def __post_init__(self): # Форматировать в список кортежей двойных связей
+    def __post_init__(self):
+        # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]
         self.fixed_double_bonds = [tuple(int(x) for x in pair) for pair in self.fixed_double_bonds]
         for name in ("ts_bonds", "fixed_double_bonds"):
             for pair in getattr(self, name):
                 if len(pair) != 2:
                     raise ValueError(f"{name} entries must be [atom_a, atom_b] pairs, got {pair}")
+        
+        if self.ts_bond_min_length <= 0 or self.ts_bond_min_length >= self.ts_bond_max_length:
+            raise ValueError(
+                f"ts_bond_min_length ({self.ts_bond_min_length}) must be > 0 and < "
+                f"ts_bond_max_length ({self.ts_bond_max_length})."
+            )
 
         normalized = []
         for i, raw in enumerate(self.extra_constraints):

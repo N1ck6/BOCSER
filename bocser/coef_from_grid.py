@@ -44,3 +44,41 @@ def calc_coefs(
     y = (y - y.mean()) * HARTRI_TO_KCAL
     coefs, cov_matrix = curve_fit(pes, x, y, p0=np.ones(7), maxfev=10000)
     return coefs
+
+def morse(
+    r: np.ndarray,
+    De: float, a: float, re: float, c: float,
+) -> np.ndarray:
+    """
+        The Morse potential for communication:
+        De is the depth of the pit (dissociation energy), a - "rigidity" of the bond,
+        re is the equilibrium length, c is the energy shift (baseline).
+    """
+    return De * (1 - np.exp(-a * (r - re))) ** 2 + c
+
+def morse_tf(
+    r: tf.Tensor,
+    De: float, a: float, re: float, c: float,
+) -> tf.Tensor:
+    return De * (1 - tf.exp(-a * (r - re))) ** 2 + c
+
+def morse_grad_tf(
+    r: tf.Tensor,
+    De: float, a: float, re: float, c: float,
+) -> tf.Tensor:
+    return 2 * De * a * tf.exp(-a * (r - re)) * (1 - tf.exp(-a * (r - re)))
+
+def calc_bond_coefs(
+    r: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """
+        r - bond length in scan [N]
+        y - energy in Hartree [N]
+        returns [4] set of morze coefficients: De, a, re, c
+    """
+    y = (y - y.min()) * HARTRI_TO_KCAL
+    # Начальные приближения: De ~ размах кривой, re ~ точка минимума
+    p0 = [max(y.max() - y.min(), 1.0), 2.0, r[np.argmin(y)], 0.0]
+    coefs, _ = curve_fit(morse, r, y, p0=p0, maxfev=10000)
+    return coefs

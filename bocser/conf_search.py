@@ -31,7 +31,11 @@ from trieste.acquisition.rule import EfficientGlobalOptimization
 from trieste.acquisition.function import ExpectedImprovement
 
 from transform_kernel import TransformKernel
-from coef_from_grid import pes_tf, pes_tf_grad
+from coef_from_grid import (
+    pes_tf, pes_tf_grad,
+    calc_bond_coefs,
+    morse_tf
+)
 from calc import (
     calc_energy,
     load_last_optimized_structure_xyz_block,
@@ -40,15 +44,20 @@ from calc import (
     _check_rings_intact,
     raw1_to_with_h_canonical,
     raw1_to_heavy_canonical,
+    _heavy_and_h_order,
     resolve_extra_constraints,
     _validate_extra_constraints_atoms,
     compute_mol_hash,
+    build_reference_with_h_mol,
+    submit_calc, wait_for_jobs,
 )
 from run_state import increase_structure_id
 import config_manager
 from coef_calc import (
     CoefCalculator,
     log_and_combine_double_bonds,
+    parse_bond_scan_results,
+    generate_bond_scan_inp,
 )
 from db_connector import LocalConnector
 from ensemble_processor import EnsembleProcessor
@@ -70,7 +79,16 @@ tf.autograph.set_verbosity(0)
 
 
 class PotentialFunction:
-    """Wrapper for mean function coefficients used in kernel computations."""
+    """Wrapper for mean function coefficients used in kernel computations.
+
+    Only reads the first len(mean_func_coefs) columns of any
+    input tensor — i.e. only the dihedral-angle dimensions. This is what
+    makes it safe to call on the FULL search vector (dihedrals + TS-bond
+    lengths, when vary_ts_bond_lengths is enabled): it silently ignores any
+    trailing columns rather than needing an explicit active_dims slice. Do
+    NOT change the loop to range(X.shape[1]) — that would break the moment
+    TS-bond dimensions are appended to the search space.
+    """
 
     def __init__(self, mean_func_coefs) -> None:
         self.mean_func_coefs = mean_func_coefs
@@ -95,6 +113,22 @@ class PotentialFunction:
             axis=1,
         )
 
+class TSBondPotentialFunction:
+    """mean function for TransformKernel based on TS bond length measurements
+    Based on the Morse potential."""
+    def __init__(self, mean_func_coefs, n_dih: int) -> None:
+        self.mean_func_coefs = mean_func_coefs
+        self.n_dih = n_dih  # offset
+
+    @tf.function
+    def __call__(self, X: tf.Tensor) -> tf.Tensor:
+        return tf.stack(
+            [
+                morse_tf(X[:, self.n_dih + dim], *self.mean_func_coefs[dim])
+                for dim in range(len(self.mean_func_coefs))
+            ],
+            axis=1,
+        )
 
 @dataclass
 class ConfSearchState:
@@ -124,6 +158,7 @@ class ConfSearchState:
     mol: Optional[Chem.Mol] = None
     config: Optional[ConfSearchConfig] = None
     extra_constraints: list = field(default_factory=list)
+    vary_ts_bond_lengths: bool = False
 
 
 def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
@@ -181,7 +216,10 @@ class ConfSearchRunner:
         filename.write_text(json.dumps({"LAST_OPT_OK": dumping_value}))
 
     def _calc_point(self, dihedrals: list[float]) -> float:
-        """Performs energy calculation for given dihedral angles."""
+        """Performs energy calculation for given dihedral angles.
+        Uses full vector for BO search: first
+        len(self.state.dihedral_ids) dihedral angles,
+        then — target lengths for TS-bonds."""
 
         if self.state.model_chk:
             logger.info("Checkpoint is not null, calculating previous acq. func. max!")
@@ -195,10 +233,7 @@ class ConfSearchRunner:
             tau = self.state.current_minima + 3.0
             acq_val = (
                 normal.cdf(tau) * (((tau - mean) ** 2) * (1 - normal.cdf(tau)) + variance)
-                + tf.sqrt(variance)
-                * normal.prob(tau)
-                * (tau - mean)
-                * (1 - 2 * normal.cdf(tau))
+                + tf.sqrt(variance) * normal.prob(tau) * (tau - mean) * (1 - 2 * normal.cdf(tau))
                 - variance * (normal.prob(tau) ** 2)
             )
             self.state.acq_vals_log.append(acq_val.numpy().flatten()[0])
@@ -211,11 +246,16 @@ class ConfSearchRunner:
         logger.debug("Point: %s", dihedrals)
 
         # Pre-opt
+        n_dih = len(self.state.dihedral_ids)
+        dihedral_vals = dihedrals[:n_dih]
+        ts_bond_vals = dihedrals[n_dih:] if self.state.vary_ts_bond_lengths else []
+        ts_bond_targets = list(zip(self.state.ts_bonds, ts_bond_vals)) if self.state.vary_ts_bond_lengths else None
+
         logger.info("Optimizing constrained struct")
         try:
             en, preopt_status = calc_energy(
                 self.state.mol_file_name,
-                list(zip(self.state.dihedral_ids, dihedrals)),
+                list(zip(self.state.dihedral_ids, dihedral_vals)),
                 self.state.norm_energy,
                 True,
                 constrained_opt=True,
@@ -227,6 +267,7 @@ class ConfSearchRunner:
                 ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals,
                 extra_constraints=self.state.extra_constraints,
+                ts_bond_targets=ts_bond_targets,
             )
         except Exception:
             logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
@@ -243,7 +284,7 @@ class ConfSearchRunner:
         logger.info("Loaded! Full opt")
         en, opt_status = calc_energy(
             self.state.mol_file_name,
-            list(zip(self.state.dihedral_ids, dihedrals)),
+            list(zip(self.state.dihedral_ids, dihedral_vals)),
             self.state.norm_energy,
             True,
             force_xyz_block=xyz_from_constrained,
@@ -255,6 +296,7 @@ class ConfSearchRunner:
             ts_bond_max_length=self.state.config.ts_bond_max_length,
             fixed_dihedrals=self.state.fixed_dihedrals,
             extra_constraints=self.state.extra_constraints,
+            ts_bond_targets=ts_bond_targets,
         )
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
@@ -275,18 +317,30 @@ class ConfSearchRunner:
 
     def _extract_dofs_values(self, m: Chem.Mol) -> tf.Tensor:
         """Extract dihedral angles from a molecule conformer."""
-        return tf.constant(
-            [
-                [
-                    -Chem.rdMolTransforms.GetDihedralRad(
-                        m.GetConformer(),
-                        *self.state.dihedral_ids[i],
+        conf = m.GetConformer()
+        dihedral_vals = [
+            -Chem.rdMolTransforms.GetDihedralRad(conf, *self.state.dihedral_ids[i])
+            for i in range(len(self.state.dihedral_ids))
+        ]
+
+        ts_bond_vals = []
+        if self.state.vary_ts_bond_lengths:
+            lo = self.state.config.ts_bond_min_length
+            hi = self.state.config.ts_bond_max_length
+            for (a, b) in self.state.ts_bonds:
+                raw_len = Chem.rdMolTransforms.GetBondLength(conf, a, b)
+                # Length in random ETKDG-embedding is random. Clip in box,
+                # so starting point will be valid for GP/trieste.
+                clipped = float(np.clip(raw_len, lo, hi))
+                if abs(clipped - raw_len) > 1e-6:
+                    logger.debug(
+                        "Initial embedded TS-bond length for pair (%d, %d) was "
+                        "%.3f A, clipped to %.3f A to fit search bounds [%.3f, %.3f].",
+                        a, b, raw_len, clipped, lo, hi,
                     )
-                    for i in range(len(self.state.dihedral_ids))
-                ]
-            ],
-            dtype=tf.float64,
-        )
+                ts_bond_vals.append(clipped)
+
+        return tf.constant([dihedral_vals + ts_bond_vals], dtype=tf.float64)
 
     def _upd_dataset_from_trj(self, trj_filename: str, dataset: Optional[Dataset]) -> Dataset:
         """Update dataset by parsing trajectory file."""
@@ -458,6 +512,25 @@ class ConfSearchRunner:
             for a, b in config.fixed_double_bonds
         ]
         fixed_double_bonds = log_and_combine_double_bonds(self.state.mol, user_double_bonds)
+        
+        ref_with_h_mol = build_reference_with_h_mol(self.state.mol_file_name)
+        ts_bonds_heavy_canonical = set()
+        for a, b in config.ts_bonds:
+            sym_a = ref_with_h_mol.GetAtomWithIdx(a - 1).GetSymbol()
+            sym_b = ref_with_h_mol.GetAtomWithIdx(b - 1).GetSymbol()
+            if sym_a == 'H' or sym_b == 'H':
+                logger.info(
+                    "ts_bonds pair (%d, %d) involves a hydrogen atom — no "
+                    "CoefCalculator exclusion mapping needed (H atoms are "
+                    "always terminal, so this pair could never be picked up "
+                    "as a rotatable-dihedral candidate anyway).",
+                    a, b,
+                )
+                continue
+            ts_bonds_heavy_canonical.add((
+                raw1_to_heavy_canonical(a, self.state.mol_file_name),
+                raw1_to_heavy_canonical(b, self.state.mol_file_name),
+            ))
 
         coef_calc = CoefCalculator(
             mol=self.state.mol,
@@ -494,6 +567,7 @@ class ConfSearchRunner:
         except Exception as e:
             self.state.ik_loss = None
             self.state.ik_loss_dihedrals_idxs = []
+            ik_loss_dihedrals_idxs = []
             logger.exception(
                 "Failed to prepare IK loss: %s. "
                 "Possible cause: unsupported ring topology. Falling back to evm.", e
@@ -514,7 +588,93 @@ class ConfSearchRunner:
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
 
-        self.state.search_dim = len(self.state.dihedral_ids)
+        n_dihedral = len(self.state.dihedral_ids)
+
+        for cycle_idx in ik_loss_dihedrals_idxs:
+            for idx in cycle_idx:
+                if idx >= 0 and idx >= n_dihedral:
+                    raise RuntimeError(
+                        f"IK dihedral index {idx} is out of range n_dihedral={n_dihedral}. "
+                        f"ik_loss_dihedrals_idxs={ik_loss_dihedrals_idxs}. "
+                        f"Check frag_key_to_position in get_ring_dihedrals() and filter "
+                        f"fixed_double_bonds в get_interesting_frags()."
+                    )
+
+        if config.vary_ts_bond_lengths and self.state.ts_bonds:
+            self.state.vary_ts_bond_lengths = True
+            self.state.search_dim = n_dihedral + len(self.state.ts_bonds)
+            logger.info(
+                "TS-bond length variation ENABLED: %d TS-bond(s) added as extra GP "
+                "search dimensions, bounds=[%.3f, %.3f] A, appended AFTER the %d "
+                "dihedral dimensions (index layout: [0:%d)=dihedrals, [%d:%d)=ts-bond "
+                "lengths). Set vary_ts_bond_lengths: false in config to fall back to "
+                "the legacy behaviour (ts_bonds used only for break/clash safety "
+                "checks, not searched).",
+                len(self.state.ts_bonds), config.ts_bond_min_length, config.ts_bond_max_length,
+                n_dihedral, n_dihedral, n_dihedral, self.state.search_dim,
+            )
+        else:
+            self.state.vary_ts_bond_lengths = False
+            self.state.search_dim = n_dihedral
+            if self.state.ts_bonds:
+                logger.info(
+                    "vary_ts_bond_lengths=False: %d TS-bond(s) configured but used "
+                    "ONLY for legacy safety checks — not added as GP search dimensions.",
+                    len(self.state.ts_bonds),
+                )
+
+        self.state.ts_bond_mean_coefs = []
+        if self.state.vary_ts_bond_lengths:
+            theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
+            mol_hash = compute_mol_hash(self.state.mol_file_name, config.charge, config.spin_multiplicity)
+            db = LocalConnector(self.state.db_file)
+
+            pairs_to_scan = []  # [(a, b, pair_key, inp_name), ...]
+            cached_coefs = {}   # pair_key -> coefs, чтобы сохранить порядок self.state.ts_bonds
+
+            for (a, b) in self.state.ts_bonds:
+                pair_key = f"{min(a, b)}-{max(a, b)}"
+                cached = db.get_ts_bond_coefs(mol_hash, theory_level, pair_key)
+                if cached is not None:
+                    logger.info("TS-bond Morse coefs cache HIT for pair (%d,%d): %s", a, b, cached)
+                    cached_coefs[pair_key] = cached
+                    continue
+
+                scans_dir = Path(self.state.working_folder) / f"{self.state.exp_name}_ts_bond_scans"
+                scans_dir.mkdir(exist_ok=True)
+                inp_name = str(scans_dir / f"tsbond_{pair_key}.inp")
+
+                mol_for_scan = Chem.MolFromMolFile(self.state.mol_file_name, removeHs=False)
+                heavy_idx, h_idx = _heavy_and_h_order(mol_for_scan)
+                mol_for_scan = Chem.RenumberAtoms(mol_for_scan, heavy_idx + h_idx)
+                xyz = "\n".join(Chem.MolToXYZBlock(mol_for_scan).split("\n")[2:])
+
+                generate_bond_scan_inp(
+                    xyz, a + 1, b + 1, inp_name,
+                    num_of_procs=config.num_of_procs, method_of_calc=config.orca_method,
+                    charge=config.charge, multipl=config.spin_multiplicity,
+                    lo=config.ts_bond_min_length, hi=config.ts_bond_max_length,
+                )
+                pairs_to_scan.append((a, b, pair_key, inp_name))
+
+            if pairs_to_scan:
+                job_ids = [submit_calc(inp_name, scan=True) for (_, _, _, inp_name) in pairs_to_scan]
+                logger.info("Submitted %d independent TS-bond length scans concurrently: %s", len(job_ids), job_ids)
+                wait_for_jobs(job_ids, timeout_minutes=config.orca_poll_timeout_minutes)
+
+                for (a, b, pair_key, inp_name) in pairs_to_scan:
+                    lengths, energies = parse_bond_scan_results(inp_name)
+                    coefs = calc_bond_coefs(lengths, energies)
+                    logger.info("TS-bond pair (%d,%d) Morse coefs: De=%.3f a=%.3f re=%.3f c=%.3f", a, b, *coefs)
+                    db.set_ts_bond_coefs(mol_hash, theory_level, pair_key, coefs)
+                    cached_coefs[pair_key] = tuple(coefs)
+
+            # Собираем в порядке self.state.ts_bonds — важно для соответствия
+            # индексов TSBondPotentialFunction/dih_dims/ts_dims дальше по коду.
+            for (a, b) in self.state.ts_bonds:
+                pair_key = f"{min(a, b)}-{max(a, b)}"
+                self.state.ts_bond_mean_coefs.append(cached_coefs[pair_key])
+
         logger.info("Cur search dim is %s", self.state.search_dim)
 
         for cycle_idx in ik_loss_dihedrals_idxs:
@@ -531,22 +691,27 @@ class ConfSearchRunner:
         """Build GPR model, BO optimizer, and acquisition rule."""
         potential_func = PotentialFunction(self.state.mean_func_coefs)
 
+        n_dih = len(self.state.dihedral_ids)
+        n_ts = len(self.state.ts_bonds) if self.state.vary_ts_bond_lengths else 0
+        dih_dims = list(range(n_dih))
+        ts_dims = list(range(n_dih, n_dih + n_ts))
+
         kernel = (
             gpflow.kernels.White(0.001)
             + gpflow.kernels.Periodic(
                 gpflow.kernels.RBF(
                     variance=0.07,
                     lengthscales=0.005,
-                    active_dims=[i for i in range(self.state.search_dim)],
+                    active_dims=dih_dims,
                 ),
-                period=[2 * np.pi for _ in range(self.state.search_dim)],
+                period=[2 * np.pi for _ in dih_dims],
             )
             + TransformKernel(
                 potential_func,
                 gpflow.kernels.RBF(
                     variance=0.12,
                     lengthscales=0.005,
-                    active_dims=[i for i in range(self.state.search_dim)],
+                    active_dims=dih_dims,
                 ),
             )
         )
@@ -558,10 +723,17 @@ class ConfSearchRunner:
             loc=tf.constant(0.005, dtype=tf.float64), scale=tf.constant(0.001, dtype=tf.float64)
         )
 
-        search_space = Box(
-            [0.0 for _ in range(self.state.search_dim)],
-            [2 * np.pi for _ in range(self.state.search_dim)],
-        )
+        if n_ts > 0:
+            ts_potential_func = TSBondPotentialFunction(self.state.ts_bond_mean_coefs, n_dih)
+            ts_kernel = TransformKernel(
+                ts_potential_func,
+                gpflow.kernels.RBF(variance=0.12, lengthscales=0.5, active_dims=ts_dims),
+            )
+            kernel = kernel + ts_kernel
+
+        lower = [0.0 for _ in range(n_dih)] + [self.state.config.ts_bond_min_length for _ in range(n_ts)]
+        upper = [2 * np.pi for _ in range(n_dih)] + [self.state.config.ts_bond_max_length for _ in range(n_ts)]
+        search_space = Box(lower, upper)
 
         config = self.state.config
 
@@ -682,11 +854,14 @@ class ConfSearchRunner:
                     )
                     mol_copy = self.state.mol
                     # Perturbation: random dihedrals instead of geometry from a file
-                    random_dihedrals = tf.constant(
-                        [[np.random.uniform(0, 2*np.pi) for _ in range(self.state.search_dim)]],
-                        dtype=tf.float64
-                    )
-                    initial_query_points = random_dihedrals
+                    n_dih = len(self.state.dihedral_ids)
+                    random_vals = [np.random.uniform(0, 2 * np.pi) for _ in range(n_dih)]
+                    # Uses different range
+                    if self.state.vary_ts_bond_lengths:
+                        lo = self.state.config.ts_bond_min_length
+                        hi = self.state.config.ts_bond_max_length
+                        random_vals += [np.random.uniform(lo, hi) for _ in range(len(self.state.ts_bonds))]
+                    initial_query_points = tf.constant([random_vals], dtype=tf.float64)
                 else:
                     initial_query_points = self._extract_dofs_values(mol_copy)
 
@@ -968,9 +1143,17 @@ class ConfSearchRunner:
         init_lengthscale = 0.5                          # typical distance between dihedra in rad
 
         kernel.kernels[1].base_kernel.variance.assign(init_variance)
-        
         kernel.kernels[2].base_kernel.variance.assign(init_variance)
         kernel.kernels[2].base_kernel.lengthscales.assign(init_lengthscale)
+
+        if self.state.vary_ts_bond_lengths:
+            # kernel.kernels[3] = RBF-term for TS-bonds,
+            # used only when vary_ts_bond_lengths: True
+            kernel.kernels[3].variance.assign(init_variance)
+            logger.info(
+                "GP kernel initialized (TS-bond term): variance=%.4f, lengthscales=%.3f A",
+                init_variance, self.state.config.ts_bond_kernel_lengthscale,
+            )
 
         logger.info(
             "GP kernel initialized: variance=%.4f, lengthscales=%.3f",

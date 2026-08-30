@@ -6,6 +6,7 @@ from typing import Union
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdMolTransforms
+from rdkit.Geometry import Point3D
 import numpy as np
 
 from sklearn.cluster import KMeans
@@ -181,6 +182,31 @@ def _check_bond_topology_intact(
 
     return True, None
 
+def _set_atom_distance(conf, i: int, j: int, target_length: float) -> None:
+    """Move atom j along the line from atom i to atom j so that the distance
+    between them equals target_length. 
+    This function works for any pair of atom indices, bonded or not, since it is
+    only a starting guess; the precise geometry is established
+    afterwards by ORCA's own constrained optimization.
+    """
+    pi = conf.GetAtomPosition(i)
+    pj = conf.GetAtomPosition(j)
+    vec = np.array([pj.x - pi.x, pj.y - pi.y, pj.z - pi.z])
+    dist = np.linalg.norm(vec)
+
+    if dist < 1e-3:
+        logger.warning(
+            "_set_atom_distance: atoms %d and %d are %.4f A apart (near-zero) "
+            "before repositioning — using an arbitrary +x direction.",
+            i, j, dist,
+        )
+        direction = np.array([1.0, 0.0, 0.0])
+    else:
+        direction = vec / dist
+
+    new_pj = np.array([pi.x, pi.y, pi.z]) + direction * target_length
+    conf.SetAtomPosition(j, Point3D(float(new_pj[0]), float(new_pj[1]), float(new_pj[2])))
+
 def _validate_extra_constraints_atoms(config: ConfSearchConfig) -> None:
     if not config.extra_constraints:
         return
@@ -296,7 +322,8 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
 
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
-                    full_block=False, ts_bonds=None, fixed_dihedrals=None, extra_constraints=None):
+                    full_block=False, ts_bonds=None, fixed_dihedrals=None, extra_constraints=None,
+                    ts_bond_targets=None):
     ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
 
     try:
@@ -304,14 +331,11 @@ def change_dihedrals(mol_file_name: str,
         heavy_idx, h_idx = _heavy_and_h_order(mol)
         mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
 
-
-        # Return reference geometry if no torsion angles are provided
-        if not dihedrals and not fixed_dihedrals and not extra_constraints:
+        if not dihedrals and not fixed_dihedrals and not extra_constraints and not ts_bond_targets:
             if full_block:
                 return Chem.MolToXYZBlock(mol)
             return '\n'.join(Chem.MolToXYZBlock(mol).split('\n')[2:])
         
-        # Read acquisition function from central config (require config to be set)
         _cfg = _get_config_or_raise()
         _af = _cfg.acquisition_function
 
@@ -320,20 +344,17 @@ def change_dihedrals(mol_file_name: str,
                 for atoms, degree in cycle:
                     rdMolTransforms.SetDihedralRad(mol.GetConformer(), *atoms, degree)
 
+            # TS-bond-length starting guess applied after dihedral rotations:
+            # Applying the guess last means nothing nhere disturbs it afterwards.
+            for (a, b), target_len in (ts_bond_targets or []):
+                _set_atom_distance(mol.GetConformer(), a, b, float(target_len))
+
         else:
             with tempfile.NamedTemporaryFile(suffix=".xyz", delete=True) as tmp:
                 Chem.MolToMolFile(mol, tmp.name)
                 tmp_mol = Chem.RWMol(Chem.MolFromMolFile(tmp.name, removeHs=False))
 
-            # for a, b in ts_bond_set: # Remove TS bonds to allow free movement
-            #     if tmp_mol.GetBondBetweenAtoms(a, b) is not None:
-            #         tmp_mol.RemoveBond(a, b)
-            # if ts_bond_set:
-            #     Chem.FastFindRings(tmp_mol)
-
             mp = AllChem.MMFFGetMoleculeProperties(tmp_mol, mmffVariant='MMFF94')
-            # if mp is None:
-            #     raise RuntimeError("MMFFGetMoleculeProperties returned None after removing TS bonds")
             ff = AllChem.MMFFGetMoleculeForceField(tmp_mol, mp)
 
             for bl_dict in ik_loss.bond_lengths:
@@ -342,11 +363,17 @@ def change_dihedrals(mol_file_name: str,
                         continue  # TS-bond is not fixed
                     ff.MMFFAddDistanceConstraint(a, b, False, value, value, 1e3)
 
+            # TS-bond-length starting guess + a SOFTER MMFF distance
+            # constraint (BO-requested target), applied directly to tmp_mol
+            # so the FF stage doesn't fight against the guess
+            for (a, b), target_len in (ts_bond_targets or []):
+                _set_atom_distance(tmp_mol.GetConformer(), a, b, float(target_len))
+                ff.MMFFAddDistanceConstraint(a, b, False, float(target_len), float(target_len), 1e2)
+
             for va_dict in ik_loss.valence_angles:
                 for (a, b, c), value in va_dict.items():
                     ff.MMFFAddAngleConstraint(a, b, c, False, np.rad2deg(value), np.rad2deg(value), 1e2)
-            
-            # Prevent deformation of discarded rings that IKLoss does not cover
+
             ik_covered_bonds = {
                 frozenset(bond) for bl_dict in ik_loss.bond_lengths for bond in bl_dict
             }
@@ -429,7 +456,8 @@ def generate_oinp(
         charge : int,
         multipl : int,
         constrained_opt : bool = False,
-        hard_constraints: list = None,   # every ORCA call (pre-opt И full opt) 
+        hard_constraints: list = None,
+        ts_bond_targets: list = None, # BO-sampled targets
     ) -> None:
     """
         generates orca .inp file
@@ -454,6 +482,7 @@ def generate_oinp(
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
             hard_by_axis = {}
+            hard_bond_pairs = set()
             all_constraints = []
             for c in (hard_constraints or []):
                 if c.type == "dihedral":
@@ -461,6 +490,8 @@ def generate_oinp(
                     if axis in hard_by_axis:
                         logger.warning("Dublicate dihedral-constraint on axis %s: %s", tuple(axis), c)
                     hard_by_axis[axis] = c
+                elif c.type == "bond":
+                    hard_bond_pairs.add(frozenset(c.atoms))
                 all_constraints.append(c)
 
             if constrained_opt:
@@ -472,6 +503,17 @@ def generate_oinp(
                                     tuple(axis), hard_by_axis[axis].type, hard_by_axis[axis].value)
                         continue
                     all_constraints.append(Constraint("dihedral", tuple(atoms), value))
+
+                for atoms, value in (ts_bond_targets or []):
+                    pair = frozenset(atoms)
+                    if pair in hard_bond_pairs:
+                        logger.info(
+                            "BO-target TS-bond length for pair %s was skipped in .inp: "
+                            "already hard-fixed via extra_constraints.",
+                            tuple(pair),
+                        )
+                        continue
+                    all_constraints.append(Constraint("bond", tuple(atoms), round(float(value), 6)))
 
             need_geom = bool(all_constraints) or (cfg.ts and not constrained_opt)
             if need_geom:
@@ -852,6 +894,7 @@ def calc_energy(
         ts_bonds=None, ts_bond_max_length=5.0,
         fixed_dihedrals=None,
         extra_constraints=None,
+        ts_bond_targets=None,
 ) -> float:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -874,6 +917,7 @@ def calc_energy(
     hard_constraints.extend(extra_constraints or [])
     
     logger.debug("dihedrals before: %s", dihedrals)
+    logger.debug("ts_bond_targets: %s", ts_bond_targets)
     logger.debug(
         "ORCA hard_constraints (%d): %s",
         len(hard_constraints),
@@ -887,6 +931,7 @@ def calc_energy(
             mol_file_name, dihedrals, ik_loss,
             ts_bonds=ts_bonds, fixed_dihedrals=fixed_dihedrals,
             extra_constraints=extra_constraints,
+            ts_bond_targets=ts_bond_targets,
         )
     
     logger.debug("dihedrals after: %s", dihedrals)
@@ -947,6 +992,7 @@ def calc_energy(
         charge=cfg.charge,
         multipl=cfg.spin_multiplicity,
         hard_constraints=hard_constraints,
+        ts_bond_targets=ts_bond_targets,
     )
     start_calc(inp_name)
     
@@ -960,8 +1006,7 @@ def calc_energy(
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed",
-                            extra_files=[out_name])
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
     else:
         _save_successful_out(out_name, constrained_opt, success_out_dir)
     return res, opt_status
