@@ -538,6 +538,7 @@ class ConfSearchRunner:
             dir_for_inps=scans_dir,
             db_connector=LocalConnector(self.state.db_file),
             fixed_double_bonds=fixed_double_bonds,
+            ts_bonds=ts_bonds_heavy_canonical,
         )
 
         logger.info("Coef calculator created!")

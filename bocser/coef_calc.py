@@ -315,11 +315,9 @@ class CoefCalculator:
 
                         if existing_axis is not None:
                             logger.info(
-                                "Ring window %s (bond %s) does not exactly match "
-                                "existing frag axis %s (different substituent atom "
-                                "chosen at a ring-fusion branch point), but this bond "
-                                "already has a GP-controlled axis — reusing %s for "
-                                "this ring's IK tracking instead of creating a second, "
+                                "Ring window %s (bond %s) does not exactly match existing "
+                                "frag axis %s (different substituent atom at a ring-fusion "
+                                "branch point) — reusing %s instead of creating a second, "
                                 "physically conflicting rotation axis for the same bond.",
                                 d, tuple(central_bond), existing_axis, existing_axis,
                             )
