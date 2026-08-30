@@ -307,21 +307,28 @@ class CoefCalculator:
                             break
                         
                     if not found:
-                        already_has_axis_bond = any(
-                            frozenset((f[1], f[2])) == central_bond for f in self.frags.keys()
-                        )
-                        if already_has_axis_bond:
+                        existing_axis = None
+                        for f in self.frags.keys():
+                            if frozenset((f[1], f[2])) == central_bond:
+                                existing_axis = f
+                                break
+
+                        if existing_axis is not None:
                             logger.info(
-                                "Ring window %s (bond %s) does not match the existing "
-                                "frag axis for this bond from a different ring — "
-                                "registering it as its own, additional GP dimension "
-                                "(fusion-atom branch point).",
-                                d, tuple(central_bond),
+                                "Ring window %s (bond %s) does not exactly match "
+                                "existing frag axis %s (different substituent atom "
+                                "chosen at a ring-fusion branch point), but this bond "
+                                "already has a GP-controlled axis — reusing %s for "
+                                "this ring's IK tracking instead of creating a second, "
+                                "physically conflicting rotation axis for the same bond.",
+                                d, tuple(central_bond), existing_axis, existing_axis,
                             )
-                        new_idx = len(self.frags)
-                        self.frags[d] = new_idx
-                        frag_key_to_position[d] = new_idx
-                        dihedral_idxs.append(new_idx)
+                            dihedral_idxs.append(frag_key_to_position[existing_axis])
+                        else:
+                            new_idx = len(self.frags)
+                            self.frags[d] = new_idx
+                            frag_key_to_position[d] = new_idx
+                            dihedral_idxs.append(new_idx)
 
                 all_dihedrals.append(dihedrals)
                 all_dihedral_idxs.append(dihedral_idxs)

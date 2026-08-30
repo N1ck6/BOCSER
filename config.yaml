@@ -26,3 +26,5 @@ fixed_double_bonds:
 ts_bonds:
   - [13, 14]
   - [18, 19]
+vary_ts_bond_lengths : False
+bond_stretch_factor : 1.6
