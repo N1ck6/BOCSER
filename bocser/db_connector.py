@@ -34,6 +34,26 @@ class LocalConnector(Connector):
         if not os.path.isfile(db_filename):
             logger.error("No database file located: %s", db_filename)
             raise FileNotFoundError(db_filename)
+        self.ensure_all_tables()
+
+    def ensure_all_tables(self) -> None:
+        """Create all cache tables if they do not exist (idempotent)."""
+        self.ensure_dihedrals_table()
+        self.ensure_norm_energy_table()
+        self.ensure_ts_bond_coefs_table()
+
+    def ensure_dihedrals_table(self) -> None:
+        """Fourier torsion-scan coefficients (fragment SMILES + method)."""
+        self.set_request(
+            """CREATE TABLE IF NOT EXISTS dihedrals (
+                   dihedral_smiles TEXT NOT NULL,
+                   method TEXT NOT NULL,
+                   a1 REAL, a2 REAL, a3 REAL,
+                   b1 REAL, b2 REAL, b3 REAL,
+                   c REAL,
+                   PRIMARY KEY (dihedral_smiles, method)
+               )"""
+        )
 
     def set_request(
         self,
