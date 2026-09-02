@@ -698,7 +698,9 @@ class CoefCalculator:
                 continue
             res.append(calc_coefs(self.degrees, energies))
         
-        logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", len(inp_filenames) - len(self.fetched_coefs), len(self.fetched_coefs))
+        self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs)
+        self.n_fourier_cached = len(self.fetched_coefs)
+        logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", self.n_fourier_computed, self.n_fourier_cached)
                 
         for inp_filename, coefs in zip(inp_filenames, res):
             if self.scanfile2smiles[inp_filename] in self.fetched_coefs:

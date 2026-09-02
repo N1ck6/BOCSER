@@ -539,10 +539,23 @@ class ConfSearchRunner:
                     a, b,
                 )
                 continue
-            ts_bonds_heavy_canonical.add((
-                raw1_to_heavy_canonical(a, self.state.mol_file_name),
-                raw1_to_heavy_canonical(b, self.state.mol_file_name),
-            ))
+            heavy_a = raw1_to_heavy_canonical(a, self.state.mol_file_name)
+            heavy_b = raw1_to_heavy_canonical(b, self.state.mol_file_name)
+            
+            with_h_a = raw1_to_with_h_canonical(a, self.state.mol_file_name)
+            with_h_b = raw1_to_with_h_canonical(b, self.state.mol_file_name)
+            if (heavy_a, heavy_b) != (with_h_a, with_h_b):
+                raise RuntimeError(
+                    f"Atom numbering mismatch for ts_bonds pair (raw 1-idx "
+                    f"{a},{b}): heavy-only canonical = ({heavy_a},{heavy_b}), "
+                    f"with-H canonical = ({with_h_a},{with_h_b}). These two "
+                    f"numbering schemes are assumed to coincide for heavy "
+                    f"atoms throughout the codebase — this assumption has "
+                    f"just been violated. Do not proceed: CoefCalculator "
+                    f"and calc.py would silently operate on different atoms "
+                    f"for what should be the same TS bond."
+                )
+            ts_bonds_heavy_canonical.add((heavy_a, heavy_b))
 
         coef_calc = CoefCalculator(
             mol=self.state.mol,
@@ -598,6 +611,27 @@ class ConfSearchRunner:
             self.state.dihedral_ids.append(ids)
             self.state.mean_func_coefs.append(coefs)
 
+        central_bonds_seen: dict = {}
+        for ids in self.state.dihedral_ids:
+            central_bond = frozenset((ids[1], ids[2]))
+            if central_bond in central_bonds_seen:
+                raise RuntimeError(
+                    f"Duplicate GP axis detected for the same physical bond "
+                    f"{tuple(central_bond)}: {central_bonds_seen[central_bond]} "
+                    f"and {ids} both ended up in self.state.dihedral_ids. This "
+                    f"would produce two independent hard 'D' constraints for "
+                    f"the same bond in the Pre-OPT .inp — an overdetermined, "
+                    f"usually physically unsatisfiable geometry. This should "
+                    f"be impossible given CoefCalculator's internal dedup "
+                    f"layers (get_interesting_frags, get_ring_dihedrals "
+                    f"axis-reuse, _dedup_frags_by_central_bond, coef_matrix) "
+                    f"— one of them has regressed if this fires."
+                )
+            central_bonds_seen[central_bond] = ids
+
+        # Mark dihedral_ids as finalized BEFORE anything downstream is allowed to read it.
+        self.state._dihedral_ids_finalized = True
+
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
 
@@ -639,6 +673,8 @@ class ConfSearchRunner:
 
         self._require_dihedral_ids_finalized("TS-bond Morse scan block")
         self.state.ts_bond_mean_coefs = []
+        n_ts_cached = 0
+        n_ts_computed = 0
         if self.state.vary_ts_bond_lengths:
             theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
             mol_hash = compute_mol_hash(self.state.mol_file_name, config.charge, config.spin_multiplicity)
@@ -664,11 +700,24 @@ class ConfSearchRunner:
                 mol_for_scan = Chem.RenumberAtoms(mol_for_scan, heavy_idx + h_idx)
                 xyz = "\n".join(Chem.MolToXYZBlock(mol_for_scan).split("\n")[2:])
 
+                # Grid density scales with scan range width instead of a value
+                range_width = config.ts_bond_max_length - config.ts_bond_min_length
+                nsteps = int(round(range_width / config.ts_bond_scan_step))
+                nsteps = max(config.ts_bond_scan_min_steps, min(config.ts_bond_scan_max_steps, nsteps))
+                actual_step = range_width / nsteps if nsteps > 0 else range_width
+                logger.info(
+                    "TS-bond pair (%d,%d): scanning [%.3f, %.3f] A with nsteps=%d "
+                    "(target step=%.3f A, actual step=%.3f A).",
+                    a, b, config.ts_bond_min_length, config.ts_bond_max_length,
+                    nsteps, config.ts_bond_scan_step, actual_step,
+                )
+
                 generate_bond_scan_inp(
                     xyz, a + 1, b + 1, inp_name,
                     num_of_procs=config.num_of_procs, method_of_calc=config.orca_method,
                     charge=config.charge, multipl=config.spin_multiplicity,
                     lo=config.ts_bond_min_length, hi=config.ts_bond_max_length,
+                    nsteps=nsteps,
                 )
                 pairs_to_scan.append((a, b, pair_key, inp_name))
 
@@ -684,13 +733,22 @@ class ConfSearchRunner:
                     db.set_ts_bond_coefs(mol_hash, theory_level, pair_key, coefs)
                     cached_coefs[pair_key] = tuple(coefs)
 
-            # Собираем в порядке self.state.ts_bonds — важно для соответствия
-            # индексов TSBondPotentialFunction/dih_dims/ts_dims дальше по коду.
             for (a, b) in self.state.ts_bonds:
                 pair_key = f"{min(a, b)}-{max(a, b)}"
                 self.state.ts_bond_mean_coefs.append(cached_coefs[pair_key])
 
+            n_ts_computed = len(pairs_to_scan)
+            n_ts_cached = len(self.state.ts_bonds) - n_ts_computed
+
         logger.info("Cur search dim is %s", self.state.search_dim)
+
+        n_fourier_cached = getattr(coef_calc, "n_fourier_cached", 0)
+        n_fourier_computed = getattr(coef_calc, "n_fourier_computed", 0)
+        logger.info(
+            "Setup cache summary: torsion Fourier coefs — %d from cache, %d "
+            "newly computed; TS-bond Morse coefs — %d from cache, %d newly computed.",
+            n_fourier_cached, n_fourier_computed, n_ts_cached, n_ts_computed,
+        )
 
         for cycle_idx in ik_loss_dihedrals_idxs:
             for idx in cycle_idx:

@@ -36,6 +36,9 @@ class ConfSearchConfig:
     vary_ts_bond_lengths: bool = True
     ts_bond_min_length: float = 1.0
     ts_bond_kernel_lengthscale: float = 0.5 # lengthscale RBF-ядра по измерениям длины TS-связи (единицы Å)
+    ts_bond_scan_step: float = 0.1
+    ts_bond_scan_min_steps: int = 15 # нижняя граница числа точек скана
+    ts_bond_scan_max_steps: int = 50 # верхняя граница
     fixed_double_bonds: List[Tuple[int, int]] = field(default_factory=list)  # 1-индексация, как в исходном .mol
     extra_constraints: List[Dict] = field(default_factory=list)
     ts_max_iter: int = 45
@@ -58,6 +61,21 @@ class ConfSearchConfig:
             raise ValueError(
                 f"ts_bond_min_length ({self.ts_bond_min_length}) must be > 0 and < "
                 f"ts_bond_max_length ({self.ts_bond_max_length})."
+            )
+
+        if self.ts_bond_scan_step <= 0:
+            raise ValueError(f"ts_bond_scan_step ({self.ts_bond_scan_step}) must be > 0.")
+        if self.ts_bond_scan_min_steps < 4:
+            # calc_bond_coefs fits a 4-parameter Morse potential (De, a, re, c) —
+            # fewer than 4 points makes curve_fit underdetermined.
+            raise ValueError(
+                f"ts_bond_scan_min_steps ({self.ts_bond_scan_min_steps}) must be "
+                f">= 4 (calc_bond_coefs fits 4 Morse parameters)."
+            )
+        if self.ts_bond_scan_min_steps > self.ts_bond_scan_max_steps:
+            raise ValueError(
+                f"ts_bond_scan_min_steps ({self.ts_bond_scan_min_steps}) must be "
+                f"<= ts_bond_scan_max_steps ({self.ts_bond_scan_max_steps})."
             )
 
         normalized = []
