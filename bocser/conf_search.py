@@ -159,6 +159,7 @@ class ConfSearchState:
     config: Optional[ConfSearchConfig] = None
     extra_constraints: list = field(default_factory=list)
     vary_ts_bond_lengths: bool = False
+    _dihedral_ids_finalized: bool = False
 
 
 def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
@@ -207,6 +208,17 @@ class ConfSearchRunner:
         
         # Ensure working folder exists
         Path(working_folder).mkdir(parents=True, exist_ok=True)
+
+    def _require_dihedral_ids_finalized(self, caller: str) -> None:
+        """Guard against setup() ordering regressions. Call this at the top of
+        any block that reads self.state.dihedral_ids' final length (n_dihedral,
+        search_dim, IK-index validation, TS-bond Morse scans). Fails loudly
+        with a clear message instead of silently corrupting search_dim downstream."""
+        if not self.state._dihedral_ids_finalized:
+            raise RuntimeError(
+                f"{caller}: self.state.dihedral_ids is not finalized yet. "
+                f"This must run AFTER the coef_matrix()/dihedral_ids-populate loop in setup()."
+            )
 
     def _dump_status_hook(self, dumping_value: bool, filename: Optional[str] = None) -> None:
         """Save optimization status to JSON file."""
@@ -589,6 +601,7 @@ class ConfSearchRunner:
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
 
+        self._require_dihedral_ids_finalized("n_dihedral computation")
         n_dihedral = len(self.state.dihedral_ids)
 
         for cycle_idx in ik_loss_dihedrals_idxs:
@@ -624,6 +637,7 @@ class ConfSearchRunner:
                     len(self.state.ts_bonds),
                 )
 
+        self._require_dihedral_ids_finalized("TS-bond Morse scan block")
         self.state.ts_bond_mean_coefs = []
         if self.state.vary_ts_bond_lengths:
             theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
@@ -1097,13 +1111,31 @@ class ConfSearchRunner:
 
     def _dataset_from_checkpoint(self, snapshot: dict) -> Dataset:
         """Restore Dataset + runner state fields from a checkpoint snapshot."""
+        query_points = snapshot["query_points"]
+        ckpt_dim = len(query_points[0]) if query_points else None
+        if ckpt_dim is not None and ckpt_dim != self.state.search_dim:
+            raise RuntimeError(
+                f"Checkpoint at {self._checkpoint_path()} has search_dim="
+                f"{ckpt_dim}, but the current config/molecule implies "
+                f"search_dim={self.state.search_dim} "
+                f"(n_dihedral={len(self.state.dihedral_ids)}, "
+                f"vary_ts_bond_lengths={self.state.vary_ts_bond_lengths}, "
+                f"n_ts_bonds={len(self.state.ts_bonds)}). The config was "
+                f"likely changed (ts_bonds / vary_ts_bond_lengths / ring "
+                f"topology) since this checkpoint was written — loading it "
+                f"as-is would silently corrupt the GP training tensors. "
+                f"Delete the checkpoint to start fresh, or restore the "
+                f"original config that produced it."
+            )
+
         dataset = Dataset(
-            tf.constant(snapshot["query_points"], dtype=tf.float64),
+            tf.constant(query_points, dtype=tf.float64),
             tf.constant(snapshot["observations"], dtype=tf.float64),
         )
         self.state.minima = snapshot.get("minima", [])
         self.state.current_minima = float(snapshot.get("current_minima", 1e9))
         self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
+        return dataset
     
     def run(self) -> None:
         """Execute the full Bayesian optimization loop."""
