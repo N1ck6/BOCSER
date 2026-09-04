@@ -245,7 +245,7 @@ class ConfSearchRunner:
         drop_idx_to_window: dict = {}
 
         for ring_i, (cycle_d, cycle_idx) in enumerate(zip(dihedral_list_all, ik_loss_dihedrals_idxs)):
-            n_flexible = sum(1 for idx in cycle_idx if idx != -2 and idx != -3)
+            n_flexible = sum(1 for idx in cycle_idx if idx != -2)
             cap = max(0, n_flexible - self._RING_DOF_SLACK)
 
             seen_in_ring: set = set()
