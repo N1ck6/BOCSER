@@ -209,6 +209,9 @@ class ConfSearchRunner:
         # Ensure working folder exists
         Path(working_folder).mkdir(parents=True, exist_ok=True)
 
+    # Cremer & Pople result that an N-membered ring has exactly N-3 independent shape coordinates
+    _RING_DOF_SLACK = 3
+
     def _require_dihedral_ids_finalized(self, caller: str) -> None:
         """Guard against setup() ordering regressions. Call this at the top of
         any block that reads self.state.dihedral_ids' final length (n_dihedral,
@@ -219,6 +222,117 @@ class ConfSearchRunner:
                 f"{caller}: self.state.dihedral_ids is not finalized yet. "
                 f"This must run AFTER the coef_matrix()/dihedral_ids-populate loop in setup()."
             )
+
+    def _apply_ring_dof_cap(
+        self,
+        dihedral_list_all: list,
+        ik_loss_dihedrals_idxs: list,
+    ) -> None:
+        """Cap the number of GP-searched (independently sampled) torsion axes
+        per ring at (n_flexible_positions_in_ring - _RING_DOF_SLACK)
+
+        Ring-fusion axes are never demoted: they encode the relative orientation of two rings.
+        A ring whose optional-axis count does not exceed its cap is left completely untouched.
+        """
+        idx_ring_membership: dict = {}
+        for ring_i, cycle_idx in enumerate(ik_loss_dihedrals_idxs):
+            for idx in set(cycle_idx):
+                if idx >= 0:
+                    idx_ring_membership.setdefault(idx, set()).add(ring_i)
+        shared_axes = {idx for idx, rings in idx_ring_membership.items() if len(rings) > 1}
+
+        FLAT_COEFS = (0.0,) * 7
+        drop_idx_to_window: dict = {}
+
+        for ring_i, (cycle_d, cycle_idx) in enumerate(zip(dihedral_list_all, ik_loss_dihedrals_idxs)):
+            n_flexible = sum(1 for idx in cycle_idx if idx != -2 and idx != -3)
+            cap = max(0, n_flexible - self._RING_DOF_SLACK)
+
+            seen_in_ring: set = set()
+            shared_in_ring = []
+            optional_in_ring = []
+            for d, idx in zip(cycle_d, cycle_idx):
+                if idx < 0 or idx in seen_in_ring:
+                    continue
+                seen_in_ring.add(idx)
+                if idx in shared_axes:
+                    shared_in_ring.append(idx)
+                else:
+                    optional_in_ring.append((idx, d))
+
+            total_in_ring = len(shared_in_ring) + len(optional_in_ring)
+            if total_in_ring <= cap:
+                logger.info(
+                    "Ring DOF cap: ring #%d (size=%d) has %d GP-searched axes "
+                    "(%d shared, %d optional), within cap=%d (n_flexible=%d - "
+                    "slack=%d) — no axes demoted.",
+                    ring_i, len(cycle_idx), total_in_ring, len(shared_in_ring),
+                    len(optional_in_ring), cap, n_flexible, self._RING_DOF_SLACK,
+                )
+                continue
+
+            budget_for_optional = max(0, cap - len(shared_in_ring))
+            # Prefer keeping axes with non-flat Fourier mean function
+            ranked = sorted(
+                optional_in_ring,
+                key=lambda pair: self.state.mean_func_coefs[pair[0]] == FLAT_COEFS,
+            )
+            keep = ranked[:budget_for_optional]
+            drop = ranked[budget_for_optional:]
+
+            logger.info(
+                "Ring DOF cap: ring #%d (size=%d) has %d GP-searched axes "
+                "(%d shared, %d optional) > cap=%d (n_flexible=%d - slack=%d) "
+                "— demoting %d optional axis(es) to fixed (original-geometry) "
+                "torsions: %s. Kept %d optional axis(es): %s. Shared "
+                "(ring-fusion) axes are never demoted: %s.",
+                ring_i, len(cycle_idx), total_in_ring, len(shared_in_ring),
+                len(optional_in_ring), cap, n_flexible, self._RING_DOF_SLACK,
+                len(drop), [idx for idx, _ in drop],
+                len(keep), [idx for idx, _ in keep],
+                shared_in_ring,
+            )
+            for idx, d in drop:
+                drop_idx_to_window[idx] = d
+
+        if not drop_idx_to_window:
+            logger.info("Ring DOF cap: no rings exceeded their cap — dihedral_ids unchanged.")
+            return
+
+        for idx, d in drop_idx_to_window.items():
+            val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
+            self.state.fixed_dihedrals.append((list(d), val))
+
+        orig_len = len(self.state.dihedral_ids)
+        old_to_new: dict = {}
+        new_dihedral_ids = []
+        new_mean_func_coefs = []
+        for old_idx, (ids, coefs) in enumerate(zip(self.state.dihedral_ids, self.state.mean_func_coefs)):
+            if old_idx in drop_idx_to_window:
+                continue
+            old_to_new[old_idx] = len(new_dihedral_ids)
+            new_dihedral_ids.append(ids)
+            new_mean_func_coefs.append(coefs)
+
+        self.state.dihedral_ids = new_dihedral_ids
+        self.state.mean_func_coefs = new_mean_func_coefs
+
+        # Rewrite EVERY reference across all rings
+        for cycle_idx in ik_loss_dihedrals_idxs:
+            for pos in range(len(cycle_idx)):
+                idx = cycle_idx[pos]
+                if idx in drop_idx_to_window:
+                    cycle_idx[pos] = -4  # demoted: fixed at original-geometry value, IK uses static reference
+                elif idx >= 0:
+                    cycle_idx[pos] = old_to_new[idx]
+
+        self.state.ik_loss_dihedrals_idxs = ik_loss_dihedrals_idxs
+
+        logger.info(
+            "Ring DOF cap: demoted %d axis(es) in total. dihedral_ids reduced "
+            "from %d to %d entries.",
+            len(drop_idx_to_window), orig_len, len(new_dihedral_ids),
+        )
 
     def _dump_status_hook(self, dumping_value: bool, filename: Optional[str] = None) -> None:
         """Save optimization status to JSON file."""
@@ -594,6 +708,7 @@ class ConfSearchRunner:
             self.state.ik_loss = None
             self.state.ik_loss_dihedrals_idxs = []
             ik_loss_dihedrals_idxs = []
+            dihedral_list_all = []
             logger.exception(
                 "Failed to prepare IK loss: %s. "
                 "Possible cause: unsupported ring topology. Falling back to evm.", e
@@ -628,6 +743,9 @@ class ConfSearchRunner:
                     f"— one of them has regressed if this fires."
                 )
             central_bonds_seen[central_bond] = ids
+
+        if config.exclude_dof_slack:
+            self._apply_ring_dof_cap(dihedral_list_all, ik_loss_dihedrals_idxs)
 
         # Mark dihedral_ids as finalized BEFORE anything downstream is allowed to read it.
         self.state._dihedral_ids_finalized = True

@@ -34,6 +34,7 @@ class ConfSearchConfig:
     ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
     ts_bond_max_length: float = 5.0
     vary_ts_bond_lengths: bool = True
+    exclude_dof_slack: bool = True # На каждом кольце оставляет (N - 3) торсионных осей для GP. Излишние оси фиксируются на значении из исходной геометрии
     ts_bond_min_length: float = 1.0
     ts_bond_kernel_lengthscale: float = 0.5 # lengthscale RBF-ядра по измерениям длины TS-связи (единицы Å)
     ts_bond_scan_step: float = 0.1
