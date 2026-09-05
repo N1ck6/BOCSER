@@ -1,5 +1,6 @@
 import os
 import os.path
+import re
 import time
 import math
 from typing import Union
@@ -589,16 +590,37 @@ def start_calc(gjf_name: str, scan=False):
     )
 
     if proc.returncode != 0:
-        logger.error(
-            "sbatch submission FAILED for %s (returncode=%s). stdout=%r stderr=%r. "
-            "This is an infrastructure failure, not a chemistry failure — "
-            "the resulting '.out' will not exist",
-            sbatch_name, proc.returncode, proc.stdout.strip(), proc.stderr.strip(),
-        )
-        raise RuntimeError(
-            f"sbatch submission failed for {sbatch_name} (code {proc.returncode}): "
-            f"{proc.stderr.strip() or proc.stdout.strip()}"
-        )
+        submitted_match = re.search(r"Submitted batch job (\d+)", proc.stdout)
+        if submitted_match:
+            job_id = submitted_match.group(1)
+            out_name = inp_to_out_name(gjf_name)
+            out_hint = (
+                f"Check {out_name} (if it exists) or run `sacct -j {job_id}` / "
+                f"`scontrol show job {job_id}` on the cluster for the actual cause."
+            )
+            logger.error(
+                "ORCA job %s (SLURM job id %s) was submitted and ran, but "
+                "sbatch -W reported exit code %s once it finished — this is "
+                "the JOB's own exit status, not a submission failure. %s",
+                gjf_name, job_id, proc.returncode, out_hint,
+            )
+            raise RuntimeError(
+                f"ORCA job {gjf_name} (SLURM job {job_id}) exited with code "
+                f"{proc.returncode}. {out_hint}"
+            )
+        else:
+            logger.error(
+                "sbatch submission FAILED for %s (returncode=%s): the job was "
+                "never queued (no 'Submitted batch job' confirmation in "
+                "stdout). stdout=%r stderr=%r. This is an infrastructure "
+                "failure, not a chemistry failure — the resulting '.out' "
+                "will not exist.",
+                sbatch_name, proc.returncode, proc.stdout.strip(), proc.stderr.strip(),
+            )
+            raise RuntimeError(
+                f"sbatch submission failed for {sbatch_name} (code {proc.returncode}): "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
 
     # cleanup heavy ORCA files after calculations
     _cleanup_orca_tempfiles(gjf_path)

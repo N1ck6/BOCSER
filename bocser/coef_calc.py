@@ -536,7 +536,7 @@ class CoefCalculator:
                         break
                 if existing_for_axis is not None:
                     if existing_for_axis != old_idxs:
-                        logger.info(
+                        logger.debug(
                             "Skipping duplicate window %s for central bond %s "
                             "(already registered as %s) — one axis per bond.",
                             old_idxs, tuple(real_axis), existing_for_axis,
@@ -751,7 +751,7 @@ class CoefCalculator:
         for axis, (idxs, has_real) in seen_axes.items():
             coef_idx = self.frags[idxs]
             if not has_real:
-                logger.info("No Fourier coefs for ring-fusion axis %s — using flat mean function.", idxs)
+                logger.debug("No Fourier coefs for ring-fusion axis %s — using flat mean function.", idxs)
                 result.append((list(idxs), (0.0,) * 7))
             else:
                 result.append((list(idxs), unique_coefs[coef_idx]))

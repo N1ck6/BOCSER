@@ -1598,6 +1598,32 @@ class ConfSearchRunner:
         query_points = dataset.query_points.numpy()
         observations = dataset.observations.numpy()
 
+        if not self.state.minima:
+            # No successful full-optimization ever completed this run
+            logger.error(
+                "No minima were found this run (%d dataset points collected, "
+                "all candidates ended up broken/failed — see per-step logs "
+                "above for the specific cause of each). Writing empty result "
+                "files instead of clustering.",
+                len(observations),
+            )
+            clustering_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_clustering_results.json")
+            json.dump({}, open(clustering_file, "w"))
+
+            final_ensemble_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_final_ensemble.xyz")
+            open(final_ensemble_file, "w").close()
+
+            all_points_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_all_points.json")
+            json.dump(
+                {"query_points": query_points.tolist(), "observations": observations.tolist()},
+                open(all_points_file, "w"),
+            )
+            ckpt_path = self._checkpoint_path()
+            if ckpt_path.is_file():
+                ckpt_path.unlink()
+                logger.info("Run finished (with zero minima) — checkpoint file removed.")
+            return
+
         dbscan_labels = DBSCAN(
             eps=np.pi / 12,
             min_pts=1,
