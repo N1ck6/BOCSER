@@ -32,8 +32,15 @@ class LocalConnector(Connector):
     ) -> None:
         self.db_filename = db_filename
         if not os.path.isfile(db_filename):
-            logger.error("No database file located: %s", db_filename)
-            raise FileNotFoundError(db_filename)
+            # Create an empty SQLite file and continue
+            parent = os.path.dirname(os.path.abspath(db_filename))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            open(db_filename, "a").close()
+            logger.info(
+                "No database file at %s — created empty dihedral_logs.db and needed tables.",
+                db_filename,
+            )
         self.ensure_all_tables()
 
     def ensure_all_tables(self) -> None:
