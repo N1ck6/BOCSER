@@ -299,9 +299,9 @@ class ConfSearchRunner:
             logger.info("Ring DOF cap: no rings exceeded their cap — dihedral_ids unchanged.")
             return
 
-        for idx, d in drop_idx_to_window.items():
-            val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
-            self.state.fixed_dihedrals.append((list(d), val))
+        # for idx, d in drop_idx_to_window.items(): 
+        #     val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
+        #     self.state.fixed_dihedrals.append((list(d), val))
 
         orig_len = len(self.state.dihedral_ids)
         old_to_new: dict = {}
