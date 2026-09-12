@@ -478,7 +478,7 @@ def generate_oinp(
             tmp.write("\n\n")
             tmp.write(coords)
         else:
-            opt_cmd = "OptTS" if (cfg.ts and not constrained_opt) else "Opt"
+            opt_cmd = "OptTS" if (cfg.ts) else "Opt"
             tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
@@ -516,7 +516,7 @@ def generate_oinp(
                         continue
                     all_constraints.append(Constraint("bond", tuple(atoms), round(float(value), 6)))
 
-            need_geom = bool(all_constraints) or (cfg.ts and not constrained_opt)
+            need_geom = bool(all_constraints) or cfg.ts
             if need_geom:
                 if all_constraints:
                     tmp.write("%geom Constraints\n")
@@ -1028,7 +1028,7 @@ def calc_energy(
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[inp_name, out_name])
     else:
         _save_successful_out(out_name, constrained_opt, success_out_dir)
     return res, opt_status

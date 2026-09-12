@@ -209,8 +209,7 @@ class ConfSearchRunner:
         # Ensure working folder exists
         Path(working_folder).mkdir(parents=True, exist_ok=True)
 
-    # Cremer & Pople result that an N-membered ring has exactly N-3 independent shape coordinates
-    _RING_DOF_SLACK = 3
+    _RING_DOF_SLACK = 6
 
     def _require_dihedral_ids_finalized(self, caller: str) -> None:
         """Guard against setup() ordering regressions. Call this at the top of
@@ -241,7 +240,6 @@ class ConfSearchRunner:
                     idx_ring_membership.setdefault(idx, set()).add(ring_i)
         shared_axes = {idx for idx, rings in idx_ring_membership.items() if len(rings) > 1}
 
-        FLAT_COEFS = (0.0,) * 7
         drop_idx_to_window: dict = {}
 
         for ring_i, (cycle_d, cycle_idx) in enumerate(zip(dihedral_list_all, ik_loss_dihedrals_idxs)):
@@ -272,20 +270,29 @@ class ConfSearchRunner:
                 continue
 
             budget_for_optional = max(0, cap - len(shared_in_ring))
-            # Prefer keeping axes with non-flat Fourier mean function
-            ranked = sorted(
-                optional_in_ring,
-                key=lambda pair: self.state.mean_func_coefs[pair[0]] == FLAT_COEFS,
-            )
-            keep = ranked[:budget_for_optional]
-            drop = ranked[budget_for_optional:]
+            n_opt = len(optional_in_ring)
+            if budget_for_optional <= 0:
+                keep_positions: set = set()
+            elif budget_for_optional >= n_opt:
+                keep_positions = set(range(n_opt))
+            else:
+                positions = np.linspace(0, n_opt - 1, budget_for_optional)
+                keep_positions = {int(round(p)) for p in positions}
+                pos = 0
+                while len(keep_positions) < budget_for_optional and pos < n_opt:
+                    keep_positions.add(pos)
+                    pos += 1
+
+            keep = [optional_in_ring[p] for p in sorted(keep_positions)]
+            drop = [optional_in_ring[p] for p in range(n_opt) if p not in keep_positions]
 
             logger.info(
                 "Ring DOF cap: ring #%d (size=%d) has %d GP-searched axes "
                 "(%d shared, %d optional) > cap=%d (n_flexible=%d - slack=%d) "
-                "— demoting %d optional axis(es) to fixed (original-geometry) "
-                "torsions: %s. Kept %d optional axis(es): %s. Shared "
-                "(ring-fusion) axes are never demoted: %s.",
+                "— demoting %d optional axis(es), evenly spaced around the "
+                "ring, to fixed (original-geometry) torsions: %s. Kept %d "
+                "optional axis(es): %s. Shared (ring-fusion) axes are never "
+                "demoted: %s.",
                 ring_i, len(cycle_idx), total_in_ring, len(shared_in_ring),
                 len(optional_in_ring), cap, n_flexible, self._RING_DOF_SLACK,
                 len(drop), [idx for idx, _ in drop],
@@ -298,10 +305,6 @@ class ConfSearchRunner:
         if not drop_idx_to_window:
             logger.info("Ring DOF cap: no rings exceeded their cap — dihedral_ids unchanged.")
             return
-
-        # for idx, d in drop_idx_to_window.items(): 
-        #     val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
-        #     self.state.fixed_dihedrals.append((list(d), val))
 
         orig_len = len(self.state.dihedral_ids)
         old_to_new: dict = {}
@@ -322,7 +325,7 @@ class ConfSearchRunner:
             for pos in range(len(cycle_idx)):
                 idx = cycle_idx[pos]
                 if idx in drop_idx_to_window:
-                    cycle_idx[pos] = -4  # demoted: fixed at original-geometry value, IK uses static reference
+                    cycle_idx[pos] = -4  # demoted: left unconstrained, IK uses static reference
                 elif idx >= 0:
                     cycle_idx[pos] = old_to_new[idx]
 
