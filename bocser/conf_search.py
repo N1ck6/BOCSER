@@ -306,6 +306,10 @@ class ConfSearchRunner:
             logger.info("Ring DOF cap: no rings exceeded their cap — dihedral_ids unchanged.")
             return
 
+        for idx, d in drop_idx_to_window.items():
+            val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
+            self.state.fixed_dihedrals.append((list(d), val))
+
         orig_len = len(self.state.dihedral_ids)
         old_to_new: dict = {}
         new_dihedral_ids = []
@@ -401,6 +405,8 @@ class ConfSearchRunner:
         except Exception:
             logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
             en, preopt_status = self.state.config.broken_struct_energy, False
+            # Dump the status file immediately, right to avoidcrash on exception
+            self._dump_status_hook(dumping_value=False)
         self.state.last_opt_ok = preopt_status
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
         if not preopt_status:
@@ -1455,8 +1461,16 @@ class ConfSearchRunner:
             last_opt_status = None
             status_file = Path(self.state.working_folder) / f"{self.state.exp_name}_last_opt_status.json"
             if status_file.is_file():
-                with open(status_file, "r") as file:
-                    last_opt_status = json.load(file)
+                try:
+                    with open(status_file, "r") as file:
+                        last_opt_status = json.load(file)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.error(
+                        "Status file %s exists but could not be parsed (%s) "
+                        "— treating as LAST_OPT_OK=False instead of crashing.",
+                        status_file, e,
+                    )
+                    last_opt_status = {"LAST_OPT_OK": False}
             else:
                 last_opt_status = {"LAST_OPT_OK": False}
                 logger.error("Status file missing — acq/objective failed before dump")

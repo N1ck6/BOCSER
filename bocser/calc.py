@@ -351,9 +351,7 @@ def change_dihedrals(mol_file_name: str,
                 _set_atom_distance(mol.GetConformer(), a, b, float(target_len))
 
         else:
-            with tempfile.NamedTemporaryFile(suffix=".xyz", delete=True) as tmp:
-                Chem.MolToMolFile(mol, tmp.name)
-                tmp_mol = Chem.RWMol(Chem.MolFromMolFile(tmp.name, removeHs=False))
+            tmp_mol = Chem.RWMol(mol)
 
             mp = AllChem.MMFFGetMoleculeProperties(tmp_mol, mmffVariant='MMFF94')
             ff = AllChem.MMFFGetMoleculeForceField(tmp_mol, mp)
@@ -1028,7 +1026,7 @@ def calc_energy(
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[inp_name, out_name])
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
     else:
         _save_successful_out(out_name, constrained_opt, success_out_dir)
     return res, opt_status
