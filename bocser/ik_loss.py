@@ -343,6 +343,8 @@ class IKLoss:
                 elems=total_motions,
             )
 
-            total_loss = total_loss + tf.reduce_sum(ik_loss)
+            # Keep the per-candidate shape [N, 1]: summing over the batch would add
+            # the same constant to every candidate and hide the IK penalty from argmax
+            total_loss = total_loss + ik_loss
 
         return total_loss

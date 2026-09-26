@@ -48,6 +48,9 @@ _COVALENT_RADII: dict[str, float] = {
 _COVALENT_RADII_DEFAULT = 0.76
 _VDW_RADII_DEFAULT = 1.70
 
+# Ring bond is "open" beyond this multiple of the covalent-radii sum (1.15 * 1.52 = 1.75 A, the old C-C threshold)
+_RING_BOND_COV_FACTOR = 1.15
+
 
 def _clash_threshold(sym_a: str, sym_b: str) -> float:
     """Minimum allowed distance between two atoms before they are considered clashing."""
@@ -356,7 +359,12 @@ def change_dihedrals(mol_file_name: str,
             mp = AllChem.MMFFGetMoleculeProperties(tmp_mol, mmffVariant='MMFF94')
             ff = AllChem.MMFFGetMoleculeForceField(tmp_mol, mp)
 
-            for bl_dict in ik_loss.bond_lengths:
+            # ik_loss is None when af='ik' but IK could not be built (no rings >= 4 or IK setup failed):
+            # keep the MMFF path, just without ring-closure constraints
+            ik_bond_lengths = ik_loss.bond_lengths if ik_loss is not None else []
+            ik_valence_angles = ik_loss.valence_angles if ik_loss is not None else []
+
+            for bl_dict in ik_bond_lengths:
                 for (a, b), value in bl_dict.items():
                     if frozenset((a, b)) in ts_bond_set:
                         continue  # TS-bond is not fixed
@@ -369,12 +377,12 @@ def change_dihedrals(mol_file_name: str,
                 _set_atom_distance(tmp_mol.GetConformer(), a, b, float(target_len))
                 ff.MMFFAddDistanceConstraint(a, b, False, float(target_len), float(target_len), 1e2)
 
-            for va_dict in ik_loss.valence_angles:
+            for va_dict in ik_valence_angles:
                 for (a, b, c), value in va_dict.items():
                     ff.MMFFAddAngleConstraint(a, b, c, False, np.rad2deg(value), np.rad2deg(value), 1e2)
 
             ik_covered_bonds = {
-                frozenset(bond) for bl_dict in ik_loss.bond_lengths for bond in bl_dict
+                frozenset(bond) for bl_dict in ik_bond_lengths for bond in bl_dict
             }
             conf0 = mol.GetConformer()
             for ring in mol.GetRingInfo().AtomRings():
@@ -865,14 +873,19 @@ def _check_rings_intact(
             else:
                 sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
                 sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
-                threshold = _bond_break_threshold(sym_a, sym_b) * ts_multiplier
+                # The vdW-based value alone is below the real bond length for S/P/Se/Si ring bonds
+                # (e.g. C-S 1.80 vs 1.82 A), so it is floored by a covalent-radius estimate.
+                cov_sum = (_COVALENT_RADII.get(sym_a, _COVALENT_RADII_DEFAULT)
+                           + _COVALENT_RADII.get(sym_b, _COVALENT_RADII_DEFAULT))
+                threshold = max(_bond_break_threshold(sym_a, sym_b) * ts_multiplier,
+                                cov_sum * _RING_BOND_COV_FACTOR)
 
             if dist > threshold:
                 sym_a = original_mol.GetAtomWithIdx(a).GetSymbol()
                 sym_b = original_mol.GetAtomWithIdx(b).GetSymbol()
                 logger.warning(
                     "Ring bond %d(%s)-%d(%s) opened: length %.3f A "
-                    "> vdw threshold %.3f A",
+                    "> threshold %.3f A",
                     a, sym_a, b, sym_b, dist, threshold
                 )
                 return False, (a, b)
