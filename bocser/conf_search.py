@@ -17,6 +17,7 @@ from rdkit.Chem import AllChem
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import json
+import re
 import shutil
 from pathlib import Path
 import numpy as np
@@ -52,6 +53,7 @@ from calc import (
     submit_calc, wait_for_jobs,
 )
 from run_state import increase_structure_id
+import run_state
 import config_manager
 from coef_calc import (
     CoefCalculator,
@@ -150,6 +152,8 @@ class ConfSearchState:
     model_chk: Optional[Any] = None
     current_minima: float = 1e9
     acq_vals_log: list = field(default_factory=list)
+    deepest_minima: list = field(default_factory=list)
+    config_path: str = ""
     last_opt_ok: bool = True
     ik_loss: Optional[Any] = None
     ik_loss_dihedrals_idxs: list = field(default_factory=list)
@@ -578,6 +582,7 @@ class ConfSearchRunner:
             raise
 
         self.state.config = config
+        self.state.config_path = config_path
 
     def setup(self) -> None:
         """Initialize the search from configuration."""
@@ -1099,13 +1104,32 @@ class ConfSearchRunner:
         the ensemble file (if provided), so restarting a run never gets
         contaminated by a previous run's outputs."""
         config = self.state.config
-        working_folder = Path(self.state.working_folder)
+        working_folder = Path(self.state.working_folder).resolve()
+
+        # Never wipe a project/home/root folder (e.g. the default --folder=. run from the repo root)
+        code_dir = Path(__file__).resolve().parent
+        if (
+            (working_folder / ".git").exists()
+            or working_folder == code_dir
+            or working_folder in code_dir.parents
+            or working_folder == Path.home().resolve()
+            or working_folder == Path(working_folder.anchor)
+        ):
+            raise RuntimeError(
+                f"clear_working_folder=True refused for {working_folder}: it is a repository, "
+                f"contains the BOCSER code, or is a home/root folder. Use a dedicated run folder."
+            )
 
         keep = set()
         mol_path = Path(config.mol_file_name)
         if not mol_path.is_absolute():
             mol_path = (working_folder / mol_path).resolve()
         keep.add(mol_path.resolve())
+        # setup() resolves mol_file_name against the CWD, keep that location too
+        keep.add(Path(config.mol_file_name).resolve())
+        # sbatch template: looked up in qc_calcs/ first, then relative to the CWD
+        keep.add(Path(config.sbatch_template_name).resolve())
+        keep.add((Path(config.mol_file_name).resolve().parent / "qc_calcs" / config.sbatch_template_name).resolve())
 
         if config.load_ensemble:
             ens_path = Path(config.load_ensemble)
@@ -1131,6 +1155,9 @@ class ConfSearchRunner:
             resolved = item.resolve()
             if resolved in keep:
                 logger.debug("Preserving %s (protected: config/ensemble/.db/.mol/.log/.yaml/checkpoint)", item)
+                continue
+            if item.is_dir() and any(k.is_relative_to(resolved) for k in keep):
+                logger.info("Preserving folder %s: it contains a protected input file", item)
                 continue
             try:
                 if item.is_dir():
@@ -1209,6 +1236,7 @@ class ConfSearchRunner:
             "minima": self.state.minima,
             "current_minima": float(self.state.current_minima),
             "acq_vals_log": list(self.state.acq_vals_log),
+            "deepest_minima": [float(v) for v in self.state.deepest_minima],
         }
 
         existing = self._load_checkpoint_file()
@@ -1330,8 +1358,27 @@ class ConfSearchRunner:
         self.state.minima = snapshot.get("minima", [])
         self.state.current_minima = float(snapshot.get("current_minima", 1e9))
         self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
+        self.state.deepest_minima = list(snapshot.get("deepest_minima", []))
+
+        # The structure-id counter restarts at 0 in a new process: continue after the
+        # highest id already on disk so resumed steps don't overwrite earlier files
+        next_id = self._next_free_structure_id()
+        run_state.set_structure_id(next_id)
+        logger.info("Structure numbering continues from %d.", next_id)
         return dataset
-    
+
+    def _next_free_structure_id(self) -> int:
+        """1 + highest numeric file-name prefix in the structures/broken/success folders."""
+        max_id = -1
+        for folder in (self.state.structures_path, self.state.broken_structs_path, self.state.success_out_dir):
+            if not folder or not Path(folder).is_dir():
+                continue
+            for item in Path(folder).iterdir():
+                m = re.match(r"(\d+)", item.name)
+                if m:
+                    max_id = max(max_id, int(m.group(1)))
+        return max_id + 1
+
     def run(self) -> None:
         """Execute the full Bayesian optimization loop."""
         config = self.state.config
@@ -1342,11 +1389,11 @@ class ConfSearchRunner:
         start_step = 1
         if ckpt is not None:
             dataset = self._dataset_from_checkpoint(ckpt)
+            start_step = ckpt["step"] + 1
             logger.info(
                 "BO loop will continue from step %d (restored step %d).",
                 start_step, ckpt["step"],
             )
-            start_step = ckpt["step"] + 1
         else:
             dataset = self._initialize_dataset(observer)
         
@@ -1438,7 +1485,7 @@ class ConfSearchRunner:
 
         rule = self._build_rule()
 
-        deepest_minima = []
+        deepest_minima = self.state.deepest_minima  # non-empty when resumed from a checkpoint
         early_termination_flag = False
 
         logger.info("MINIMA: %s", self.state.minima)
@@ -1451,7 +1498,7 @@ class ConfSearchRunner:
             self._save_results(dataset)
             return
         
-        for step in range(1, config.max_steps + 1):
+        for step in range(start_step, config.max_steps + 1):
             logger.debug("Previous last_opt_ok: %s", self.state.last_opt_ok)
             logger.debug("Step number %s", step)
 
@@ -1578,18 +1625,17 @@ class ConfSearchRunner:
             except Exception:
                 logger.exception("Failed to write checkpoint at step %s", step)
 
-            if step < config.rolling_window_size:
+            # Last N acquisition values: a step can add no value (bo.optimize failed before
+            # the objective ran), so indexing the list by step number would misalign the window
+            window_vals = logs["acq_vals"][-config.rolling_window_size:] if config.rolling_window_size > 0 else []
+            if config.rolling_window_size <= 0 or len(window_vals) < config.rolling_window_size:
                 continue
 
             logger.debug("Checking termination criterion!")
-            logger.debug("Acq vals in window: %s", logs['acq_vals'][max(0, step - config.rolling_window_size) : step])
+            logger.debug("Acq vals in window: %s", window_vals)
 
-            rolling_mean = np.mean(
-                logs["acq_vals"][max(0, step - config.rolling_window_size) : step]
-            )
-            rolling_std = np.std(
-                logs["acq_vals"][max(0, step - config.rolling_window_size) : step]
-            )
+            rolling_mean = np.mean(window_vals)
+            rolling_std = np.std(window_vals)
 
             logger.debug("After step %s:", step)
             logger.info(
@@ -1603,8 +1649,7 @@ class ConfSearchRunner:
                 config.rolling_std_threshold,
             )
             if (
-                step >= config.rolling_window_size
-                and rolling_std < config.rolling_std_threshold
+                rolling_std < config.rolling_std_threshold
                 and rolling_mean < config.rolling_mean_threshold
             ):
                 logger.info("Termination criterion reached on step %s! Terminating search!", step)

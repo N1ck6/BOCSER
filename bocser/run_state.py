@@ -26,6 +26,12 @@ def peek_structure_id() -> int:
     return _CURRENT_STRUCTURE_ID
 
 
+def set_structure_id(value: int) -> None:
+    """Set the next structure id (used when resuming from a checkpoint)."""
+    global _CURRENT_STRUCTURE_ID
+    _CURRENT_STRUCTURE_ID = value
+
+
 def reset() -> None:
     """Reset the runtime state (useful for tests)."""
     global _CURRENT_STRUCTURE_ID
