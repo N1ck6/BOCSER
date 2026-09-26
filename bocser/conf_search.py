@@ -492,7 +492,8 @@ class ConfSearchRunner:
         valid_degrees, valid_energies = [], []
         for coords, energy, xyz_block in parsed_data:
             if self.state.ik_loss is not None:
-                if not _check_rings_intact(xyz_block, self.state.mol):
+                rings_intact, _ = _check_rings_intact(xyz_block, self.state.mol, ts_bonds=self.state.ts_bonds)
+                if not rings_intact:
                     logger.warning(
                         "Discarding trajectory frame (energy=%.3f kcal/mol): "
                         "ring opened during optimization",
@@ -512,7 +513,7 @@ class ConfSearchRunner:
 
         # Validate last_point before saving to minima list.
         last_xyz = last_point["xyz_block"]
-        if self.state.ik_loss is None or _check_rings_intact(last_xyz, self.state.mol):
+        if self.state.ik_loss is None or _check_rings_intact(last_xyz, self.state.mol, ts_bonds=self.state.ts_bonds)[0]:
             minima_file = os.path.join(
                 self.state.working_folder,
                 f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz"

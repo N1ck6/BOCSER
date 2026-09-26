@@ -516,8 +516,10 @@ def generate_oinp(
 
             need_geom = bool(all_constraints) or cfg.ts
             if need_geom:
+                # %geom must be opened even without constraints (TS: MaxIter/Calc_Hess only)
+                tmp.write("%geom\n")
                 if all_constraints:
-                    tmp.write("%geom Constraints\n")
+                    tmp.write("Constraints\n")
                     for c in all_constraints:
                         letter = _CONSTRAINT_LETTER[c.type]
                         atoms_str = " ".join(str(a) for a in c.atoms)
@@ -687,6 +689,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
     cycle_re  = re.compile(r"GEOMETRY OPTIMIZATION CYCLE\s+(\d+)", re.IGNORECASE)
     maxiter_re = re.compile(r"The optimization did not converge but reached the maximum number of", re.IGNORECASE)
     m = None
+    cfg = _get_config_or_raise()
 
     try:
         with open(log_name, 'r', errors='ignore') as fh:
@@ -694,7 +697,6 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
             from collections import deque
             last_lines = deque(fh, maxlen=4000)
             joined = "\n".join(last_lines)
-            cfg = _get_config_or_raise()
 
             if not terminated_re.search(joined):
                 # Don't search for energy if run didn't succeed
@@ -713,19 +715,20 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
                 logger.warning("ORCA reached MaxIter (cycle=%s) — returning broken_struct_energy", n_cycles)
                 return cfg.broken_struct_energy, False, n_cycles
 
-            m = energy_re.search(joined) or alt_re.search(joined)
-            if not m:
+            # The window can hold several optimization cycles: the final energy is the LAST match
+            matches = list(energy_re.finditer(joined)) or list(alt_re.finditer(joined))
+            if not matches:
                 # no energy line found -> optimization likely failed; return broken_struct_energy
                 logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
                 return cfg.broken_struct_energy, False, None
-            
+            m = matches[-1]
+
             return float(m.group(1)), True, n_cycles
-            
+
     except FileNotFoundError:
         logger.error("No log file: %s. Returning broken_struct_energy", log_name)
         return cfg.broken_struct_energy, False, None
     except Exception:
-        logger.exception("Failed to parse energy from line: %s", m.group(0))
         matched_text = m.group(0) if m is not None else "<no match — exception occurred before energy regex ran>"
         logger.exception("Failed to parse energy from log (matched text: %s)", matched_text)
         return cfg.broken_struct_energy, False, None
@@ -853,7 +856,7 @@ def _check_rings_intact(
                 logger.warning(
                     "Ring atom %d or %d missing from xyz block", a, b
                 )
-                return False
+                return False, (a, b)
 
             dist = np.linalg.norm(coords[a] - coords[b])
 
@@ -879,7 +882,7 @@ def _check_rings_intact(
 def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) -> tuple[bool, Union[tuple[int, int], None]]:
     """Checks if TS-bonds are within max_length, because RingInfo does not see bonds with H"""
     if not ts_bonds:
-        return True
+        return True, None
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
     if lines and lines[0].strip().lstrip('-').isdigit():
         lines = lines[2:]
@@ -892,7 +895,7 @@ def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) ->
     for a, b in ts_bonds:
         if a not in coords or b not in coords:
             logger.warning("TS-bond %d-%d: atom missing in xyz", a, b)
-            return False
+            return False, (a, b)
         dist = np.linalg.norm(coords[a] - coords[b])
         if dist > max_length:
             logger.warning("TS-bond %d-%d surpassed the limit: %.3f A > %.3f A", a, b, dist, max_length)
