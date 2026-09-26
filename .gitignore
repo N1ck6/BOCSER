@@ -21,3 +21,5 @@ tests/**/*
 !tests/**/*_final_ensemble.xyz
 !tests/**/*.mol
 !tests/**/*config.yaml
+# Claude change log (local only)
+claude_log.md
