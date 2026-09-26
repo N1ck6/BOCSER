@@ -16,6 +16,7 @@ RDLogger.DisableLog("rdApp.warning")
 from rdkit.Chem import AllChem
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
+import hashlib
 import json
 import re
 import shutil
@@ -46,6 +47,7 @@ from calc import (
     raw1_to_with_h_canonical,
     raw1_to_heavy_canonical,
     _heavy_and_h_order,
+    HARTRI_TO_KCAL,
     resolve_extra_constraints,
     _validate_extra_constraints_atoms,
     compute_mol_hash,
@@ -816,9 +818,20 @@ class ConfSearchRunner:
             pairs_to_scan = []  # [(a, b, pair_key, inp_name), ...]
             cached_coefs = {}   # pair_key -> coefs, чтобы сохранить порядок self.state.ts_bonds
 
+            # mol_hash ignores the atom order of the .mol file, raw indices don't: key the cache by
+            # canonical atom ranks + graph distance so another .mol of the same molecule can't
+            # pick up the coefficients of a different atom pair
+            ref_mol = build_reference_with_h_mol(self.state.mol_file_name)
+            ranks = list(Chem.CanonicalRankAtoms(ref_mol, breakTies=False))
+            topo_dist = Chem.GetDistanceMatrix(ref_mol)
+
+            def db_pair_key(a: int, b: int) -> str:
+                r1, r2 = sorted((ranks[a], ranks[b]))
+                return f"rank{r1}-{r2}|d{int(topo_dist[a][b])}"
+
             for (a, b) in self.state.ts_bonds:
                 pair_key = f"{min(a, b)}-{max(a, b)}"
-                cached = db.get_ts_bond_coefs(mol_hash, theory_level, pair_key)
+                cached = db.get_ts_bond_coefs(mol_hash, theory_level, db_pair_key(a, b))
                 if cached is not None:
                     logger.info("TS-bond Morse coefs cache HIT for pair (%d,%d): %s", a, b, cached)
                     cached_coefs[pair_key] = cached
@@ -872,7 +885,7 @@ class ConfSearchRunner:
                         cached_coefs[pair_key] = (0.0, 1.0, (config.ts_bond_min_length + config.ts_bond_max_length) / 2, 0.0)
                         continue
                     logger.info("TS-bond pair (%d,%d) Morse coefs: De=%.3f a=%.3f re=%.3f c=%.3f", a, b, *coefs)
-                    db.set_ts_bond_coefs(mol_hash, theory_level, pair_key, coefs)
+                    db.set_ts_bond_coefs(mol_hash, theory_level, db_pair_key(a, b), coefs)
                     cached_coefs[pair_key] = tuple(coefs)
 
             for (a, b) in self.state.ts_bonds:
@@ -960,13 +973,20 @@ class ConfSearchRunner:
                 "min energy from ensemble selected instead.",
                 ensemble_path,
             )
-            self.state.ensemble_processor = EnsembleProcessor(
-                ensemble_path, dihedral_idxs=self.state.dihedral_ids,
-            )
+            self.state.ensemble_processor = self._make_ensemble_processor()
             if not self.state.ensemble_processor.energies:
                 raise RuntimeError(
                     f"load_ensemble at {ensemble_path}: no conformers/energies found. "
                     f"norm_energy can't be calculated."
+                )
+            # BO energies are E_orca * HARTRI_TO_KCAL - norm_energy, so the ensemble must hold absolute
+            # kcal/mol energies (< -9e4 for any molecule with a heavy-atom torsion). Hartree or
+            # relative values would silently mix scales with every later ORCA result.
+            if max(self.state.ensemble_processor.energies) > -1e4:
+                raise RuntimeError(
+                    f"load_ensemble at {ensemble_path}: energies (max={max(self.state.ensemble_processor.energies):.4f}) "
+                    f"are not absolute energies in kcal/mol. Put the absolute energy in kcal/mol "
+                    f"(Hartree * {HARTRI_TO_KCAL}) as the last token of each comment line."
                 )
             self.state.norm_energy = min(self.state.ensemble_processor.energies)
             logger.info(
@@ -975,6 +995,16 @@ class ConfSearchRunner:
             )
         else:
             theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
+            # norm_energy comes from an Opt/OptTS of the input geometry under the hard constraints,
+            # so both change the cached value
+            if config.ts:
+                theory_level += "|ts"
+            hard_constraints = sorted(
+                [("dihedral", tuple(atoms), round(float(np.rad2deg(val)), 1)) for atoms, val in self.state.fixed_dihedrals]
+                + [(c.type, tuple(c.atoms), round(float(c.value), 3)) for c in self.state.extra_constraints]
+            )
+            if hard_constraints:
+                theory_level += "|c=" + hashlib.sha1(repr(hard_constraints).encode()).hexdigest()[:12]
             mol_hash = compute_mol_hash(self.state.mol_file_name, config.charge, config.spin_multiplicity)
             db = LocalConnector(self.state.db_file)
 
@@ -1019,9 +1049,7 @@ class ConfSearchRunner:
                 logger.warning(
                     "ensemble_processor was not created ahead — checking load_ensemble again."
                 )
-                ep = EnsembleProcessor(
-                    self._resolve_ensemble_path(), dihedral_idxs=self.state.dihedral_ids,
-                )
+                ep = self._make_ensemble_processor()
             
             logger.info(
                 "Loading init points from given ensemble! Normalizing against norm_energy=%.3f kcal/mol.",
@@ -1747,6 +1775,26 @@ class ConfSearchRunner:
         if not load_ensemble_filename.is_absolute():
             load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
         return str(load_ensemble_filename)
+
+    def _make_ensemble_processor(self) -> EnsembleProcessor:
+        """EnsembleProcessor with atom-order check against the .mol and, when TS-bond
+        lengths are searched, the TS-bond dimensions of the search vector."""
+        raw_mol = Chem.MolFromMolFile(self.state.mol_file_name, removeHs=False)
+        heavy_idx, h_idx = _heavy_and_h_order(raw_mol)
+        raw_order = heavy_idx + h_idx
+        ts_kwargs = {}
+        if self.state.vary_ts_bond_lengths:
+            ts_kwargs = dict(
+                ts_bonds=self.state.ts_bonds,
+                ts_bounds=(self.state.config.ts_bond_min_length, self.state.config.ts_bond_max_length),
+            )
+        return EnsembleProcessor(
+            self._resolve_ensemble_path(),
+            dihedral_idxs=self.state.dihedral_ids,
+            ref_symbols=[raw_mol.GetAtomWithIdx(i).GetSymbol() for i in raw_order],
+            raw_order=raw_order,
+            **ts_kwargs,
+        )
 
 
 def main():
