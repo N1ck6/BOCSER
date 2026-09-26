@@ -77,6 +77,7 @@ class CoefCalculator:
 
         self.scanfile2smiles = {} # k - scan_file, v - smiles
         self.fetched_coefs = {} # k - smiles, v - coefs
+        self.failed_scans = set() # scan .inp files without usable results
 
         if not os.path.exists(self.dir_for_inps):
             os.makedirs(self.dir_for_inps)
@@ -654,9 +655,24 @@ class CoefCalculator:
                 continue
 
             cur_res = []
-            with open(res_file_name, "r") as file:
-                for line in file:
-                    cur_res.append(float(line.strip().split()[1]))
+            try:
+                with open(res_file_name, "r") as file:
+                    for line in file:
+                        if line.strip():
+                            cur_res.append(float(line.strip().split()[1]))
+            except (OSError, ValueError, IndexError) as e:
+                logger.error("Torsion scan %s has no usable results (%s)", inp_name, e)
+                self.failed_scans.add(inp_name)
+                result.append(None)
+                continue
+            if len(cur_res) != len(self.degrees):
+                logger.error(
+                    "Torsion scan %s is incomplete: %d of %d points",
+                    inp_name, len(cur_res), len(self.degrees),
+                )
+                self.failed_scans.add(inp_name)
+                result.append(None)
+                continue
             result.append(np.array(cur_res))
 
         return list(zip(lst, result))
@@ -696,14 +712,26 @@ class CoefCalculator:
             if self.scanfile2smiles[inp_filename] in self.fetched_coefs:
                 res.append(self.fetched_coefs[self.scanfile2smiles[inp_filename]])
                 continue
-            res.append(calc_coefs(self.degrees, energies))
-        
-        self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs)
+            if inp_filename not in self.failed_scans:
+                try:
+                    res.append(calc_coefs(self.degrees, energies))
+                    continue
+                except (RuntimeError, ValueError) as e:
+                    logger.error("Fourier fit failed for scan %s: %s", inp_filename, e)
+                    self.failed_scans.add(inp_filename)
+            # Same flat prior as used for ring dihedrals; not cached, so the scan is retried next run
+            logger.error(
+                "Using flat mean function for %s (%s) — torsion scan failed",
+                inp_filename, self.scanfile2smiles[inp_filename],
+            )
+            res.append((0.0,) * 7)
+
+        self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs) - len(self.failed_scans)
         self.n_fourier_cached = len(self.fetched_coefs)
         logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", self.n_fourier_computed, self.n_fourier_cached)
-                
+
         for inp_filename, coefs in zip(inp_filenames, res):
-            if self.scanfile2smiles[inp_filename] in self.fetched_coefs:
+            if self.scanfile2smiles[inp_filename] in self.fetched_coefs or inp_filename in self.failed_scans:
                 continue
             self.db_connector.set_request_params(
                 "INSERT INTO dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) "

@@ -855,8 +855,17 @@ class ConfSearchRunner:
                 wait_for_jobs(job_ids, timeout_minutes=config.orca_poll_timeout_minutes)
 
                 for (a, b, pair_key, inp_name) in pairs_to_scan:
-                    lengths, energies = parse_bond_scan_results(inp_name)
-                    coefs = calc_bond_coefs(lengths, energies)
+                    try:
+                        lengths, energies = parse_bond_scan_results(inp_name)
+                        coefs = calc_bond_coefs(lengths, energies)
+                    except (OSError, ValueError, IndexError, RuntimeError, TypeError) as e:
+                        # De=0 gives a flat Morse mean; not cached, so the scan is retried next run
+                        logger.error(
+                            "TS-bond scan %s failed (%s) — using flat mean function for pair (%d,%d).",
+                            inp_name, e, a, b,
+                        )
+                        cached_coefs[pair_key] = (0.0, 1.0, (config.ts_bond_min_length + config.ts_bond_max_length) / 2, 0.0)
+                        continue
                     logger.info("TS-bond pair (%d,%d) Morse coefs: De=%.3f a=%.3f re=%.3f c=%.3f", a, b, *coefs)
                     db.set_ts_bond_coefs(mol_hash, theory_level, pair_key, coefs)
                     cached_coefs[pair_key] = tuple(coefs)

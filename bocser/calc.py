@@ -283,7 +283,7 @@ def submit_calc(gjf_name: str, scan=False) -> str:
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
 
     proc = subprocess.run(
-        ["sbatch", "-o", "/dev/null", sbatch_name],
+        ["sbatch", "-t", str(cfg.orca_poll_timeout_minutes), "-o", "/dev/null", sbatch_name],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -296,6 +296,29 @@ def submit_calc(gjf_name: str, scan=False) -> str:
     return job_id
 
 
+def _squeue_running(job_ids: list[str]) -> Union[set, None]:
+    """Return the subset of job_ids still known to squeue, or None if squeue itself failed."""
+    proc = subprocess.run(
+        ["squeue", "-h", "-j", ",".join(job_ids), "-o", "%i"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        return set(proc.stdout.split())
+    if "Invalid job id" in proc.stderr:
+        # A job already purged from slurmctld makes squeue fail: it is finished
+        if len(job_ids) == 1:
+            return set()
+        running = set()
+        for job_id in job_ids:
+            cur = _squeue_running([job_id])
+            if cur is None:
+                return None
+            running |= cur
+        return running
+    logger.warning("squeue failed (code %s): %s — will retry", proc.returncode, proc.stderr.strip())
+    return None
+
+
 def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
     """Block until all given SLURM job ids finish, or timeout. Uses a simple
     polling loop against squeue rather than one blocking sbatch -W per job,
@@ -305,11 +328,11 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
     pending = set(job_ids)
 
     while pending and time.monotonic() < deadline:
-        proc = subprocess.run(
-            ["squeue", "-h", "-j", ",".join(pending), "-o", "%i"],
-            capture_output=True, text=True,
-        )
-        still_running = set(proc.stdout.split())
+        still_running = _squeue_running(sorted(pending))
+        if still_running is None:
+            # squeue error is not a proof of completion — keep waiting
+            time.sleep(10)
+            continue
         finished = pending - still_running
         if finished:
             logger.debug("Jobs finished: %s", finished)
@@ -320,9 +343,10 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
     if pending:
         logger.warning(
             "Timeout (%d min) reached with %d jobs still pending: %s. "
-            "Continuing — their .out files may be incomplete/missing.",
+            "Cancelling them — their .out files may be incomplete/missing.",
             timeout_minutes, len(pending), pending,
         )
+        subprocess.run(["scancel", *sorted(pending)], capture_output=True, text=True)
 
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
