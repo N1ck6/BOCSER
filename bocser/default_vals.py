@@ -50,6 +50,11 @@ class ConfSearchConfig:
     # or (when True) the lengths in the lowest-energy conformer of load_ensemble.
     infer_ts_bond_lengths_from_ensemble: bool = False
 
+    # Full opt failed in ORCA (MaxIter, SCF, abort) after a successful pre-opt: give the GP the
+    # pre-opt energy of the point instead of broken_struct_energy. A geometry rejected by the
+    # structure checks is always broken. False = old behaviour (penalize the region).
+    use_preopt_energy_on_opt_failure: bool = True
+
     # Also freeze the BO dihedrals in the final Opt/OptTS (they are always frozen in the pre-opt).
     # The result is then a constrained structure, not a free stationary point.
     constrain_bo_dihedrals_in_final_opt: bool = False

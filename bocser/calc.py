@@ -1111,12 +1111,20 @@ def calc_energy(
         fixed_dihedrals=None,
         extra_constraints=None,
         ts_bond_targets=None,
-) -> float:
+        failure_info: Union[dict, None] = None,
+) -> tuple[float, bool]:
     """
         Calculates energy of molecule from 'mol_file_name'
-        with current properties and returns it as float.
+        with current properties and returns (energy, success).
         If config is provided, uses its values; otherwise uses module-level defaults.
+        failure_info: optional dict; on failure its "stage" is set to
+            "geometry" (rejected by the structure checks before ORCA) or
+            "orca" (ORCA job failed, did not converge or gave no energy).
     """
+    def failed(stage: str) -> None:
+        if failure_info is not None:
+            failure_info["stage"] = stage
+
     # Use explicit config if provided, otherwise require central config
     if config is None:
         cfg = _get_config_or_raise()
@@ -1181,6 +1189,7 @@ def calc_energy(
         )
         atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in clash_atoms) if clash_atoms else None
         _save_broken_struct(xyz_upd, broken_structs_dir, "clash", atoms_raw1)
+        failed("geometry")
         return broken_energy, False
     
     # catches broken bonds in xyz before ORCA
@@ -1189,6 +1198,7 @@ def calc_energy(
         if not topology_ok:
             atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in bad_bond) if bad_bond else None
             _save_broken_struct(xyz_upd, broken_structs_dir, "topology_broken", atoms_raw1)
+            failed("geometry")
             return cfg.broken_struct_energy, False
 
     if ts_bonds:
@@ -1196,6 +1206,7 @@ def calc_energy(
         if not within_limit:
             atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in exceeded_atoms) if exceeded_atoms else None
             _save_broken_struct(xyz_upd, broken_structs_dir, "ts_bond_exceeded", atoms_raw1)
+            failed("geometry")
             return cfg.broken_struct_energy, False
 
     if ik_loss is not None:
@@ -1204,6 +1215,7 @@ def calc_energy(
             logger.warning("Ring has opened in candidate — skipping ORCA")
             atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in opened_atoms) if opened_atoms else None
             _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open", atoms_raw1)
+            failed("geometry")
             return cfg.broken_struct_energy, False
 
     opt_status = True
@@ -1239,7 +1251,14 @@ def calc_energy(
         ts_bond_targets=ts_bond_targets,
         constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
     )
-    start_calc(inp_name)
+    try:
+        start_calc(inp_name)
+    except RuntimeError:
+        # sbatch -W reports a non-zero job exit code (ORCA abort, SCF failure, time limit)
+        logger.exception("ORCA job for %s failed", inp_name)
+        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
+        failed("orca")
+        return cfg.broken_struct_energy, False
     
     res, opt_status, n_cycles = find_energy_in_log(out_name)
     
@@ -1252,6 +1271,7 @@ def calc_energy(
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
         _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
+        failed("orca")
     else:
         _save_successful_out(out_name, constrained_opt, success_out_dir)
     return res, opt_status
@@ -1349,36 +1369,35 @@ def parse_points_from_trj(
 
     points, obs, _ = list(zip(*result[1:]))
 
-    num_of_clusters = min(3, len(points))
-    logger.debug("Num of clusters: %s", num_of_clusters)
+    # Cluster in [cos, sin] of every dihedral so that angles near 0 and 2*pi are close;
+    # TS-bond lengths (if any) are appended as they are (A, comparable scale).
+    n_dih = len(dihedrals)
+    pts = np.asarray(points, dtype=float).reshape(len(points), -1)
+    features = np.hstack([np.cos(pts[:, :n_dih]), np.sin(pts[:, :n_dih]), pts[:, n_dih:]])
 
-    vals = {cluster_id : (1e9, -1) for cluster_id in range(num_of_clusters)}
+    # Never ask for more clusters than there are distinct frames: KMeans would leave a cluster empty
+    n_distinct = len(np.unique(np.round(features, 8), axis=0))
+    num_of_clusters = min(3, n_distinct)
+    logger.debug("Num of clusters: %s (distinct frames: %s)", num_of_clusters, n_distinct)
 
-    model = KMeans(n_clusters=num_of_clusters)
-    model.fit(points)
-    
-    for i in range(len(points)):
-        cluster = model.predict([points[i]])[0]
-        #print(cluster)
-        if vals[cluster][0] > obs[i]:
-            vals[cluster] = obs[i], i
-    
+    model = KMeans(n_clusters=num_of_clusters, n_init=10, random_state=0)
+    labels = model.fit_predict(features)
+
+    # Lowest-energy frame of every non-empty cluster, in frame order
+    best = {}
+    for i, label in enumerate(labels):
+        if label not in best or obs[i] < obs[best[label]]:
+            best[label] = i
+    chosen = sorted(best.values())
+
     logger.debug("PARSING POINTS, CLUSTER NUM = %s", num_of_clusters)
     if save_structs:
         logger.info("SAVING STRUCTS")
-        cur_id = run_state.peek_structure_id()
-        logger.info("Saving first struct from trj. Current structure number: %s", cur_id)
-        with open(os.path.join(structures_path, str(cur_id) + ".xyz"), "w") as file:
-            file.write(structures[0])
-        logger.info("saved")
-        run_state.increase_structure_id()
-
-        for cluster_id in vals:
+        for frame_idx in [0] + [i + 1 for i in chosen]:  # +1: points were parsed from result[1:]
             cur_id = run_state.peek_structure_id()
             logger.info("saving struct number %s", cur_id)
             with open(os.path.join(structures_path, str(cur_id) + ".xyz"), "w") as file:
-                file.write(structures[vals[cluster_id][1] + 1]) # because points parsed from result[1:]
-            logger.info("saved")
+                file.write(structures[frame_idx])
             run_state.increase_structure_id()
    
     minima_node = {
@@ -1388,10 +1407,7 @@ def parse_points_from_trj(
     }
 
     return (
-        [result[0]] + [
-            (points[vals[cluster_id][1]], vals[cluster_id][0], result[vals[cluster_id][1] + 1][2])
-            for cluster_id in vals
-        ],
+        [result[0]] + [(points[i], obs[i], result[i + 1][2]) for i in chosen],
         minima_node
     )
 

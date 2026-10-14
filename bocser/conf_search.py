@@ -429,6 +429,8 @@ class ConfSearchRunner:
             skipped_structure_id = increase_structure_id()
             logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
             return en + np.random.randn()
+        preopt_en = en
+        full_opt_failure = {}
         try:
             logger.info("Optimized! Loading xyz from preopt")
             xyz_from_constrained = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
@@ -448,6 +450,7 @@ class ConfSearchRunner:
                 fixed_dihedrals=self.state.fixed_dihedrals,
                 extra_constraints=self.state.extra_constraints,
                 ts_bond_targets=None,  # TS-bond lengths are free in the final Opt/OptTS
+                failure_info=full_opt_failure,
             )
         except Exception:
             # e.g. sbatch -W reports a non-zero ORCA exit code: lose this point, not the whole run
@@ -461,6 +464,14 @@ class ConfSearchRunner:
         if not opt_status:
             skipped_structure_id = increase_structure_id()
             logger.error("Opt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
+            if self.state.config.use_preopt_energy_on_opt_failure and full_opt_failure.get("stage") == "orca":
+                # The pre-opt energy at this point is a valid observation (it is what the first
+                # trajectory frame gives on success); only a rejected geometry is not.
+                logger.warning(
+                    "Full optimization failed in ORCA — using the pre-optimization energy %.3f kcal/mol "
+                    "for this point instead of broken_struct_energy.", preopt_en,
+                )
+                return preopt_en
 
         return en + ((not opt_status) * np.random.randn())
 
