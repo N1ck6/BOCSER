@@ -52,18 +52,6 @@ _VDW_RADII_DEFAULT = 1.70
 _RING_BOND_COV_FACTOR = 1.15
 
 
-def _clash_threshold(sym_a: str, sym_b: str) -> float:
-    """Minimum allowed distance between two atoms before they are considered clashing."""
-    cfg = config_manager.get_config()
-    scale = cfg.clash_vdw_scale if cfg is not None else 0.0
-
-    if scale <= 0.0:
-        return 0.7  # legacy behaviour, unchanged default
-
-    ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
-    rb = _VDW_RADII.get(sym_b, _VDW_RADII_DEFAULT)
-    return scale * (ra + rb)
-
 def _bond_break_threshold(sym_a: str, sym_b: str, delta: float = 0.1) -> float:
     """Maximum allowed distance for a ring bond before it is considered broken."""
     ra = _VDW_RADII.get(sym_a, _VDW_RADII_DEFAULT)
@@ -186,13 +174,52 @@ def _check_bond_topology_intact(
 
     return True, None
 
-def _set_atom_distance(conf, i: int, j: int, target_length: float) -> None:
-    """Move atom j along the line from atom i to atom j so that the distance
-    between them equals target_length. 
-    This function works for any pair of atom indices, bonded or not, since it is
+def _side_of_bond(mol, start: int, blocked: int, skip_edge: tuple) -> set:
+    """Atoms reachable from `start` without visiting `blocked` and without crossing `skip_edge`."""
+    skip = frozenset(skip_edge)
+    seen = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        for nbr in mol.GetAtomWithIdx(cur).GetNeighbors():
+            n = nbr.GetIdx()
+            if n == blocked or n in seen or frozenset((cur, n)) == skip:
+                continue
+            seen.add(n)
+            stack.append(n)
+    return seen
+
+
+def _atoms_moving_with(mol, i: int, j: int) -> set:
+    """Atoms that move rigidly with j when the i-j distance is changed.
+
+    - i-j separates the molecule: the whole fragment on j's side.
+    - i-j closes a ring (or i, j are linked another way): j plus its side branches
+      (H atoms, substituents) that do not lead back to i, so j keeps its own bonds.
+    """
+    fragment = _side_of_bond(mol, j, blocked=-1, skip_edge=(i, j))
+    if i not in fragment:
+        return fragment
+    moving = {j}
+    for nbr in mol.GetAtomWithIdx(j).GetNeighbors():
+        n = nbr.GetIdx()
+        if n == i:
+            continue
+        branch = _side_of_bond(mol, n, blocked=j, skip_edge=(j, n))
+        if i not in branch:
+            moving |= branch
+    return moving
+
+
+def _set_atom_distance(mol, i: int, j: int, target_length: float) -> None:
+    """Move atom j (together with the atoms that hang on it, see _atoms_moving_with)
+    along the line from atom i to atom j so that the distance between i and j equals
+    target_length. Moving only j used to stretch every other bond of j.
+    This works for any pair of atom indices, bonded or not, since it is
     only a starting guess; the precise geometry is established
     afterwards by ORCA's own constrained optimization.
     """
+    conf = mol.GetConformer()
     pi = conf.GetAtomPosition(i)
     pj = conf.GetAtomPosition(j)
     vec = np.array([pj.x - pi.x, pj.y - pi.y, pj.z - pi.z])
@@ -209,7 +236,10 @@ def _set_atom_distance(conf, i: int, j: int, target_length: float) -> None:
         direction = vec / dist
 
     new_pj = np.array([pi.x, pi.y, pi.z]) + direction * target_length
-    conf.SetAtomPosition(j, Point3D(float(new_pj[0]), float(new_pj[1]), float(new_pj[2])))
+    shift = new_pj - np.array([pj.x, pj.y, pj.z])
+    for idx in _atoms_moving_with(mol, i, j):
+        p = conf.GetAtomPosition(idx)
+        conf.SetAtomPosition(idx, Point3D(p.x + float(shift[0]), p.y + float(shift[1]), p.z + float(shift[2])))
 
 def _validate_extra_constraints_atoms(config: ConfSearchConfig) -> None:
     if not config.extra_constraints:
@@ -368,14 +398,13 @@ def change_dihedrals(mol_file_name: str,
         _af = _cfg.acquisition_function
 
         if _af != 'ik':
-            for cycle in dihedrals:
-                for atoms, degree in cycle:
-                    rdMolTransforms.SetDihedralRad(mol.GetConformer(), *atoms, degree)
+            for atoms, degree in dihedrals:
+                rdMolTransforms.SetDihedralRad(mol.GetConformer(), *atoms, degree)
 
             # TS-bond-length starting guess applied after dihedral rotations:
             # Applying the guess last means nothing nhere disturbs it afterwards.
             for (a, b), target_len in (ts_bond_targets or []):
-                _set_atom_distance(mol.GetConformer(), a, b, float(target_len))
+                _set_atom_distance(mol, a, b, float(target_len))
 
         else:
             tmp_mol = Chem.RWMol(mol)
@@ -398,7 +427,7 @@ def change_dihedrals(mol_file_name: str,
             # constraint (BO-requested target), applied directly to tmp_mol
             # so the FF stage doesn't fight against the guess
             for (a, b), target_len in (ts_bond_targets or []):
-                _set_atom_distance(tmp_mol.GetConformer(), a, b, float(target_len))
+                _set_atom_distance(tmp_mol, a, b, float(target_len))
                 ff.MMFFAddDistanceConstraint(a, b, False, float(target_len), float(target_len), 1e2)
 
             for va_dict in ik_valence_angles:
@@ -813,10 +842,14 @@ def _save_successful_out(out_name: str, constrained_opt: bool, success_out_dir: 
 def check_is_broken(
     xyz_block: str,
     len_threshold: float | None = None,
+    excluded_pairs=None,
 ) -> tuple[bool, Union[tuple[int, int], None]]:
     """Return True if any two atoms in xyz_block are unphysically close.
-    When len_threshold is None sum of radii is used instead,
-    which is physically more accurate and avoids false positives for heavy atoms.
+    len_threshold: one global minimal distance for every pair. When it is None,
+    clash_vdw_scale from the config decides: <= 0 -> legacy fixed 0.7 A,
+    > 0 -> clash_vdw_scale * (vdW radius A + vdW radius B).
+    excluded_pairs: atom pairs (0-idx) not checked, e.g. bonded (1-2) and 1-3 pairs,
+    which are always closer than the vdW sum.
     """
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
 
@@ -833,22 +866,47 @@ def check_is_broken(
         symbols.append(parts[0])
         coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
 
-    coord_matrix = np.array(coords)
-    n = coord_matrix.shape[0]
+    if not coords:
+        raise ValueError("check_is_broken: xyz block contains no atoms")
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.linalg.norm(coord_matrix[i] - coord_matrix[j])
-            # Legacy behaviour: single global threshold
-            threshold = len_threshold if len_threshold is not None else _clash_threshold(symbols[i], symbols[j])
-            if dist <= threshold:
-                logger.warning(
-                    "Clash detected: atoms %d(%s) and %d(%s) distance=%.3f A "
-                    "<= threshold=%.3f A",
-                    i, symbols[i], j, symbols[j], dist, threshold
-                )
-                return True, (i, j)
-    return False, None
+    coord_matrix = np.array(coords, dtype=float)
+    n = coord_matrix.shape[0]
+    dist = np.linalg.norm(coord_matrix[:, None, :] - coord_matrix[None, :, :], axis=-1)
+
+    if len_threshold is not None:
+        threshold = np.full((n, n), float(len_threshold))
+    else:
+        cfg = config_manager.get_config()
+        scale = cfg.clash_vdw_scale if cfg is not None else 0.0
+        if scale <= 0.0:
+            threshold = np.full((n, n), 0.7)  # legacy behaviour, unchanged default
+        else:
+            radii = np.array([_VDW_RADII.get(s, _VDW_RADII_DEFAULT) for s in symbols])
+            threshold = scale * (radii[:, None] + radii[None, :])
+
+    clash = np.triu(dist <= threshold, k=1)
+    for a, b in (excluded_pairs or ()):
+        if a < n and b < n and a != b:
+            clash[min(a, b), max(a, b)] = False
+
+    hits = np.argwhere(clash)
+    if len(hits) == 0:
+        return False, None
+    i, j = int(hits[0][0]), int(hits[0][1])  # same pair the old i<j loop reported first
+    logger.warning(
+        "Clash detected: atoms %d(%s) and %d(%s) distance=%.3f A "
+        "<= threshold=%.3f A",
+        i, symbols[i], j, symbols[j], dist[i, j], threshold[i, j]
+    )
+    return True, (i, j)
+
+
+@lru_cache(maxsize=8)
+def _bonded_and_13_pairs(mol_file_name: str) -> frozenset:
+    """Canonical (with-H) atom pairs 1 or 2 bonds apart in the molecular graph."""
+    dm = Chem.GetDistanceMatrix(build_reference_with_h_mol(mol_file_name))
+    close = np.argwhere((dm > 0) & (dm <= 2))
+    return frozenset((int(a), int(b)) for a, b in close if a < b)
 
 def _check_rings_intact(
     xyz_block: str,
@@ -996,7 +1054,11 @@ def calc_energy(
     
     logger.debug("dihedrals after: %s", dihedrals)
 
-    broken, clash_atoms = check_is_broken(xyz_upd)
+    clash_excluded = None
+    if cfg.clash_vdw_scale > 0:
+        # vdW-based thresholds only make sense for non-bonded contacts
+        clash_excluded = set(_bonded_and_13_pairs(mol_file_name)) | {tuple(sorted(p)) for p in (ts_bonds or [])}
+    broken, clash_atoms = check_is_broken(xyz_upd, excluded_pairs=clash_excluded)
     if broken:
         broken_energy = cfg.broken_struct_energy
         logger.warning(
@@ -1041,7 +1103,15 @@ def calc_energy(
         except Exception:
             # fallback to remove via shell
             subprocess.run(["rm", "-f", out_name])
-    
+
+    # Pre-opt, full opt and every step share one basename: drop the previous trajectory so
+    # the frames parsed after this run can only come from this run
+    trj_name = Path(inp_name).with_name(Path(inp_name).stem + "_trj.xyz")
+    try:
+        trj_name.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not delete old trajectory %s", trj_name)
+
     generate_oinp(
         xyz_upd,
         dihedrals,
