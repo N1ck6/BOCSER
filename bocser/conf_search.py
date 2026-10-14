@@ -45,6 +45,7 @@ from calc import (
     _qc_calcs_dir,
     _check_rings_intact,
     raw1_to_with_h_canonical,
+    with_h_canonical_to_raw1,
     raw1_to_heavy_canonical,
     _heavy_and_h_order,
     HARTRI_TO_KCAL,
@@ -57,6 +58,7 @@ from calc import (
 from run_state import increase_structure_id
 import run_state
 import config_manager
+from config_loader import ConfigError
 from coef_calc import (
     CoefCalculator,
     log_and_combine_double_bonds,
@@ -165,6 +167,7 @@ class ConfSearchState:
     config: Optional[ConfSearchConfig] = None
     extra_constraints: list = field(default_factory=list)
     vary_ts_bond_lengths: bool = False
+    fixed_ts_bond_targets: list = field(default_factory=list)  # [((a, b), length)], pre-opt only
     _dihedral_ids_finalized: bool = False
 
 
@@ -387,8 +390,14 @@ class ConfSearchRunner:
         # Pre-opt
         n_dih = len(self.state.dihedral_ids)
         dihedral_vals = dihedrals[:n_dih]
-        ts_bond_vals = dihedrals[n_dih:] if self.state.vary_ts_bond_lengths else []
-        ts_bond_targets = list(zip(self.state.ts_bonds, ts_bond_vals)) if self.state.vary_ts_bond_lengths else None
+        # TS-bond lengths held in the pre-optimization only: sampled by BO, or fixed
+        # (user values / lowest-energy ensemble conformer, see _resolve_fixed_ts_bond_targets)
+        if self.state.vary_ts_bond_lengths:
+            ts_bond_targets = list(zip(self.state.ts_bonds, dihedrals[n_dih:]))
+        elif self.state.fixed_ts_bond_targets:
+            ts_bond_targets = list(self.state.fixed_ts_bond_targets)
+        else:
+            ts_bond_targets = None
 
         logger.info("Optimizing constrained struct")
         try:
@@ -438,7 +447,7 @@ class ConfSearchRunner:
                 ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals,
                 extra_constraints=self.state.extra_constraints,
-                ts_bond_targets=ts_bond_targets,
+                ts_bond_targets=None,  # TS-bond lengths are free in the final Opt/OptTS
             )
         except Exception:
             # e.g. sbatch -W reports a non-zero ORCA exit code: lose this point, not the whole run
@@ -489,16 +498,31 @@ class ConfSearchRunner:
         return tf.constant([dihedral_vals + ts_bond_vals], dtype=tf.float64)
 
     def _upd_dataset_from_trj(self, trj_filename: str, dataset: Optional[Dataset]) -> Dataset:
-        """Update dataset by parsing trajectory file."""
+        """Update the GP dataset with observations from an ORCA trajectory.
+
+        Default: first frame + cluster representatives. With augment_gp_from_orca_trj,
+        more frames are kept but thinned in BO coordinates (consecutive optimization
+        steps are strongly correlated, not independent observations).
+        """
         logger.debug("Input dataset is: %s", dataset)
+        cfg = self.state.config
+        augment = bool(cfg.augment_gp_from_orca_trj)
+        # Points must have the same dimensions as the search space (TS-bond lengths too)
+        ts_pairs = self.state.ts_bonds if self.state.vary_ts_bond_lengths else []
         parsed_data, last_point = parse_points_from_trj(
             trj_file_name=trj_filename,
             dihedrals=self.state.dihedral_ids,
             norm_en=self.state.norm_energy,
-            save_structs=True,
+            save_structs=not augment,
             structures_path=self.state.structures_path,
             return_minima=True,
+            extra_distance_pairs=ts_pairs,
+            distance_bounds=(cfg.ts_bond_min_length, cfg.ts_bond_max_length),
+            return_all_frames=augment,
         )
+        if augment:
+            parsed_data = self._select_trj_training_frames(parsed_data)
+            self._save_structures([xyz for _, _, xyz in parsed_data])
         # Filter out frames where rings opened during ORCA optimization
         valid_degrees, valid_energies = [], []
         for coords, energy, xyz_block in parsed_data:
@@ -550,6 +574,49 @@ class ConfSearchRunner:
         )
 
         return add_part if not dataset else dataset + add_part
+
+    def _save_structures(self, xyz_blocks: list) -> None:
+        """Save trajectory frames used for the GP as {exp_name}/<structure id>.xyz."""
+        for xyz in xyz_blocks:
+            path = Path(self.state.structures_path) / f"{run_state.peek_structure_id()}.xyz"
+            path.write_text(xyz)
+            increase_structure_id()
+
+    def _select_trj_training_frames(self, parsed_data: list) -> list:
+        """Pick informative frames of one ORCA trajectory for the GP (augment_gp_from_orca_trj).
+
+        Always keeps the first and the last frame; then greedily adds the frame farthest
+        (in BO coordinates) from the frames already chosen, among frames within
+        orca_trj_energy_window of the trajectory minimum, until orca_trj_max_gp_points
+        or until the farthest one is closer than orca_trj_min_dihedral_separation.
+        """
+        cfg = self.state.config
+        indexed = [(i, x) for i, x in enumerate(parsed_data) if np.isfinite(x[1])]
+        if len(indexed) <= 2:
+            return [x for _, x in indexed]
+
+        n_dih = len(self.state.dihedral_ids)
+        ts_scale = max(float(cfg.ts_bond_kernel_lengthscale), 1e-6)
+
+        def distance(a, b):
+            a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+            delta = np.abs(a[:n_dih] - b[:n_dih])
+            delta = np.minimum(delta, 2.0 * np.pi - delta)
+            d2 = float(np.sum(delta ** 2)) + float(np.sum(((a[n_dih:] - b[n_dih:]) / ts_scale) ** 2))
+            return float(np.sqrt(d2))
+
+        selected = [indexed[0], indexed[-1]]
+        e_min = min(x[1] for _, x in indexed)
+        candidates = [(i, x) for i, x in indexed[1:-1] if x[1] <= e_min + cfg.orca_trj_energy_window]
+        while candidates and len(selected) < cfg.orca_trj_max_gp_points:
+            gaps = [min(distance(x[0], s[0]) for _, s in selected) for _, x in candidates]
+            best = int(np.argmax(gaps))
+            if gaps[best] < cfg.orca_trj_min_dihedral_separation:
+                break  # every remaining frame is a near-duplicate of a chosen one
+            selected.append(candidates.pop(best))
+        keep = {i for i, _ in selected}
+        logger.info("Trajectory augmentation: %d of %d frames used for the GP", len(keep), len(parsed_data))
+        return [x for i, x in indexed if i in keep]
 
     def _erase_last_from_dataset(self, dataset: Dataset, n: int = 1) -> Dataset:
         """Remove last n points from dataset."""
@@ -647,6 +714,9 @@ class ConfSearchRunner:
         ]
         if self.state.ts_bonds:
             logger.info("TS-связи (config 1-idx -> canonical 0-idx): %s -> %s", config.ts_bonds, self.state.ts_bonds)
+
+        # Must run before vary_ts_bond_lengths is read below (it may be switched off here)
+        self.state.fixed_ts_bond_targets = self._resolve_fixed_ts_bond_targets(config)
 
         logger.info("Coef calculator creating")
 
@@ -1730,7 +1800,7 @@ class ConfSearchRunner:
         dbscan_labels = DBSCAN(
             eps=np.pi / 12,
             min_pts=1,
-        ).fit_predict(np.asarray([cur[0] for cur in self.state.minima]))
+        ).fit_predict(np.asarray([cur[0][:len(self.state.dihedral_ids)] for cur in self.state.minima]))  # angles only, not TS lengths
 
         res = {int(label): (1e9, -1) for label in np.unique(dbscan_labels)}
 
@@ -1786,7 +1856,7 @@ class ConfSearchRunner:
             return str(in_cwd.resolve())
         return str(in_folder)
 
-    def _make_ensemble_processor(self) -> EnsembleProcessor:
+    def _make_ensemble_processor(self, dihedral_idxs: Optional[list] = None) -> EnsembleProcessor:
         """EnsembleProcessor with atom-order check against the .mol and, when TS-bond
         lengths are searched, the TS-bond dimensions of the search vector."""
         raw_mol = Chem.MolFromMolFile(self.state.mol_file_name, removeHs=False)
@@ -1800,11 +1870,75 @@ class ConfSearchRunner:
             )
         return EnsembleProcessor(
             self._resolve_ensemble_path(),
-            dihedral_idxs=self.state.dihedral_ids,
+            dihedral_idxs=self.state.dihedral_ids if dihedral_idxs is None else dihedral_idxs,
             ref_symbols=[raw_mol.GetAtomWithIdx(i).GetSymbol() for i in raw_order],
             raw_order=raw_order,
             **ts_kwargs,
         )
+
+    def _resolve_fixed_ts_bond_targets(self, config: ConfSearchConfig) -> list:
+        """Fixed TS-bond lengths, held ONLY in the ORCA pre-optimization (ts: true only).
+
+        Two sources:
+          - user input: `bond` entries of extra_constraints on a ts_bonds pair
+            (value: number or "current" = length in the .mol);
+          - infer_ts_bond_lengths_from_ensemble: lengths in the lowest-energy conformer of
+            load_ensemble (overrides user values).
+        Such TS-pair bond entries are taken out of the hard constraints, which are applied
+        in every ORCA stage, so the final OptTS can move along the reaction coordinate.
+        Returns [((a, b), length)] with canonical 0-idx atoms.
+        """
+        if not config.ts:
+            if config.infer_ts_bond_lengths_from_ensemble:
+                logger.warning("infer_ts_bond_lengths_from_ensemble is ignored: ts is false.")
+            return []
+
+        ts_pairs = {frozenset(p) for p in self.state.ts_bonds}
+        lengths, kept = {}, []
+        for c in self.state.extra_constraints:
+            if c.type == "bond" and frozenset(c.atoms) in ts_pairs:
+                lengths[frozenset(c.atoms)] = float(c.value)
+            else:
+                kept.append(c)
+        self.state.extra_constraints = kept
+        source = "extra_constraints (pre-opt only)"
+
+        if config.infer_ts_bond_lengths_from_ensemble:
+            if not config.load_ensemble or not self.state.ts_bonds:
+                raise ConfigError("infer_ts_bond_lengths_from_ensemble: true needs both load_ensemble and ts_bonds.")
+            ep = self._make_ensemble_processor(dihedral_idxs=[])
+            if not ep.energies:
+                raise RuntimeError(f"load_ensemble {self._resolve_ensemble_path()}: no conformers found.")
+            best = int(np.argmin(ep.energies))
+            coords = np.asarray(ep.coords[best], dtype=float)
+            if max(max(p) for p in self.state.ts_bonds) >= len(coords):
+                raise ConfigError("load_ensemble has fewer atoms than the .mol (no H?): TS-bond lengths can't be measured.")
+            if lengths:
+                logger.warning("TS-bond values from extra_constraints are replaced by the ensemble values.")
+            lengths = {frozenset((a, b)): float(np.linalg.norm(coords[a] - coords[b])) for a, b in self.state.ts_bonds}
+            source = f"lowest-energy ensemble conformer #{best + 1}/{len(ep.energies)} (E={ep.energies[best]:.6f})"
+
+        targets = [((a, b), lengths[frozenset((a, b))]) for a, b in self.state.ts_bonds if frozenset((a, b)) in lengths]
+        if not targets:
+            return []
+
+        for (a, b), length in targets:
+            if not 0.0 < length <= config.ts_bond_max_length:
+                raise ConfigError(
+                    f"Fixed TS-bond length {length:.3f} A for atoms "
+                    f"({with_h_canonical_to_raw1(a, self.state.mol_file_name)}, "
+                    f"{with_h_canonical_to_raw1(b, self.state.mol_file_name)}) is outside "
+                    f"(0, ts_bond_max_length={config.ts_bond_max_length}]: every point would be rejected."
+                )
+            logger.info(
+                "Fixed TS bond (%d, %d) [1-idx .mol] = %.4f A from %s",
+                with_h_canonical_to_raw1(a, self.state.mol_file_name),
+                with_h_canonical_to_raw1(b, self.state.mol_file_name), length, source,
+            )
+        if config.vary_ts_bond_lengths:
+            logger.warning("vary_ts_bond_lengths switched off: TS-bond lengths are fixed (%s).", source)
+            config.vary_ts_bond_lengths = False
+        return targets
 
 
 def main():

@@ -40,6 +40,7 @@ class EnsembleProcessor:
         """
         self.processed_ens = []
         self.energies: list[float] = []
+        self.coords: list[list[list[float]]] = []  # per conformer, canonical atom order
         xyz_blocks = []
 
         try:
@@ -63,6 +64,7 @@ class EnsembleProcessor:
             # Keep object in a valid state with empty data so callers can continue.
             self.processed_ens = []
             self.energies = []
+            self.coords = []
             return
 
         for block_idx, xyz_block in enumerate(xyz_blocks):
@@ -94,6 +96,7 @@ class EnsembleProcessor:
                         f"canonical (heavy atoms first) nor the original .mol order."
                     )
 
+            self.coords.append(coords)
             dihedrals = []
             for i, j, k, l in dihedral_idxs:
                 dihedrals.append(

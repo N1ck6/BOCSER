@@ -26,7 +26,7 @@ class ConfSearchConfig:
     max_steps : int = 50
     exp_name : str = "cs"
     load_ensemble : Union[str, None] = None
-    acquisition_function : str = "iv"
+    acquisition_function : str = "evm"  # ei | evm | ik
     ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
     ts_bond_max_length: float = 5.0
     vary_ts_bond_lengths: bool = True
@@ -44,6 +44,25 @@ class ConfSearchConfig:
     tf_eager_mode: bool = False # Управляет tf.config.run_functions_eagerly() - отладка shape-ошибок, замедление расчетов acquisition
     bond_stretch_factor: float = 1.4  # порог для _check_bond_topology_intact
     preopt_max_iter: int = 100
+
+    # TS only (ts: true). Fixed TS-bond lengths are held in the ORCA pre-optimization only,
+    # never in the final OptTS. Sources: bond entries of extra_constraints on a ts_bonds pair,
+    # or (when True) the lengths in the lowest-energy conformer of load_ensemble.
+    infer_ts_bond_lengths_from_ensemble: bool = False
+
+    # Also freeze the BO dihedrals in the final Opt/OptTS (they are always frozen in the pre-opt).
+    # The result is then a constrained structure, not a free stationary point.
+    constrain_bo_dihedrals_in_final_opt: bool = False
+
+    # Optional MMFF94 clean-up of each candidate before the ORCA pre-optimization.
+    use_mmff_regularization: bool = False
+    mmff_max_iter: int = 1000
+
+    # Optional: feed more frames of each ORCA trajectory into the GP (thinned in BO coordinates).
+    augment_gp_from_orca_trj: bool = False
+    orca_trj_max_gp_points: int = 12
+    orca_trj_min_dihedral_separation: float = 0.10  # radians
+    orca_trj_energy_window: float = 15.0  # kcal/mol above the trajectory minimum
 
     def __post_init__(self):
         # Форматировать в список кортежей двойных связей
@@ -74,6 +93,13 @@ class ConfSearchConfig:
                 f"ts_bond_scan_min_steps ({self.ts_bond_scan_min_steps}) must be "
                 f"<= ts_bond_scan_max_steps ({self.ts_bond_scan_max_steps})."
             )
+
+        if self.mmff_max_iter < 1:
+            raise ValueError(f"mmff_max_iter ({self.mmff_max_iter}) must be >= 1.")
+        if self.orca_trj_max_gp_points < 2:
+            raise ValueError("orca_trj_max_gp_points must be >= 2 (first and last trajectory frames are always kept).")
+        if self.orca_trj_min_dihedral_separation < 0 or self.orca_trj_energy_window < 0:
+            raise ValueError("orca_trj_min_dihedral_separation and orca_trj_energy_window must be >= 0.")
 
         normalized = []
         for i, raw in enumerate(self.extra_constraints):

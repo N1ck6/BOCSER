@@ -65,7 +65,7 @@ dihedral = tuple[list[int], float]
 class Constraint(NamedTuple):
     type: str      # "bond" | "angle" | "dihedral"
     atoms: tuple   # canonical 0-idx (with-H)
-    value: float   # angle/dihedral, A for bond
+    value: Union[float, None]   # deg for angle/dihedral, A for bond; None = freeze the current value in ORCA
 
 def _get_config_or_raise() -> ConfSearchConfig:
     """Return the runtime config or raise RuntimeError if it's not set.
@@ -517,10 +517,16 @@ def generate_oinp(
         multipl : int,
         constrained_opt : bool = False,
         hard_constraints: list = None,
-        ts_bond_targets: list = None, # BO-sampled targets
+        ts_bond_targets: list = None, # BO-sampled or fixed TS-bond lengths; pre-opt only
+        constrain_bo_dihedrals: bool = False, # also freeze BO dihedrals in the final (unconstrained) opt
     ) -> None:
     """
         generates orca .inp file
+
+        Dihedral constraints whose value is None are written without a value:
+        ORCA then freezes the value present in the input geometry ("current").
+        Bond constraints (TS-bond targets, user bonds) keep explicit values, so ORCA
+        corrects the small deviations left by the MMFF stage.
     """
     # Require runtime config to be set; config provides TS flag
     cfg = _get_config_or_raise()
@@ -554,16 +560,19 @@ def generate_oinp(
                     hard_bond_pairs.add(frozenset(c.atoms))
                 all_constraints.append(c)
 
-            if constrained_opt:
-                dihedrals_deg = to_degrees(dihedrals)
-                for atoms, value in dihedrals_deg:
+            if constrained_opt or constrain_bo_dihedrals:
+                # The geometry was already built at the BO dihedrals (and the MMFF branch reads
+                # the values back), so freezing the current value is exact and sign-independent
+                for atoms, _ in dihedrals:
                     axis = frozenset((atoms[1], atoms[2]))
                     if axis in hard_by_axis:
                         logger.info("BO-target for axis %s was skipped in .inp: fixed with %s=%s.",
                                     tuple(axis), hard_by_axis[axis].type, hard_by_axis[axis].value)
                         continue
-                    all_constraints.append(Constraint("dihedral", tuple(atoms), value))
+                    all_constraints.append(Constraint("dihedral", tuple(atoms), None))
 
+            if constrained_opt:
+                # TS-bond lengths are held only during the pre-optimization
                 for atoms, value in (ts_bond_targets or []):
                     pair = frozenset(atoms)
                     if pair in hard_bond_pairs:
@@ -584,7 +593,8 @@ def generate_oinp(
                     for c in all_constraints:
                         letter = _CONSTRAINT_LETTER[c.type]
                         atoms_str = " ".join(str(a) for a in c.atoms)
-                        tmp.write("{ " + letter + " " + atoms_str + " " + str(c.value) + " C }\n")
+                        value_str = "" if c.value is None else " " + str(c.value)
+                        tmp.write("{ " + letter + " " + atoms_str + value_str + " C }\n")
                     tmp.write("end\n")
                 if cfg.ts and not constrained_opt:
                     max_iter = cfg.ts_max_iter * 2
@@ -997,6 +1007,94 @@ def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) ->
             return False, (a, b)
     return True, None
 
+def _mmff_regularize_xyz(
+    xyz_block: str,
+    mol_file_name: str,
+    dihedrals=None,
+    ts_bonds=None,
+    fixed_dihedrals=None,
+    extra_constraints=None,
+    ts_bond_targets=None,
+    max_its: int = 1000,
+) -> str:
+    """Relax a candidate geometry with MMFF94 before the ORCA pre-optimization,
+    holding everything that defines the BO point.
+
+    Held (zero-width windows, i.e. harmonic around the target — a [t - tol, t + tol]
+    window is flat inside, so the minimizer leaves the value at a window edge):
+      - BO and fixed dihedrals at their CURRENT values (the geometry was built at them;
+        no sign convention involved);
+      - TS bonds at the requested length (ts_bond_targets) or at the current one;
+      - bonds and valence angles around TS atoms at current values, so MMFF can't absorb
+        a stretched TS distance by distorting the scaffold;
+      - extra_constraints: bonds/angles at their configured values, dihedrals at current values.
+    ORCA re-imposes the exact bond values afterwards; dihedrals are frozen there as "current".
+    """
+    lines = [line for line in xyz_block.strip().split("\n") if line.strip()]
+    if lines and lines[0].strip().lstrip("-").isdigit():
+        lines = lines[2:]
+    reg_mol = build_reference_with_h_mol(mol_file_name)
+    conf = reg_mol.GetConformer()
+    if len(lines) != reg_mol.GetNumAtoms():
+        raise ValueError(f"MMFF regularization expected {reg_mol.GetNumAtoms()} atoms, got {len(lines)} lines.")
+    for idx, line in enumerate(lines):
+        x, y, z = map(float, line.split()[1:4])
+        conf.SetAtomPosition(idx, Point3D(x, y, z))
+
+    props = AllChem.MMFFGetMoleculeProperties(reg_mol, mmffVariant="MMFF94")
+    if props is None:
+        logger.warning("MMFF94 has no parameters for %s; skipping regularization.", mol_file_name)
+        return xyz_block
+    ff = AllChem.MMFFGetMoleculeForceField(reg_mol, props)
+
+    bond_k, angle_k, torsion_k = 1e4, 1e3, 1e3
+
+    def hold_bond(a, b, value):
+        ff.MMFFAddDistanceConstraint(a, b, False, value, value, bond_k)
+
+    def hold_torsion_current(a, b, c, d):
+        cur = rdMolTransforms.GetDihedralDeg(conf, a, b, c, d)
+        ff.MMFFAddTorsionConstraint(a, b, c, d, False, cur, cur, torsion_k)
+
+    held_bonds = set()
+    targets = {frozenset(atoms): float(length) for atoms, length in (ts_bond_targets or [])}
+    ts_atoms = set()
+    for a, b in (ts_bonds or []):
+        ts_atoms.update((a, b))
+        pair = frozenset((a, b))
+        hold_bond(a, b, targets.get(pair, rdMolTransforms.GetBondLength(conf, a, b)))
+        held_bonds.add(pair)
+
+    for center in ts_atoms:
+        nbrs = [n.GetIdx() for n in reg_mol.GetAtomWithIdx(center).GetNeighbors()]
+        for n in nbrs:
+            pair = frozenset((center, n))
+            if pair not in held_bonds:
+                hold_bond(center, n, rdMolTransforms.GetBondLength(conf, center, n))
+                held_bonds.add(pair)
+        for i, na in enumerate(nbrs):
+            for nb in nbrs[i + 1:]:
+                ang = rdMolTransforms.GetAngleDeg(conf, na, center, nb)
+                ff.MMFFAddAngleConstraint(na, center, nb, False, ang, ang, angle_k)
+
+    for atoms, _ in list(dihedrals or []) + list(fixed_dihedrals or []):
+        hold_torsion_current(*atoms)
+
+    for c in (extra_constraints or []):
+        if c.type == "bond" and frozenset(c.atoms) not in held_bonds:
+            hold_bond(*c.atoms, float(c.value))
+        elif c.type == "angle":
+            ff.MMFFAddAngleConstraint(*c.atoms, False, float(c.value), float(c.value), angle_k)
+        elif c.type == "dihedral":
+            hold_torsion_current(*c.atoms)
+
+    status = ff.Minimize(maxIts=max_its)
+    if status != 0:
+        logger.warning("MMFF94 regularization did not converge in %d iterations; using the last geometry.", max_its)
+    logger.info("MMFF94 regularization applied before the ORCA pre-optimization")
+    return "\n".join(Chem.MolToXYZBlock(reg_mol).split("\n")[2:])
+
+
 def calc_energy(
         mol_file_name: str,
         dihedrals: list[dihedral] = [],
@@ -1030,8 +1128,9 @@ def calc_energy(
     xyz_upd = None
 
     hard_constraints = []
-    for atoms, value in (fixed_dihedrals or []):
-        hard_constraints.append(Constraint("dihedral", tuple(atoms), round(np.rad2deg(value), 6)))
+    for atoms, _ in (fixed_dihedrals or []):
+        # The geometry already holds these torsions (input .mol / MMFF stage): freeze the current value
+        hard_constraints.append(Constraint("dihedral", tuple(atoms), None))
     hard_constraints.extend(extra_constraints or [])
     
     logger.debug("dihedrals before: %s", dihedrals)
@@ -1053,6 +1152,21 @@ def calc_energy(
         )
     
     logger.debug("dihedrals after: %s", dihedrals)
+
+    # Optional MMFF94 clean-up of the candidate before the ORCA pre-optimization only
+    if cfg.use_mmff_regularization and xyz_upd is not None and not force_xyz_block:
+        try:
+            xyz_upd = _mmff_regularize_xyz(
+                xyz_upd, mol_file_name,
+                dihedrals=dihedrals,
+                ts_bonds=ts_bonds,
+                fixed_dihedrals=fixed_dihedrals,
+                extra_constraints=extra_constraints,
+                ts_bond_targets=ts_bond_targets,
+                max_its=cfg.mmff_max_iter,
+            )
+        except Exception:
+            logger.exception("MMFF94 regularization failed — continuing with the unregularized geometry.")
 
     clash_excluded = None
     if cfg.clash_vdw_scale > 0:
@@ -1123,6 +1237,7 @@ def calc_energy(
         multipl=cfg.spin_multiplicity,
         hard_constraints=hard_constraints,
         ts_bond_targets=ts_bond_targets,
+        constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
     )
     start_calc(inp_name)
     
@@ -1177,13 +1292,19 @@ def parse_points_from_trj(
     dihedrals : list,
     norm_en : float, 
     save_structs : bool = True,
-    structures_path : str = "structs/", 
+    structures_path : str = "structs/",
     return_minima : bool = True,
+    extra_distance_pairs=None,
+    distance_bounds=None,
+    return_all_frames: bool = False,
 ) -> Union[list[tuple[list[dihedral], float]], tuple[list[tuple[list[dihedral], float]], tuple[list[dihedral], float]]]:
     """
         Parse more points from trj orca file
         returns list of description of dihedrals
         for every point
+        extra_distance_pairs: atom pairs whose distances are appended after the dihedrals
+            (TS-bond dimensions when vary_ts_bond_lengths is on), clipped to distance_bounds
+        return_all_frames: return every frame without clustering and without saving structures
     """
 
     logger.debug("Parsing starts with norm_en=%s, save_struct=%s", norm_en, save_structs)
@@ -1191,6 +1312,7 @@ def parse_points_from_trj(
     result = []
 
     structures = []
+    extra_distance_pairs = list(extra_distance_pairs or [])
 
     # use internal counter for structure ids (from run_state)
 
@@ -1208,15 +1330,20 @@ def parse_points_from_trj(
                 c_coord = list(map(float, lines[i * (n + 2) + 2 + c].split()[1:]))
                 d_coord = list(map(float, lines[i * (n + 2) + 2 + d].split()[1:]))    
                 cur_d.append(dihedral_angle(a_coord, b_coord, c_coord, d_coord))
+            for a, b in extra_distance_pairs:
+                a_coord = np.asarray(list(map(float, lines[i * (n + 2) + 2 + a].split()[1:4])))
+                b_coord = np.asarray(list(map(float, lines[i * (n + 2) + 2 + b].split()[1:4])))
+                length = float(np.linalg.norm(a_coord - b_coord))
+                cur_d.append(float(np.clip(length, *distance_bounds)) if distance_bounds else length)
             result.append((cur_d, energy, structures[i]))
-    
+
     logger.debug("Points in trj: %s", len(result))
-    
-    if len(result) == 1:
+
+    if len(result) == 1 or return_all_frames:
         minima_node = {
-            "coords": result[0][0],
-            "rel_en": result[0][1],
-            "xyz_block": result[0][2],
+            "coords": result[-1][0],
+            "rel_en": result[-1][1],
+            "xyz_block": result[-1][2],
         }
         return result, minima_node
 
@@ -1241,7 +1368,7 @@ def parse_points_from_trj(
         logger.info("SAVING STRUCTS")
         cur_id = run_state.peek_structure_id()
         logger.info("Saving first struct from trj. Current structure number: %s", cur_id)
-        with open(structures_path + str(cur_id) + ".xyz", "w") as file:
+        with open(os.path.join(structures_path, str(cur_id) + ".xyz"), "w") as file:
             file.write(structures[0])
         logger.info("saved")
         run_state.increase_structure_id()
@@ -1249,7 +1376,7 @@ def parse_points_from_trj(
         for cluster_id in vals:
             cur_id = run_state.peek_structure_id()
             logger.info("saving struct number %s", cur_id)
-            with open(structures_path + str(cur_id) + ".xyz", "w") as file:
+            with open(os.path.join(structures_path, str(cur_id) + ".xyz"), "w") as file:
                 file.write(structures[vals[cluster_id][1] + 1]) # because points parsed from result[1:]
             logger.info("saved")
             run_state.increase_structure_id()
