@@ -23,3 +23,7 @@ tests/**/*
 !tests/**/*config.yaml
 # Claude change log (local only)
 claude_log.md
+
+# Local-only files
+7-120.txt
+CLAUDE.md
