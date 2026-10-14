@@ -115,14 +115,14 @@ class TestLoadConfig:
         config_path = temp_dir / "float_config.yaml"
         config_data = {
             "mol_file_name": "test.mol",
-            "bond_length_threshold": "1.5",  # string instead of float
+            "broken_struct_energy": "1.5",  # string instead of float
         }
         with open(config_path, "w") as f:
             yaml.dump(config_data, f)
 
         config = load_config(str(config_path))
-        assert config.bond_length_threshold == 1.5
-        assert isinstance(config.bond_length_threshold, float)
+        assert config.broken_struct_energy == 1.5
+        assert isinstance(config.broken_struct_energy, float)
 
     def test_empty_config_file(self, temp_dir):
         """Test loading an empty config file (should use all defaults)."""

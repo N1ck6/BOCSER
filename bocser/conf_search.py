@@ -1165,10 +1165,8 @@ class ConfSearchRunner:
         keep.add((Path(config.mol_file_name).resolve().parent / "qc_calcs" / config.sbatch_template_name).resolve())
 
         if config.load_ensemble:
-            ens_path = Path(config.load_ensemble)
-            if not ens_path.is_absolute():
-                ens_path = (working_folder / ens_path).resolve()
-            keep.add(ens_path.resolve())
+            # same lookup as _resolve_ensemble_path: working folder, then CWD
+            keep.add(Path(self._resolve_ensemble_path()).resolve())
 
         if getattr(self.state, "config_path", None):
             keep.add(Path(self.state.config_path).resolve())
@@ -1774,12 +1772,19 @@ class ConfSearchRunner:
             logger.info("Run finished successfully — checkpoint file removed.")
 
     def _resolve_ensemble_path(self) -> str:
-        """Returns absolute path to load_ensemble."""
+        """Returns absolute path to load_ensemble: relative paths are looked up in the
+        working folder (--folder) first, then in the current working directory."""
         config = self.state.config
         load_ensemble_filename = Path(config.load_ensemble)
-        if not load_ensemble_filename.is_absolute():
-            load_ensemble_filename = Path(self.state.working_folder) / load_ensemble_filename
-        return str(load_ensemble_filename)
+        if load_ensemble_filename.is_absolute():
+            return str(load_ensemble_filename)
+        in_folder = Path(self.state.working_folder) / load_ensemble_filename
+        in_cwd = Path.cwd() / load_ensemble_filename
+        if not in_folder.is_file() and in_cwd.is_file():
+            logger.info("load_ensemble %s not found in %s — using %s",
+                        config.load_ensemble, self.state.working_folder, in_cwd.resolve())
+            return str(in_cwd.resolve())
+        return str(in_folder)
 
     def _make_ensemble_processor(self) -> EnsembleProcessor:
         """EnsembleProcessor with atom-order check against the .mol and, when TS-bond

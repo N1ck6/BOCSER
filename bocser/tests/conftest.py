@@ -28,7 +28,6 @@ def sample_config_dict():
         "num_of_procs": 4,
         "orca_method": "lda sto-3g",
         "broken_struct_energy": 100.0,
-        "bond_length_threshold": 0.7,
         "ts": False,
         "rolling_window_size": 5,
         "rolling_std_threshold": 0.15,

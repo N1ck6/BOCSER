@@ -211,7 +211,7 @@ class TestSetConfig:
         assert cfg.spin_multiplicity == sample_config.spin_multiplicity
         assert cfg.ts == sample_config.ts
         assert cfg.broken_struct_energy == sample_config.broken_struct_energy
-        assert cfg.bond_length_threshold == sample_config.bond_length_threshold
+        assert cfg.clash_vdw_scale == sample_config.clash_vdw_scale
         assert cfg.acquisition_function == sample_config.acquisition_function
 
     def test_set_config_partial_update(self, sample_config):

@@ -8,7 +8,6 @@ orca_method: "M062X 6-31+G(d)"
 orca_poll_timeout_minutes: 560
 broken_struct_energy : 100.0
 ts: true
-bond_length_threshold : 0.7
 load_ensemble: "NonBR_New-4wE.xyz"
 rolling_window_size : 5
 rolling_std_threshold : 0

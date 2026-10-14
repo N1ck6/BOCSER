@@ -12,16 +12,12 @@ class ConfSearchConfig:
     num_of_procs : int = 8
     orca_method : str = "lda sto-3g"
     broken_struct_energy : float = 100.
-    bond_length_threshold : float = 0.7 # Deprecated
-    clash_vdw_scale: float = 0.0  # 0.0 = legacy fixed 0.7 Å threshold; >0.0 = use clash_vdw_scale * (vdw_radius_a + vdw_radius_b) instead.
+    clash_vdw_scale: float = 0.0  # 0.0 = legacy fixed 0.7 Å threshold for all atom pairs; >0.0 = clash_vdw_scale * (vdw_radius_a + vdw_radius_b) for pairs more than 2 bonds apart (bonded, 1-3 and TS-bond pairs are skipped). Sensible values: ~0.5-0.7
     ts : bool = False
-    ring_bond_threshold : float = 1.75
-    ts_ring_bond_threshold : float = 2.5
     use_grass : bool = False
     path_to_grass : str = ""
     grass_options : str = ""
     orca_poll_timeout_minutes: int = 60
-    orca_poll_interval_ms: int = 1000
     sbatch_template_name: str = "sbatch_temp"
     rolling_window_size : int = 5
     rolling_std_threshold : float = 0.15
