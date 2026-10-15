@@ -12,8 +12,9 @@ import sys
 
 def _redirected_logs() -> dict:
     """Regular files that stdout/stderr are redirected to (`> run.log 2>&1`), captured before
-    any import writes to them: (st_dev, st_ino) -> (size at start, opened in append mode).
-    With `>>` the size at start is the previous run's log; with `>` the shell has already emptied it."""
+    any import writes to them: (st_dev, st_ino) -> (size at start, opened in append mode, path).
+    With `>>` the size at start is the previous run's log; with `>` the shell has already emptied it.
+    The path is known on Linux (/proc/self/fd), None elsewhere."""
     found = {}
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -28,7 +29,12 @@ def _redirected_logs() -> dict:
             append = bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND)
         except (ImportError, OSError):
             append = None  # unknown (Windows)
-        found[(st.st_dev, st.st_ino)] = (st.st_size, append)
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+            path = path if os.path.isfile(path) else None
+        except OSError:
+            path = None
+        found[(st.st_dev, st.st_ino)] = (st.st_size, append, path)
     return found
 
 
@@ -706,6 +712,8 @@ class ConfSearchRunner:
         
         if config.clear_working_folder:
             self._clear_working_folder()
+        else:
+            self._drop_previous_log()
 
         logger.info("Performing conf. search with config: %s", config)
 
@@ -1330,7 +1338,7 @@ class ConfSearchRunner:
                 st = item.stat()
                 own = _OWN_LOGS.get((st.st_dev, st.st_ino))
                 if own is not None:
-                    moved += self._split_own_log(item, backup_dir / item.name, *own)
+                    moved += self._split_own_log(item, backup_dir / item.name, own[0], own[1])
                     continue
             try:
                 move(item)
@@ -1349,10 +1357,10 @@ class ConfSearchRunner:
             )
 
     @staticmethod
-    def _split_own_log(path: Path, dest: Path, start_size: int, append: Optional[bool]) -> int:
+    def _split_own_log(path: Path, dest: Optional[Path], start_size: int, append: Optional[bool]) -> int:
         """The current run writes its output to `path`. Copy the part written before this
-        process started (previous run) to `dest` and keep only this run's lines in `path`.
-        Returns 1 if something was backed up."""
+        process started (previous run) to `dest` (None = drop it) and keep only this run's
+        lines in `path`. Returns 1 if something was backed up."""
         if start_size == 0:
             logger.info(
                 "%s is this run's output; the previous run's log was already emptied by the shell "
@@ -1364,10 +1372,14 @@ class ConfSearchRunner:
                 stream.flush()
             except (AttributeError, OSError, ValueError):
                 pass
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "rb") as src, open(dest, "wb") as out:
-            out.write(src.read(start_size))
+        if dest is not None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "rb") as src, open(dest, "wb") as out:
+                out.write(src.read(start_size))
         if append is not True:
+            if dest is None:
+                logger.info("%s still holds the previous run's log (append mode not confirmed).", path)
+                return 0
             # Not confirmed O_APPEND (or Windows, where it can't be checked): after a truncation
             # the writer would continue at its old offset and leave a hole of zero bytes,
             # so the file is left as is (previous + current run)
@@ -1379,8 +1391,18 @@ class ConfSearchRunner:
             f.seek(0)
             f.truncate()
             f.write(current)
+        if dest is None:
+            logger.info("Previous run's log removed from %s (clear_working_folder is off).", path)
+            return 0
         logger.info("Previous run's log moved to %s; %s now holds only this run.", dest, path)
         return 1
+
+    def _drop_previous_log(self) -> None:
+        """clear_working_folder is off: like a `>` redirect, keep only this run's output in the
+        log the current process writes to (the previous run's part is not kept anywhere)."""
+        for start_size, append, path in _OWN_LOGS.values():
+            if path is not None and start_size > 0:
+                self._split_own_log(Path(path), None, start_size, append)
 
     def _build_rule(self) -> Any:
         """Build acquisition rule based on configuration."""
