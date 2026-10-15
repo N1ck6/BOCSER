@@ -72,7 +72,7 @@ from default_vals import ConfSearchConfig
 from ik_loss import IKLoss
 from imp_var_with_ik import ImprovementVarianceWithIK
 import time
-_PROCESS_START = time.time()  # files newer than this belong to the current run
+_PROCESS_START = time.time()  # .log files newer than this belong to the current run
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
@@ -1219,8 +1219,8 @@ class ConfSearchRunner:
         intermediate files in qc_calcs/: from there only the last .out and _trj.xyz are kept.
 
         Stay in place: input files (.mol, load_ensemble, config, .db, sbatch template),
-        folders that contain an input file, earlier backupN/ folders, and files written by
-        this process already (e.g. the log the current run is redirected to)."""
+        folders that contain an input file, earlier backupN/ folders, and .log files
+        modified after this process started (the log the current run is redirected to)."""
         config = self.state.config
         working_folder = Path(self.state.working_folder).resolve()
 
@@ -1299,8 +1299,8 @@ class ConfSearchRunner:
             if item.is_dir() and any(k.is_relative_to(resolved) for k in keep):
                 logger.info("Leaving folder %s in place: it contains an input file", item)
                 continue
-            # clean-up runs before this run creates any folder, so only files can be its own
-            if item.is_file() and item.stat().st_mtime >= _PROCESS_START - 10:
+            # A .log modified after this process started is the log the current run writes to
+            if item.is_file() and item.suffix.lower() == ".log" and item.stat().st_mtime >= _PROCESS_START - 10:
                 logger.info("Leaving %s in place: written by the current run", item)
                 continue
             try:
