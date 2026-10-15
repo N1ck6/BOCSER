@@ -6,6 +6,33 @@ all state and behavior for the conformational search workflow.
 """
 
 import os
+import stat
+import sys
+
+
+def _redirected_logs() -> dict:
+    """Regular files that stdout/stderr are redirected to (`> run.log 2>&1`), captured before
+    any import writes to them: (st_dev, st_ino) -> (size at start, opened in append mode).
+    With `>>` the size at start is the previous run's log; with `>` the shell has already emptied it."""
+    found = {}
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            fd = stream.fileno()
+            st = os.fstat(fd)
+        except (AttributeError, OSError, ValueError):
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        try:
+            import fcntl
+            append = bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND)
+        except (ImportError, OSError):
+            append = None  # unknown (Windows)
+        found[(st.st_dev, st.st_ino)] = (st.st_size, append)
+    return found
+
+
+_OWN_LOGS = _redirected_logs()
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 import warnings
@@ -72,7 +99,6 @@ from default_vals import ConfSearchConfig
 from ik_loss import IKLoss
 from imp_var_with_ik import ImprovementVarianceWithIK
 import time
-_PROCESS_START = time.time()  # .log files newer than this belong to the current run
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
@@ -1219,8 +1245,9 @@ class ConfSearchRunner:
         intermediate files in qc_calcs/: from there only the last .out and _trj.xyz are kept.
 
         Stay in place: input files (.mol, load_ensemble, config, .db, sbatch template),
-        folders that contain an input file, earlier backupN/ folders, and .log files
-        modified after this process started (the log the current run is redirected to)."""
+        folders that contain an input file and earlier backupN/ folders.
+        The file this process's stdout/stderr is redirected to is split: what it held at
+        start (previous run, only with `>>`) goes to the backup, this run's lines stay."""
         config = self.state.config
         working_folder = Path(self.state.working_folder).resolve()
 
@@ -1299,10 +1326,12 @@ class ConfSearchRunner:
             if item.is_dir() and any(k.is_relative_to(resolved) for k in keep):
                 logger.info("Leaving folder %s in place: it contains an input file", item)
                 continue
-            # A .log modified after this process started is the log the current run writes to
-            if item.is_file() and item.suffix.lower() == ".log" and item.stat().st_mtime >= _PROCESS_START - 10:
-                logger.info("Leaving %s in place: written by the current run", item)
-                continue
+            if item.is_file():
+                st = item.stat()
+                own = _OWN_LOGS.get((st.st_dev, st.st_ino))
+                if own is not None:
+                    moved += self._split_own_log(item, backup_dir / item.name, *own)
+                    continue
             try:
                 move(item)
                 moved += 1
@@ -1318,6 +1347,40 @@ class ConfSearchRunner:
                 "checkpoint_step is set together with clear_working_folder: the old checkpoint "
                 "was moved to the backup, the run starts from scratch."
             )
+
+    @staticmethod
+    def _split_own_log(path: Path, dest: Path, start_size: int, append: Optional[bool]) -> int:
+        """The current run writes its output to `path`. Copy the part written before this
+        process started (previous run) to `dest` and keep only this run's lines in `path`.
+        Returns 1 if something was backed up."""
+        if start_size == 0:
+            logger.info(
+                "%s is this run's output; the previous run's log was already emptied by the shell "
+                "(launch with '>> %s' instead of '>' to keep it in the backup).", path, path.name,
+            )
+            return 0
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (AttributeError, OSError, ValueError):
+                pass
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "rb") as src, open(dest, "wb") as out:
+            out.write(src.read(start_size))
+        if append is not True:
+            # Not confirmed O_APPEND (or Windows, where it can't be checked): after a truncation
+            # the writer would continue at its old offset and leave a hole of zero bytes,
+            # so the file is left as is (previous + current run)
+            logger.info("Previous run's log copied to %s; %s left unchanged (append mode not confirmed).", dest, path)
+            return 1
+        with open(path, "r+b") as f:
+            f.seek(start_size)
+            current = f.read()
+            f.seek(0)
+            f.truncate()
+            f.write(current)
+        logger.info("Previous run's log moved to %s; %s now holds only this run.", dest, path)
+        return 1
 
     def _build_rule(self) -> Any:
         """Build acquisition rule based on configuration."""
