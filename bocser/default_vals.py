@@ -59,6 +59,10 @@ class ConfSearchConfig:
     # The result is then a constrained structure, not a free stationary point.
     constrain_bo_dihedrals_in_final_opt: bool = False
 
+    # Final ensemble: two minima are one conformer when BOTH hold (defaults as in CREST)
+    dedup_rmsd_threshold: float = 0.125   # heavy-atom RMSD after symmetry-aware alignment, A
+    dedup_energy_threshold: float = 0.05  # kcal/mol
+
     # Optional MMFF94 clean-up of each candidate before the ORCA pre-optimization.
     use_mmff_regularization: bool = False
     mmff_max_iter: int = 1000
@@ -99,6 +103,8 @@ class ConfSearchConfig:
                 f"<= ts_bond_scan_max_steps ({self.ts_bond_scan_max_steps})."
             )
 
+        if self.dedup_rmsd_threshold < 0 or self.dedup_energy_threshold < 0:
+            raise ValueError("dedup_rmsd_threshold and dedup_energy_threshold must be >= 0.")
         if self.mmff_max_iter < 1:
             raise ValueError(f"mmff_max_iter ({self.mmff_max_iter}) must be >= 1.")
         if self.orca_trj_max_gp_points < 2:

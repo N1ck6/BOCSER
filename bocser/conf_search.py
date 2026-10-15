@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="gpflow")
 from rdkit import Chem, RDLogger
 RDLogger.DisableLog("rdApp.warning")
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolAlign
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import hashlib
@@ -68,11 +68,11 @@ from coef_calc import (
 from db_connector import LocalConnector
 from ensemble_processor import EnsembleProcessor
 from evm import ExplorationalVarianceMinimizer
-from dbscan import DBSCAN
 from default_vals import ConfSearchConfig
 from ik_loss import IKLoss
 from imp_var_with_ik import ImprovementVarianceWithIK
 import time
+_PROCESS_START = time.time()  # files newer than this belong to the current run
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
 
@@ -1214,9 +1214,13 @@ class ConfSearchRunner:
         return dataset
 
     def _clear_working_folder(self) -> None:
-        """Remove all files/subfolders in working_folder except the mol file,
-        the ensemble file (if provided), so restarting a run never gets
-        contaminated by a previous run's outputs."""
+        """Start a clean run: move the previous run's files from working_folder into a new
+        backupN/ subfolder (backup1/, backup2/, ...). Nothing is deleted except the
+        intermediate files in qc_calcs/: from there only the last .out and _trj.xyz are kept.
+
+        Stay in place: input files (.mol, load_ensemble, config, .db, sbatch template),
+        folders that contain an input file, earlier backupN/ folders, and files written by
+        this process already (e.g. the log the current run is redirected to)."""
         config = self.state.config
         working_folder = Path(self.state.working_folder).resolve()
 
@@ -1243,7 +1247,8 @@ class ConfSearchRunner:
         keep.add(Path(config.mol_file_name).resolve())
         # sbatch template: looked up in qc_calcs/ first, then relative to the CWD
         keep.add(Path(config.sbatch_template_name).resolve())
-        keep.add((Path(config.mol_file_name).resolve().parent / "qc_calcs" / config.sbatch_template_name).resolve())
+        qc_dir = (Path(config.mol_file_name).resolve().parent / "qc_calcs").resolve()
+        keep.add(qc_dir / config.sbatch_template_name)
 
         if config.load_ensemble:
             # same lookup as _resolve_ensemble_path: working folder, then CWD
@@ -1252,33 +1257,67 @@ class ConfSearchRunner:
         if getattr(self.state, "config_path", None):
             keep.add(Path(self.state.config_path).resolve())
         keep.add(Path(self.state.db_file).resolve())
-        
-        ckpt_path = working_folder / f"{config.exp_name}_checkpoint.json"
-        keep.add(ckpt_path.resolve())
 
-        protected_suffixes = {".mol", ".log", ".db", ".yaml"}
+        protected_suffixes = {".mol", ".db", ".yaml", ".yml"}
         for item in working_folder.iterdir():
             if item.is_file() and item.suffix.lower() in protected_suffixes:
                 keep.add(item.resolve())
 
-        logger.info("clear_working_folder=True: wiping %s except %s", working_folder, keep)
+        backup_re = re.compile(r"backup(\d+)$")
+        existing = [int(m.group(1)) for item in working_folder.iterdir()
+                    if item.is_dir() and (m := backup_re.match(item.name))]
+        backup_dir = working_folder / f"backup{max(existing, default=0) + 1}"
 
-        for item in working_folder.iterdir():
+        def move(src: Path) -> None:
+            dest = backup_dir / src.resolve().relative_to(working_folder)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+
+        moved = 0
+        # qc_calcs/: keep only the last ORCA output and its trajectory, drop inputs/scripts/scratch
+        if qc_dir.is_dir() and qc_dir.is_relative_to(working_folder):
+            for f in sorted(qc_dir.iterdir()):
+                if f.resolve() in keep:
+                    continue
+                try:
+                    if f.is_file() and (f.suffix == ".out" or f.name.endswith("_trj.xyz")):
+                        move(f)
+                        moved += 1
+                    elif f.is_dir():
+                        shutil.rmtree(f)
+                    else:
+                        f.unlink()
+                except Exception:
+                    logger.exception("Failed to back up / remove %s", f)
+            if not any(qc_dir.iterdir()):
+                qc_dir.rmdir()
+
+        for item in sorted(working_folder.iterdir()):
             resolved = item.resolve()
-            if resolved in keep:
-                logger.debug("Preserving %s (protected: config/ensemble/.db/.mol/.log/.yaml/checkpoint)", item)
+            if resolved in keep or backup_re.match(item.name) or resolved == qc_dir:
                 continue
             if item.is_dir() and any(k.is_relative_to(resolved) for k in keep):
-                logger.info("Preserving folder %s: it contains a protected input file", item)
+                logger.info("Leaving folder %s in place: it contains an input file", item)
+                continue
+            # clean-up runs before this run creates any folder, so only files can be its own
+            if item.is_file() and item.stat().st_mtime >= _PROCESS_START - 10:
+                logger.info("Leaving %s in place: written by the current run", item)
                 continue
             try:
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-                logger.debug("Removed %s", item)
+                move(item)
+                moved += 1
             except Exception:
-                logger.exception("Failed to remove %s during working-folder cleanup", item)
+                logger.exception("Failed to move %s to %s", item, backup_dir)
+
+        if moved:
+            logger.info("clear_working_folder: previous results moved to %s (%d items)", backup_dir, moved)
+        else:
+            logger.info("clear_working_folder: nothing to back up in %s", working_folder)
+        if config.checkpoint_step is not None:
+            logger.warning(
+                "checkpoint_step is set together with clear_working_folder: the old checkpoint "
+                "was moved to the backup, the run starts from scratch."
+            )
 
     def _build_rule(self) -> Any:
         """Build acquisition rule based on configuration."""
@@ -1808,17 +1847,7 @@ class ConfSearchRunner:
                 logger.info("Run finished (with zero minima) — checkpoint file removed.")
             return
 
-        dbscan_labels = DBSCAN(
-            eps=np.pi / 12,
-            min_pts=1,
-        ).fit_predict(np.asarray([cur[0][:len(self.state.dihedral_ids)] for cur in self.state.minima]))  # angles only, not TS lengths
-
-        res = {int(label): (1e9, -1) for label in np.unique(dbscan_labels)}
-
-        for i in range(len(self.state.minima)):
-            cluster_id = dbscan_labels[i]
-            if self.state.minima[i][1] < res[cluster_id][0]:
-                res[cluster_id] = self.state.minima[i][1], i
+        res = self._cluster_minima_by_rmsd()
 
         clustering_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_clustering_results.json")
         logger.info(
@@ -1851,6 +1880,58 @@ class ConfSearchRunner:
         if ckpt_path.is_file():
             ckpt_path.unlink()
             logger.info("Run finished successfully — checkpoint file removed.")
+
+    def _cluster_minima_by_rmsd(self) -> dict:
+        """Group the found minima into unique conformers.
+
+        Two minima are the same conformer when their energies differ by less than
+        dedup_energy_threshold AND the heavy-atom RMSD after symmetry-aware alignment
+        (RDKit GetBestRMS) is below dedup_rmsd_threshold. All atoms take part, so ring
+        torsions outside the GP axes and TS-bond lengths are compared too.
+        Minima are processed from the lowest energy, so each group is represented by its
+        lowest-energy member and groups come out sorted by energy.
+        Returns {group: (relative energy, minimum index)}.
+        """
+        cfg = self.state.config
+        minima_dir = Path(self.state.working_folder) / f"{self.state.exp_name}_minima"
+        ref = build_reference_with_h_mol(self.state.mol_file_name)
+
+        candidates = []  # (energy, minimum index, heavy-atom mol)
+        for i, (_, energy) in enumerate(self.state.minima):
+            path = minima_dir / f"{i}.xyz"
+            try:
+                lines = [l for l in path.read_text().splitlines() if l.strip()]
+                if lines and lines[0].strip().isdigit():
+                    lines = lines[2:]
+                if len(lines) != ref.GetNumAtoms():
+                    raise ValueError(f"{len(lines)} atoms instead of {ref.GetNumAtoms()}")
+                mol = Chem.Mol(ref)
+                conf = mol.GetConformer()
+                for k, line in enumerate(lines):
+                    conf.SetAtomPosition(k, [float(v) for v in line.split()[1:4]])
+                candidates.append((float(energy), i, Chem.RemoveHs(mol)))
+            except (OSError, ValueError) as e:
+                logger.warning("Minimum %d (%s) skipped in the final ensemble: %s", i, path, e)
+        candidates.sort(key=lambda c: c[0])
+
+        groups = []  # (energy, minimum index, heavy-atom mol) of each group's representative
+        for energy, idx, mol in candidates:
+            for g_energy, g_idx, g_mol in groups:
+                if abs(energy - g_energy) >= cfg.dedup_energy_threshold:
+                    continue
+                rmsd = rdMolAlign.GetBestRMS(Chem.Mol(mol), g_mol)
+                if rmsd < cfg.dedup_rmsd_threshold:
+                    logger.debug("Minimum %d duplicates %d (dE=%.3f kcal/mol, RMSD=%.3f A)",
+                                 idx, g_idx, energy - g_energy, rmsd)
+                    break
+            else:
+                groups.append((energy, idx, mol))
+
+        logger.info(
+            "Final ensemble: %d unique conformers out of %d minima (RMSD < %.3f A and dE < %.3f kcal/mol = duplicate)",
+            len(groups), len(candidates), cfg.dedup_rmsd_threshold, cfg.dedup_energy_threshold,
+        )
+        return {label: (energy, idx) for label, (energy, idx, _) in enumerate(groups)}
 
     def _resolve_ensemble_path(self) -> str:
         """Returns absolute path to load_ensemble: relative paths are looked up in the
