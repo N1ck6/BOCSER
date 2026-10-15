@@ -81,7 +81,7 @@ All files are written to `--folder`, prefixed with `exp_name`:
 | `<exp_name>_all_minima.json` | All local minima with relative energies (kcal/mol) |
 | `<exp_name>_logs.json` | Acquisition values and best energy per BO step |
 | `<exp_name>_minima/` | Individual `.xyz` files for each minimum |
-| `<exp_name>_clustering_results.json` | DBSCAN cluster assignments |
+| `<exp_name>_clustering_results.json` | Unique conformers: relative energy and minimum index |
 
 ---
 
@@ -95,7 +95,7 @@ All files are written to `--folder`, prefixed with `exp_name`:
    - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt.
    - Result updates the GP model.
    - Early-stop when acquisition values plateau (rolling window criterion).
-5. **Cluster** all discovered minima with DBSCAN (angular distance) → write final ensemble.
+5. **Deduplicate** all discovered minima (heavy-atom RMSD + energy window) → write final ensemble sorted by energy.
 
 ---
 
