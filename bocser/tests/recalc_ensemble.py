@@ -1,16 +1,15 @@
 """
-recalc_ensemble_xtb2.py — recalculate energies for all conformers in an XYZ
+recalc_ensemble.py — recalculate energies for all conformers in an XYZ
 ensemble at XTB2 level using ORCA via Slurm, then write a new ensemble file
 with XTB2 energies (relative to ensemble minimum, in kcal/mol).
 
 Output: NonBR_energies_res.xyz  (same folder as input ensemble)
 
-Usage (from /home/xray/Nicki/BOCSER/):
-    python recalc_ensemble_xtb2.py
+Usage (from the repository root):
+    nohup python bocser/tests/recalc_ensemble.py >> tests/NonBR_copy/run.log 2>&1 &
 
-All paths are configured in the CONFIG block below.
-
-nohup python tests/NonBR_copy/recalc_ensemble.py > "tests/NonBR_copy/run.log" 2>&1 &
+All paths are configured in the CONFIG block below, relative to the repository root
+(found automatically from this file's location).
 """
 
 import os
@@ -29,12 +28,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+def _repo_root() -> Path:
+    """First folder above this file that holds bocser/ and sbatch_temp (the repository root)."""
+    here = Path(__file__).resolve()
+    for folder in here.parents:
+        if (folder / "bocser").is_dir() and (folder / "sbatch_temp").is_file():
+            return folder
+    raise RuntimeError(f"Repository root (with bocser/ and sbatch_temp) not found above {here}")
+
+
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOCSER_DIR       = Path("/home/xray/Nicki/BOCSER/bocser")      # source code
-WORK_DIR         = Path("/home/xray/Nicki/BOCSER/tests/NonBR_copy") # working folder
+REPO_ROOT        = _repo_root()
+BOCSER_DIR       = REPO_ROOT / "bocser"                         # source code
+WORK_DIR         = REPO_ROOT / "tests" / "NonBR_copy"           # working folder
 ENSEMBLE_FILE    = WORK_DIR / "NonBR-TSs-energies.xyz"          # input ensemble
 OUTPUT_FILE      = WORK_DIR / "NonBR_energies_res.xyz"          # output
-SBATCH_TEMPLATE  = Path("/home/xray/Nicki/BOCSER/sbatch_temp")  # Slurm template
+SBATCH_TEMPLATE  = REPO_ROOT / "sbatch_temp"                    # Slurm template
 SP_DIR           = WORK_DIR / "sp_calcs"                        # temp ORCA files
 
 ORCA_CMD         = "/opt/orca_6.1.0/orca"
@@ -214,9 +223,8 @@ def main() -> None:
     log.info("Use config2.yaml for the next run.")
 
 def cleanup_slurm_logs() -> None:
-    """Delete slurm-*.out files that Slurm drops in the BOCSER root folder."""
-    bocser_root = Path("/home/xray/Nicki/BOCSER")
-    slurm_files = list(bocser_root.glob("slurm-*.out"))
+    """Delete slurm-*.out files that Slurm drops in the folder sbatch was called from."""
+    slurm_files = list(Path.cwd().glob("slurm-*.out"))
     if not slurm_files:
         log.info("No slurm-*.out files to clean up.")
         return

@@ -17,8 +17,8 @@ pip install -r requirements.txt
 mkdir my_run && cd my_run
 # Place molecule.mol and config.yaml here
 
-# 3. Run
-python bocser/conf_search.py --folder=my_run --config=config.yaml
+# 3. Run (in the background; '>>' keeps the previous run's log for the backup)
+nohup python -u bocser/conf_search.py --folder my_run --config config.yaml >> my_run/run.log 2>&1 &
 
 # Or via Slurm (requiers installed ORCA to perform calculations and Slurm workload manager to manage them)
 sbatch run_cs.sh my_run
