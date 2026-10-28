@@ -1539,6 +1539,7 @@ class ConfSearchRunner:
             "current_minima": float(self.state.current_minima),
             "acq_vals_log": list(self.state.acq_vals_log),
             "deepest_minima": [float(v) for v in self.state.deepest_minima],
+            "norm_energy": float(self.state.norm_energy),  # all observations are relative to it
         }
 
         existing = self._load_checkpoint_file()
@@ -1562,6 +1563,7 @@ class ConfSearchRunner:
 
         Rules:
         - checkpoint_step is None → do not resume (normal run).
+        - checkpoint_step is "last" → use the last saved step.
         - no / empty checkpoint file → log, no resume.
         - checkpoint_step > last available step → use last, log warning.
         - checkpoint_step matches an entry → use it.
@@ -1595,11 +1597,18 @@ class ConfSearchRunner:
         steps_available = [h["step"] for h in history_sorted]
         last = history_sorted[-1]
 
+        if isinstance(requested, str) and requested.strip().lower() == "last":
+            logger.info(
+                "checkpoint_step=last: resuming after step %d (%d dataset points, %d minima).",
+                last["step"], len(last.get("observations", [])), len(last.get("minima", [])),
+            )
+            return last
+
         try:
             req = int(requested)
         except (TypeError, ValueError):
             logger.warning(
-                "checkpoint_step=%r is not a valid integer — ignoring checkpoint.",
+                "checkpoint_step=%r is neither an integer nor 'last' — ignoring checkpoint.",
                 requested,
             )
             return None
@@ -1657,6 +1666,15 @@ class ConfSearchRunner:
             tf.constant(query_points, dtype=tf.float64),
             tf.constant(snapshot["observations"], dtype=tf.float64),
         )
+        ckpt_norm = snapshot.get("norm_energy")
+        if ckpt_norm is not None:
+            if abs(float(ckpt_norm) - self.state.norm_energy) > 1e-4:
+                logger.warning(
+                    "norm_energy of this run (%.6f) differs from the checkpoint (%.6f) — using the "
+                    "checkpoint value so old and new points share one energy scale.",
+                    self.state.norm_energy, float(ckpt_norm),
+                )
+            self.state.norm_energy = float(ckpt_norm)
         self.state.minima = snapshot.get("minima", [])
         self.state.current_minima = float(snapshot.get("current_minima", 1e9))
         self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
@@ -2018,10 +2036,7 @@ class ConfSearchRunner:
                 {"query_points": query_points.tolist(), "observations": observations.tolist()},
                 open(all_points_file, "w"),
             )
-            ckpt_path = self._checkpoint_path()
-            if ckpt_path.is_file():
-                ckpt_path.unlink()
-                logger.info("Run finished (with zero minima) — checkpoint file removed.")
+            self._log_checkpoint_kept()
             return
 
         res = self._cluster_minima_by_rmsd()
@@ -2053,10 +2068,15 @@ class ConfSearchRunner:
             {"query_points": query_points.tolist(), "observations": observations.tolist()},
             open(all_points_file, "w"),
         )
-        ckpt_path = self._checkpoint_path()
-        if ckpt_path.is_file():
-            ckpt_path.unlink()
-            logger.info("Run finished successfully — checkpoint file removed.")
+        self._log_checkpoint_kept()
+
+    def _log_checkpoint_kept(self) -> None:
+        """The checkpoint stays after the run, so it can be continued with more steps."""
+        if self._checkpoint_path().is_file():
+            logger.info(
+                "Checkpoint kept at %s: to continue this run, set checkpoint_step: last and a larger max_steps.",
+                self._checkpoint_path(),
+            )
 
     def _cluster_minima_by_rmsd(self) -> dict:
         """Group the found minima into unique conformers.

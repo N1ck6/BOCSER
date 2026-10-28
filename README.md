@@ -105,6 +105,8 @@ All files are written to `--folder`, prefixed with `exp_name`:
    - Early-stop when acquisition values plateau (rolling window criterion).
 5. **Deduplicate** all discovered minima (heavy-atom RMSD + energy window) → write final ensemble sorted by energy.
 
+**Continuing a run.** `{exp_name}_checkpoint.json` is kept after the run. To add steps in the same folder, set `checkpoint_step: last`, a larger `max_steps` (e.g. 20 → 30) and `clear_working_folder: false`: the run continues from the last saved step and rewrites the final files. A run that stopped early on the convergence criterion stops again soon with the same thresholds.
+
 ---
 
 ## Acquisition Functions

@@ -41,7 +41,7 @@ class ConfSearchConfig:
     extra_constraints: List[Dict] = field(default_factory=list)
     ts_max_iter: int = 45
     clear_working_folder: bool = False
-    checkpoint_step: Union[int, None] = None   # None - default behaviour, else - start at chosen step
+    checkpoint_step: Union[int, str, None] = None   # None - default behaviour, N - continue after step N, "last" - after the last saved step (raise max_steps to run more)
     tf_eager_mode: bool = False # Управляет tf.config.run_functions_eagerly() - отладка shape-ошибок, замедление расчетов acquisition
     bond_stretch_factor: float = 1.4  # порог для _check_bond_topology_intact
     preopt_max_iter: int = 100
