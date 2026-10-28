@@ -47,7 +47,7 @@ orca_method: "PBE def2-SVP"   # ORCA keywords; Opt/OptTS is appended by BOCSER
 # orca_method: |
 #   ! M062X 6-31+G(d) DefGrid3
 #   %scf
-#     TRAH false
+#     MaxIter 300
 #   end
 num_of_procs: 8
 charge: 0
