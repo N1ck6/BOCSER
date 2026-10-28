@@ -41,7 +41,14 @@ sbatch run_cs.sh my_run
 mol_file_name: "molecule.mol"
 exp_name: "my_experiment"
 orca_exec_command: "/path/to/orca"
-orca_method: "PBE def2-SVP"
+orca_method: "PBE def2-SVP"   # ORCA keywords; Opt/OptTS is appended by BOCSER
+# Several lines: the first one is the "!" keyword line (the "!" is optional),
+# the rest is copied into every ORCA input as is:
+# orca_method: |
+#   ! M062X 6-31+G(d) DefGrid3
+#   %scf
+#     TRAH false
+#   end
 num_of_procs: 8
 charge: 0
 spin_multiplicity: 1

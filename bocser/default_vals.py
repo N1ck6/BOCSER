@@ -75,6 +75,16 @@ class ConfSearchConfig:
     orca_trj_energy_window: float = 15.0  # kcal/mol above the trajectory minimum
 
     def __post_init__(self):
+        # orca_method: first line = ORCA keywords (a leading "!" is optional), next lines
+        # (e.g. a "%scf ... end" block) are copied into every input as they are
+        lines = [line.rstrip() for line in str(self.orca_method).strip().splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("orca_method must not be empty.")
+        lines[0] = lines[0].strip().removeprefix("!").strip()
+        if not lines[0]:
+            raise ValueError("orca_method: the first line must hold the ORCA keywords (method, basis).")
+        self.orca_method = "\n".join(lines)
+
         # Форматировать в список кортежей двойных связей
         self.ts_bonds = [tuple(int(x) for x in pair) for pair in self.ts_bonds]
         self.fixed_double_bonds = [tuple(int(x) for x in pair) for pair in self.fixed_double_bonds]

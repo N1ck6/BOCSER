@@ -8,7 +8,7 @@ from typing import Union
 import os
 
 from default_vals import ConfSearchConfig
-from calc import start_calc
+from calc import start_calc, orca_input_head
 from coef_from_grid import calc_coefs
 from db_connector import Connector
 import config_manager
@@ -570,7 +570,7 @@ class CoefCalculator:
             that it should work always
         """
         with open(filename, 'w+') as file:
-            file.write("!" + self.method_of_calc + " opt\n")
+            file.write(orca_input_head(self.method_of_calc, "Opt"))
             file.write("%pal\nnprocs " + str(self.num_of_procs) + "\nend\n")
             file.write("%geom Scan\n")
             file.write("D " + " ".join(list(map(str, idxs_to_rotate))) + " = 0.0, 360.0, 37\n")
@@ -820,7 +820,7 @@ def generate_bond_scan_inp(
 ) -> None:
     """Relaxed scan of the bond length atom_a-atom_b from lo to hi."""
     with open(filename, 'w+') as file:
-        file.write("!" + method_of_calc + " opt\n")
+        file.write(orca_input_head(method_of_calc, "Opt"))
         file.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
         file.write("%geom Scan\n")
         file.write(f"B {atom_a} {atom_b} = {lo}, {hi}, {nsteps}\n")

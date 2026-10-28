@@ -541,6 +541,14 @@ def read_xyz(name : str) -> list[str]:
             xyz.append(line)
     return '\n'.join(xyz)
 
+def orca_input_head(method_of_calc: str, keywords: str = "") -> str:
+    """Start of an ORCA input: the first line of orca_method becomes the "!" line with
+    `keywords` (Opt, OptTS, opt) appended; the other lines (e.g. %scf ... end) follow as they are."""
+    first, _, rest = method_of_calc.strip().partition("\n")
+    first = first.strip().removeprefix("!").strip()
+    head = "!" + first + (" " + keywords if keywords else "") + "\n"
+    return head + (rest.rstrip("\n") + "\n" if rest.strip() else "")
+
 def generate_oinp(
         coords : str, 
         dihedrals : list[dihedral], # BO-targets; only when constrained_opt=True
@@ -578,7 +586,7 @@ def generate_oinp(
             tmp.write(coords)
         else:
             opt_cmd = "OptTS" if (cfg.ts) else "Opt"
-            tmp.write("!" + method_of_calc + f" {opt_cmd}\n")
+            tmp.write(orca_input_head(method_of_calc, opt_cmd))
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
             hard_by_axis = {}
