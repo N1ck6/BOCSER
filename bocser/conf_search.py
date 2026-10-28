@@ -769,6 +769,14 @@ class ConfSearchRunner:
             self._drop_previous_log()
 
         logger.info("Performing conf. search with config: %s", config)
+        final_opt_constraints = [
+            name for name, on in (("BO dihedrals", config.constrain_bo_dihedrals_in_final_opt),
+                                  ("fixed torsions + extra_constraints", config.constrain_final_opt)) if on
+        ]
+        logger.info(
+            "Full optimization constraints: %s (pre-opt holds all of them)",
+            ", ".join(final_opt_constraints) if final_opt_constraints else "none",
+        )
 
         # Propagate configuration to central config manager and internal state
         config_manager.set_config(config)
@@ -942,6 +950,12 @@ class ConfSearchRunner:
 
         logger.info("Dihedral ids: %s", self.state.dihedral_ids)
         logger.info("Mean func coefs: %s", self.state.mean_func_coefs)
+        n_flat = sum(1 for coefs in self.state.mean_func_coefs if not any(coefs))
+        logger.info(
+            "GP axes: %d — %d with a torsion-scan profile, %d with a flat mean "
+            "(ring torsions are not scanned, or the scan failed)",
+            len(self.state.mean_func_coefs), len(self.state.mean_func_coefs) - n_flat, n_flat,
+        )
 
         self._require_dihedral_ids_finalized("n_dihedral computation")
         n_dihedral = len(self.state.dihedral_ids)
@@ -1168,14 +1182,14 @@ class ConfSearchRunner:
             )
         else:
             theory_level = f"{config.orca_method}|charge={config.charge}|mult={config.spin_multiplicity}"
-            # norm_energy comes from an Opt/OptTS of the input geometry under the hard constraints,
-            # so both change the cached value
+            # norm_energy comes from an Opt/OptTS of the input geometry (under the hard constraints
+            # with constrain_final_opt), so both change the cached value
             if config.ts:
                 theory_level += "|ts"
             hard_constraints = sorted(
                 [("dihedral", tuple(atoms), round(float(np.rad2deg(val)), 1)) for atoms, val in self.state.fixed_dihedrals]
                 + [(c.type, tuple(c.atoms), round(float(c.value), 3)) for c in self.state.extra_constraints]
-            )
+            ) if config.constrain_final_opt else []
             if hard_constraints:
                 theory_level += "|c=" + hashlib.sha1(repr(hard_constraints).encode()).hexdigest()[:12]
             mol_hash = compute_mol_hash(self.state.mol_file_name, config.charge, config.spin_multiplicity)
@@ -2139,8 +2153,9 @@ class ConfSearchRunner:
             (value: number or "current" = length in the .mol);
           - infer_ts_bond_lengths_from_ensemble: lengths in the lowest-energy conformer of
             load_ensemble (overrides user values).
-        Such TS-pair bond entries are taken out of the hard constraints, which are applied
-        in every ORCA stage, so the final OptTS can move along the reaction coordinate.
+        Such TS-pair bond entries are taken out of the hard constraints, which
+        constrain_final_opt also applies in the final opt, so the final OptTS can always move
+        along the reaction coordinate.
         Returns [((a, b), length)] with canonical 0-idx atoms.
         """
         if not config.ts:

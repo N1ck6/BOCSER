@@ -56,9 +56,13 @@ class ConfSearchConfig:
     # structure checks is always broken. False = old behaviour (penalize the region).
     use_preopt_energy_on_opt_failure: bool = True
 
+    # The final Opt/OptTS runs without constraints by default; all of them are held in the pre-opt.
     # Also freeze the BO dihedrals in the final Opt/OptTS (they are always frozen in the pre-opt).
     # The result is then a constrained structure, not a free stationary point.
     constrain_bo_dihedrals_in_final_opt: bool = False
+    # Also hold the fixed torsions (double bonds, demoted ring axes) and extra_constraints in the
+    # final Opt/OptTS and in the norm_energy optimization of the .mol geometry.
+    constrain_final_opt: bool = False
 
     # Final ensemble: two minima are one conformer when BOTH hold (defaults as in CREST)
     dedup_rmsd_threshold: float = 0.125   # heavy-atom RMSD after symmetry-aware alignment, A

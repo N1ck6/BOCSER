@@ -78,6 +78,7 @@ class CoefCalculator:
         self.scanfile2smiles = {} # k - scan_file, v - smiles
         self.fetched_coefs = {} # k - smiles, v - coefs
         self.failed_scans = set() # scan .inp files without usable results
+        self.flat_ring_smiles = set() # ring fragments given a flat mean instead of a scan
 
         if not os.path.exists(self.dir_for_inps):
             os.makedirs(self.dir_for_inps)
@@ -623,6 +624,7 @@ class CoefCalculator:
                 # A ring dihedral cannot be freely scanned (the ring breaks);
                 # use a flat GP mean prior so the IK loss alone guides ring geometry.
                 self.fetched_coefs[cur_mol_smiles] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                self.flat_ring_smiles.add(cur_mol_smiles)
 
             xyz = Chem.MolToXYZBlock(cur_mol)
             filename = self.dir_for_inps + "scan_" + str(angle_number) + ".inp"
@@ -727,8 +729,11 @@ class CoefCalculator:
             res.append((0.0,) * 7)
 
         self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs) - len(self.failed_scans)
-        self.n_fourier_cached = len(self.fetched_coefs)
-        logger.info("Sucessful calculated %s coefs and fetched from db %s coefs!", self.n_fourier_computed, self.n_fourier_cached)
+        self.n_fourier_cached = len(self.fetched_coefs) - len(self.flat_ring_smiles)
+        logger.info(
+            "Sucessful calculated %s coefs and fetched from db %s coefs! (%d ring fragment(s) not scanned, flat mean)",
+            self.n_fourier_computed, self.n_fourier_cached, len(self.flat_ring_smiles),
+        )
 
         for inp_filename, coefs in zip(inp_filenames, res):
             if self.scanfile2smiles[inp_filename] in self.fetched_coefs or inp_filename in self.failed_scans:

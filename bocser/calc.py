@@ -1242,11 +1242,14 @@ def calc_energy(
 
     xyz_upd = None
 
+    # Fixed torsions and extra_constraints are held in the pre-opt; the full opt (and the
+    # norm_energy opt) runs without any constraint unless constrain_final_opt is set
     hard_constraints = []
-    for atoms, _ in (fixed_dihedrals or []):
-        # The geometry already holds these torsions (input .mol / MMFF stage): freeze the current value
-        hard_constraints.append(Constraint("dihedral", tuple(atoms), None))
-    hard_constraints.extend(extra_constraints or [])
+    if constrained_opt or cfg.constrain_final_opt:
+        for atoms, _ in (fixed_dihedrals or []):
+            # The geometry already holds these torsions (input .mol / MMFF stage): freeze the current value
+            hard_constraints.append(Constraint("dihedral", tuple(atoms), None))
+        hard_constraints.extend(extra_constraints or [])
     
     logger.debug("dihedrals before: %s", dihedrals)
     logger.debug("ts_bond_targets: %s", ts_bond_targets)
