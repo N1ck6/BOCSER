@@ -6,6 +6,7 @@ all state and behavior for the conformational search workflow.
 """
 
 import os
+import signal
 import stat
 import sys
 
@@ -2220,6 +2221,14 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # kill / Slurm stop / closed terminal: raise SystemExit instead of dying at once, so the
+    # running ORCA job is cancelled (calc.start_calc) before BOCSER exits
+    def _stop(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _stop)
+    if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) is signal.SIG_DFL:  # not under nohup
+        signal.signal(signal.SIGHUP, _stop)
 
     logger.info("Working folder: %s", args.folder)
     logger.info("Reading config from: %s", args.config)

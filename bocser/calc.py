@@ -318,7 +318,7 @@ def submit_calc(gjf_name: str, scan=False) -> str:
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
 
     proc = subprocess.run(
-        ["sbatch", "-t", str(cfg.orca_poll_timeout_minutes), "-o", "/dev/null", sbatch_name],
+        ["sbatch", "-J", _slurm_job_name(gjf_path), "-t", str(cfg.orca_poll_timeout_minutes), "-o", "/dev/null", sbatch_name],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -354,6 +354,29 @@ def _squeue_running(job_ids: list[str]) -> Union[set, None]:
     return None
 
 
+def _slurm_job_name(gjf_path: Path) -> str:
+    """Job name unique to this BOCSER process: sbatch -W prints the job id only when the job
+    is over, so a running job is cancelled by name (see _cancel_slurm_jobs)."""
+    return f"{gjf_path.stem}_bocser{os.getpid()}"
+
+
+def _cancel_slurm_jobs(job_ids=(), job_name: Union[str, None] = None) -> None:
+    """scancel this user's jobs given by id and/or name (BOCSER is stopping or timed out)."""
+    import getpass
+    commands = []
+    if job_ids:
+        commands.append(["scancel", *sorted(job_ids)])
+    if job_name:
+        commands.append(["scancel", f"--name={job_name}", f"--user={getpass.getuser()}"])
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                logger.warning("%s failed: %s", " ".join(cmd), proc.stderr.strip())
+        except Exception as e:
+            logger.warning("%s failed: %s", " ".join(cmd), e)
+
+
 def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
     """Block until all given SLURM job ids finish, or timeout. Uses a simple
     polling loop against squeue rather than one blocking sbatch -W per job,
@@ -362,18 +385,24 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
     deadline = time.monotonic() + timeout_minutes * 60
     pending = set(job_ids)
 
-    while pending and time.monotonic() < deadline:
-        still_running = _squeue_running(sorted(pending))
-        if still_running is None:
-            # squeue error is not a proof of completion — keep waiting
-            time.sleep(10)
-            continue
-        finished = pending - still_running
-        if finished:
-            logger.debug("Jobs finished: %s", finished)
-        pending = still_running
-        if pending:
-            time.sleep(10)
+    try:
+        while pending and time.monotonic() < deadline:
+            still_running = _squeue_running(sorted(pending))
+            if still_running is None:
+                # squeue error is not a proof of completion — keep waiting
+                time.sleep(10)
+                continue
+            finished = pending - still_running
+            if finished:
+                logger.debug("Jobs finished: %s", finished)
+            pending = still_running
+            if pending:
+                time.sleep(10)
+    except BaseException:
+        # Ctrl+C / kill / error: don't leave the scans running on the cluster
+        logger.warning("BOCSER is stopping — cancelling SLURM jobs %s", sorted(pending))
+        _cancel_slurm_jobs(job_ids=pending)
+        raise
 
     if pending:
         logger.warning(
@@ -381,7 +410,7 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
             "Cancelling them — their .out files may be incomplete/missing.",
             timeout_minutes, len(pending), pending,
         )
-        subprocess.run(["scancel", *sorted(pending)], capture_output=True, text=True)
+        _cancel_slurm_jobs(job_ids=pending)
 
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
@@ -659,11 +688,18 @@ def start_calc(gjf_name: str, scan=False):
             fh.write(f"{orca_cmd} {gjf_name} > {gjf_name[:-4]}.out\n")
     
     timeout_minutes = cfg.orca_poll_timeout_minutes
+    job_name = _slurm_job_name(gjf_path)
     logger.info("Submitting ORCA job %s to SLURM (sbatch -W, timeout=%d min)...", gjf_name, timeout_minutes)
-    proc = subprocess.run(
-        ["sbatch", "-W", "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["sbatch", "-W", "-J", job_name, "-t", str(timeout_minutes), "-o", "/dev/null", sbatch_name],
+            capture_output=True, text=True,
+        )
+    except BaseException:
+        # Ctrl+C / kill: killing sbatch -W leaves the job running, cancel it explicitly
+        logger.warning("BOCSER is stopping — cancelling SLURM job %s", job_name)
+        _cancel_slurm_jobs(job_name=job_name)
+        raise
 
     if proc.returncode != 0:
         submitted_match = re.search(r"Submitted batch job (\d+)", proc.stdout)
@@ -1286,12 +1322,13 @@ def calc_energy(
         ts_bond_targets=ts_bond_targets,
         constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
     )
+    failed_tag = "preopt_failed" if constrained_opt else "opt_failed"
     try:
         start_calc(inp_name)
     except RuntimeError:
         # sbatch -W reports a non-zero job exit code (ORCA abort, SCF failure, time limit)
         logger.exception("ORCA job for %s failed", inp_name)
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
+        _save_broken_struct(xyz_upd, broken_structs_dir, failed_tag, extra_files=[out_name])
         failed("orca")
         return cfg.broken_struct_energy, False
     
@@ -1305,7 +1342,7 @@ def calc_energy(
     res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
-        _save_broken_struct(xyz_upd, broken_structs_dir, "opt_failed", extra_files=[out_name])
+        _save_broken_struct(xyz_upd, broken_structs_dir, failed_tag, extra_files=[out_name])
         failed("orca")
     else:
         _save_successful_out(out_name, constrained_opt, success_out_dir)
