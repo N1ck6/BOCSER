@@ -101,6 +101,11 @@ def build_reference_with_h_mol(mol_file_name: str):
     heavy_idx, h_idx = _heavy_and_h_order(mol)
     return Chem.RenumberAtoms(mol, heavy_idx + h_idx)
 
+@lru_cache(maxsize=8)
+def _reference_with_h_mol_cached(mol_file_name: str):
+    """Read-only copy of build_reference_with_h_mol for the geometry checks (do not modify)."""
+    return build_reference_with_h_mol(mol_file_name)
+
 def raw1_to_with_h_canonical(raw_1idx: int, mol_file_name: str) -> int:
     """1-idx number from .mol -> 0-idx"""
     order = _with_h_order_cached(mol_file_name)
@@ -984,8 +989,11 @@ def _check_rings_intact(
 
     return True, None
 
-def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) -> tuple[bool, Union[tuple[int, int], None]]:
-    """Checks if TS-bonds are within max_length, because RingInfo does not see bonds with H"""
+def _check_ts_bonds_within_limit(
+    xyz_block: str, ts_bonds, max_length: float, min_length: float = 0.0,
+) -> tuple[bool, Union[tuple[int, int], None]]:
+    """Checks if TS-bonds are within [min_length, max_length]: the topology and clash checks
+    skip TS pairs (clash only with clash_vdw_scale > 0), so this is their only limit."""
     if not ts_bonds:
         return True, None
     lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
@@ -1005,7 +1013,62 @@ def _check_ts_bonds_within_limit(xyz_block: str, ts_bonds, max_length: float) ->
         if dist > max_length:
             logger.warning("TS-bond %d-%d surpassed the limit: %.3f A > %.3f A", a, b, dist, max_length)
             return False, (a, b)
+        if dist < min_length:
+            logger.warning("TS-bond %d-%d is too short: %.3f A < %.3f A", a, b, dist, min_length)
+            return False, (a, b)
     return True, None
+
+
+def check_structure(
+    xyz_block: str,
+    mol_file_name: str,
+    original_mol=None,
+    ts_bonds=None,
+    ts_bond_max_length: float = None,
+    check_rings: bool = False,
+) -> tuple[Union[str, None], Union[tuple, None]]:
+    """Geometry checks used before every ORCA run and on the ORCA results:
+      - clash: non-bonded atoms too close (check_is_broken);
+      - topology_broken: a bond of the .mol (H included) stretched beyond
+        bond_stretch_factor * covalent radii sum; TS bonds are skipped;
+      - ts_bond_exceeded: a TS bond outside [ts_bond_min_length, ts_bond_max_length];
+      - ring_open (check_rings, needs original_mol): a ring bond opened.
+    Returns (reason, atoms as 1-idx .mol numbers) of the first failed check, or (None, None).
+    """
+    cfg = _get_config_or_raise()
+    if ts_bond_max_length is None:
+        ts_bond_max_length = cfg.ts_bond_max_length
+
+    def raw1(atoms):
+        return tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in atoms) if atoms else None
+
+    clash_excluded = None
+    if cfg.clash_vdw_scale > 0:
+        # vdW-based thresholds only make sense for non-bonded contacts
+        clash_excluded = set(_bonded_and_13_pairs(mol_file_name)) | {tuple(sorted(p)) for p in (ts_bonds or [])}
+    broken, clash_atoms = check_is_broken(xyz_block, excluded_pairs=clash_excluded)
+    if broken:
+        return "clash", raw1(clash_atoms)
+
+    topology_ok, bad_bond = _check_bond_topology_intact(
+        xyz_block, _reference_with_h_mol_cached(mol_file_name), ts_bonds=ts_bonds,
+    )
+    if not topology_ok:
+        return "topology_broken", raw1(bad_bond)
+
+    if ts_bonds:
+        within_limit, exceeded_atoms = _check_ts_bonds_within_limit(
+            xyz_block, ts_bonds, ts_bond_max_length, cfg.ts_bond_min_length,
+        )
+        if not within_limit:
+            return "ts_bond_exceeded", raw1(exceeded_atoms)
+
+    if check_rings and original_mol is not None:
+        rings_intact, opened_atoms = _check_rings_intact(xyz_block, original_mol, ts_bonds=ts_bonds)
+        if not rings_intact:
+            return "ring_open", raw1(opened_atoms)
+
+    return None, None
 
 def _mmff_regularize_xyz(
     xyz_block: str,
@@ -1176,47 +1239,19 @@ def calc_energy(
         except Exception:
             logger.exception("MMFF94 regularization failed — continuing with the unregularized geometry.")
 
-    clash_excluded = None
-    if cfg.clash_vdw_scale > 0:
-        # vdW-based thresholds only make sense for non-bonded contacts
-        clash_excluded = set(_bonded_and_13_pairs(mol_file_name)) | {tuple(sorted(p)) for p in (ts_bonds or [])}
-    broken, clash_atoms = check_is_broken(xyz_upd, excluded_pairs=clash_excluded)
-    if broken:
-        broken_energy = cfg.broken_struct_energy
+    # Unphysical geometry (clash, broken bond, TS bond out of range, opened ring) never goes to ORCA
+    reason, atoms_raw1 = check_structure(
+        xyz_upd, mol_file_name, original_mol=original_mol, ts_bonds=ts_bonds,
+        ts_bond_max_length=ts_bond_max_length, check_rings=ik_loss is not None,
+    )
+    if reason is not None:
         logger.warning(
-            "Seems that some atoms in current structure are closer than the threshold! Returning broken_struct_energy=%s",
-            broken_energy,
+            "Structure check failed before ORCA (%s, atoms %s) — skipping ORCA, returning broken_struct_energy=%s",
+            reason, atoms_raw1, cfg.broken_struct_energy,
         )
-        atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in clash_atoms) if clash_atoms else None
-        _save_broken_struct(xyz_upd, broken_structs_dir, "clash", atoms_raw1)
+        _save_broken_struct(xyz_upd, broken_structs_dir, reason, atoms_raw1)
         failed("geometry")
-        return broken_energy, False
-    
-    # catches broken bonds in xyz before ORCA
-    if original_mol is not None:
-        topology_ok, bad_bond = _check_bond_topology_intact(xyz_upd, original_mol, ts_bonds=ts_bonds)
-        if not topology_ok:
-            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in bad_bond) if bad_bond else None
-            _save_broken_struct(xyz_upd, broken_structs_dir, "topology_broken", atoms_raw1)
-            failed("geometry")
-            return cfg.broken_struct_energy, False
-
-    if ts_bonds:
-        within_limit, exceeded_atoms = _check_ts_bonds_within_limit(xyz_upd, ts_bonds, ts_bond_max_length)
-        if not within_limit:
-            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in exceeded_atoms) if exceeded_atoms else None
-            _save_broken_struct(xyz_upd, broken_structs_dir, "ts_bond_exceeded", atoms_raw1)
-            failed("geometry")
-            return cfg.broken_struct_energy, False
-
-    if ik_loss is not None:
-        rings_intact, opened_atoms = _check_rings_intact(xyz_upd, original_mol, ts_bonds=ts_bonds)
-        if not rings_intact:
-            logger.warning("Ring has opened in candidate — skipping ORCA")
-            atoms_raw1 = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in opened_atoms) if opened_atoms else None
-            _save_broken_struct(xyz_upd, broken_structs_dir, "ring_open", atoms_raw1)
-            failed("geometry")
-            return cfg.broken_struct_energy, False
+        return cfg.broken_struct_energy, False
 
     opt_status = True
 

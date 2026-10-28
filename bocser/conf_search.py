@@ -76,7 +76,8 @@ from calc import (
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
     _qc_calcs_dir,
-    _check_rings_intact,
+    check_structure,
+    _save_broken_struct,
     raw1_to_with_h_canonical,
     with_h_canonical_to_raw1,
     raw1_to_heavy_canonical,
@@ -200,6 +201,10 @@ class ConfSearchState:
     extra_constraints: list = field(default_factory=list)
     vary_ts_bond_lengths: bool = False
     fixed_ts_bond_targets: list = field(default_factory=list)  # [((a, b), length)], pre-opt only
+    # Last objective call: candidate rejected by the structure checks before the first ORCA run
+    geometry_rejected: bool = False
+    # Last objective call: (query point, energy), to rebuild the dataset if trieste fails after it
+    last_observation: Optional[tuple] = None
     _dihedral_ids_finalized: bool = False
 
 
@@ -394,7 +399,13 @@ class ConfSearchRunner:
         Uses full vector for BO search: first
         len(self.state.dihedral_ids) dihedral angles,
         then — target lengths for TS-bonds."""
+        self.state.geometry_rejected = False
+        self.state.last_observation = None
+        en = self._calc_point_energy(dihedrals)
+        self.state.last_observation = ([float(v) for v in self.state.asked_points[-1]], float(en))
+        return en
 
+    def _calc_point_energy(self, dihedrals: list[float]) -> float:
         if self.state.model_chk:
             logger.info("Checkpoint is not null, calculating previous acq. func. max!")
             dihedrals_tf = tf.constant(dihedrals, dtype=tf.float64)
@@ -432,6 +443,7 @@ class ConfSearchRunner:
             ts_bond_targets = None
 
         logger.info("Optimizing constrained struct")
+        preopt_failure = {}
         try:
             en, preopt_status = calc_energy(
                 self.state.mol_file_name,
@@ -448,6 +460,7 @@ class ConfSearchRunner:
                 fixed_dihedrals=self.state.fixed_dihedrals,
                 extra_constraints=self.state.extra_constraints,
                 ts_bond_targets=ts_bond_targets,
+                failure_info=preopt_failure,
             )
         except Exception:
             logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
@@ -459,7 +472,14 @@ class ConfSearchRunner:
         if not preopt_status:
             self._dump_status_hook(dumping_value=self.state.last_opt_ok)
             skipped_structure_id = increase_structure_id()
-            logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
+            self.state.geometry_rejected = preopt_failure.get("stage") == "geometry"
+            if self.state.geometry_rejected:
+                logger.error(
+                    "Candidate %s rejected by the structure check before ORCA — broken_struct_energy "
+                    "goes to the GP, the BO step is not counted.", skipped_structure_id,
+                )
+            else:
+                logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
             return en + np.random.randn()
         preopt_en = en
         full_opt_failure = {}
@@ -488,6 +508,8 @@ class ConfSearchRunner:
             # e.g. sbatch -W reports a non-zero ORCA exit code: lose this point, not the whole run
             logger.exception("calc_energy (full opt) fell with unexpected exception — counting point as broken.")
             en, opt_status = self.state.config.broken_struct_energy, False
+        if opt_status:
+            opt_status = self._check_full_opt_result(full_opt_failure)
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
         logger.info("Optimized! En = %s", en)
@@ -496,16 +518,36 @@ class ConfSearchRunner:
         if not opt_status:
             skipped_structure_id = increase_structure_id()
             logger.error("Opt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
-            if self.state.config.use_preopt_energy_on_opt_failure and full_opt_failure.get("stage") == "orca":
+            if self.state.config.use_preopt_energy_on_opt_failure and full_opt_failure.get("stage") in ("orca", "result"):
                 # The pre-opt energy at this point is a valid observation (it is what the first
-                # trajectory frame gives on success); only a rejected geometry is not.
+                # trajectory frame gives on success); only a rejected input geometry is not.
                 logger.warning(
-                    "Full optimization failed in ORCA — using the pre-optimization energy %.3f kcal/mol "
-                    "for this point instead of broken_struct_energy.", preopt_en,
+                    "Full optimization failed (%s) — using the pre-optimization energy %.3f kcal/mol "
+                    "for this point instead of broken_struct_energy.",
+                    "ORCA" if full_opt_failure["stage"] == "orca" else "broken final geometry", preopt_en,
                 )
                 return preopt_en
 
         return en + ((not opt_status) * np.random.randn())
+
+    def _check_full_opt_result(self, failure_info: dict) -> bool:
+        """Run the structure checks on the final geometry of a successful full optimization.
+        A broken result counts as a failed full opt (failure_info["stage"] = "result")."""
+        try:
+            xyz_final = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
+            reason, atoms_raw1 = check_structure(
+                xyz_final, self.state.mol_file_name, original_mol=self.state.mol,
+                ts_bonds=self.state.ts_bonds, check_rings=self.state.ik_loss is not None,
+            )
+        except Exception:
+            logger.exception("Could not check the final full-opt geometry — keeping the result.")
+            return True
+        if reason is None:
+            return True
+        logger.error("Final full-opt geometry failed the structure check (%s, atoms %s).", reason, atoms_raw1)
+        _save_broken_struct(xyz_final, self.state.broken_structs_path, f"opt_result_{reason}", atoms_raw1)
+        failure_info["stage"] = "result"
+        return False
 
     def _func_objective(self, cur: tf.Tensor) -> tf.Tensor:
         """Defines the objective function for the Bayesian optimization."""
@@ -540,14 +582,27 @@ class ConfSearchRunner:
 
         return tf.constant([dihedral_vals + ts_bond_vals], dtype=tf.float64)
 
-    def _upd_dataset_from_trj(self, trj_filename: str, dataset: Optional[Dataset]) -> Dataset:
-        """Update the GP dataset with observations from an ORCA trajectory.
+    def _last_trj_path(self) -> str:
+        return str(_qc_calcs_dir(self.state.mol_file_name) / (Path(self.state.mol_file_name).stem + "_trj.xyz"))
 
-        Default: first frame + cluster representatives. With augment_gp_from_orca_trj,
+    def _trj_dataset_part(self, trj_filename: str) -> Optional[Dataset]:
+        """GP observations from the trajectory of a successful full optimization, which replace
+        the energy at the asked point. None (caller keeps the asked point) if the trajectory
+        can't be read or every frame fails the structure checks."""
+        try:
+            return self._parse_trj_dataset_part(trj_filename)
+        except Exception:
+            logger.exception(
+                "Failed to read trajectory %s — the GP keeps the full-opt energy at the asked point.",
+                trj_filename,
+            )
+            return None
+
+    def _parse_trj_dataset_part(self, trj_filename: str) -> Optional[Dataset]:
+        """Default: first frame + cluster representatives. With augment_gp_from_orca_trj,
         more frames are kept but thinned in BO coordinates (consecutive optimization
         steps are strongly correlated, not independent observations).
         """
-        logger.debug("Input dataset is: %s", dataset)
         cfg = self.state.config
         augment = bool(cfg.augment_gp_from_orca_trj)
         # Points must have the same dimensions as the search space (TS-bond lengths too)
@@ -566,32 +621,31 @@ class ConfSearchRunner:
         if augment:
             parsed_data = self._select_trj_training_frames(parsed_data)
             self._save_structures([xyz for _, _, xyz in parsed_data])
-        # Filter out frames where rings opened during ORCA optimization
+        def frame_problem(xyz_block):
+            reason, _ = check_structure(
+                xyz_block, self.state.mol_file_name, original_mol=self.state.mol,
+                ts_bonds=self.state.ts_bonds, check_rings=self.state.ik_loss is not None,
+            )
+            return reason
+
+        # Filter out frames with broken bonds, clashes or opened rings
         valid_degrees, valid_energies = [], []
         for coords, energy, xyz_block in parsed_data:
-            if self.state.ik_loss is not None:
-                rings_intact, _ = _check_rings_intact(xyz_block, self.state.mol, ts_bonds=self.state.ts_bonds)
-                if not rings_intact:
-                    logger.warning(
-                        "Discarding trajectory frame (energy=%.3f kcal/mol): "
-                        "ring opened during optimization",
-                        energy
-                    )
-                    continue
+            reason = frame_problem(xyz_block)
+            if reason is not None:
+                logger.warning("Discarding trajectory frame (energy=%.3f kcal/mol): %s", energy, reason)
+                continue
             valid_degrees.append(coords)
             valid_energies.append(energy)
 
         if not valid_degrees:
-            logger.warning(
-                "All trajectory frames from %s discarded (rings broken in all frames). "
-                "Dataset unchanged.",
-                trj_filename
-            )
-            return dataset
+            logger.warning("All trajectory frames from %s failed the structure check.", trj_filename)
+            return None
 
         # Validate last_point before saving to minima list.
         last_xyz = last_point["xyz_block"]
-        if self.state.ik_loss is None or _check_rings_intact(last_xyz, self.state.mol, ts_bonds=self.state.ts_bonds)[0]:
+        last_reason = frame_problem(last_xyz)
+        if last_reason is None:
             minima_file = os.path.join(
                 self.state.working_folder,
                 f"{self.state.exp_name}_minima/{len(self.state.minima)}.xyz"
@@ -601,22 +655,20 @@ class ConfSearchRunner:
             self.state.minima.append((last_point["coords"], last_point["rel_en"]))
         else:
             logger.warning(
-                "Last trajectory point (energy=%.3f kcal/mol) discarded: "
-                "ring opened during optimization. Not added to minima.",
-                last_point["rel_en"]
+                "Last trajectory point (energy=%.3f kcal/mol) discarded: %s. Not added to minima.",
+                last_point["rel_en"], last_reason,
             )
 
+        logger.info("GP: %d trajectory frame(s) added in place of the asked point", len(valid_degrees))
         logger.debug("Valid frames: %d / %d", len(valid_degrees), len(parsed_data))
         logger.debug("Degrees: %s\nEnergies: %s", valid_degrees, valid_energies)
 
         self.state.global_degrees.extend(valid_degrees)
 
-        add_part = Dataset(
+        return Dataset(
             tf.constant(valid_degrees, dtype="double"),
             tf.constant(valid_energies, dtype="double").reshape(len(valid_energies), 1),
         )
-
-        return add_part if not dataset else dataset + add_part
 
     def _save_structures(self, xyz_blocks: list) -> None:
         """Save trajectory frames used for the GP as {exp_name}/<structure id>.xyz."""
@@ -1229,16 +1281,15 @@ class ConfSearchRunner:
                     initial_query_points = self._extract_dofs_values(mol_copy)
 
                 observed_point = observer(initial_query_points)
-                if not self.state.last_opt_ok:
-                    logger.warning(
-                        "Optimization didn't finish well. Continue only with broken_struct_energy in required point: %s",
-                        observed_point,
-                    )
-                    dataset = observed_point if not dataset else dataset + observed_point
-                else:
-                    dataset = self._upd_dataset_from_trj(
-                        str(_qc_calcs_dir(self.state.mol_file_name) / (Path(self.state.mol_file_name).stem + "_trj.xyz")), dataset
-                    )
+                part = self._trj_dataset_part(self._last_trj_path()) if self.state.last_opt_ok else None
+                if part is None:
+                    if not self.state.last_opt_ok:
+                        logger.warning(
+                            "Optimization didn't finish well. Continue only with the returned energy in required point: %s",
+                            observed_point,
+                        )
+                    part = observed_point
+                dataset = part if dataset is None else dataset + part
             logger.info(
                 "Initial dataset observed! %s minima observed, total %s points has been collected!",
                 config.num_initial_points,
@@ -1734,20 +1785,56 @@ class ConfSearchRunner:
             self._save_results(dataset)
             return
         
-        for step in range(start_step, config.max_steps + 1):
+        # A BO step counts towards max_steps only if its candidate reached ORCA: candidates
+        # rejected by the structure check (or no candidate at all) still go into the GP, but
+        # are retried, at most max_geometry_rejections_in_a_row times in a row (0 = no limit)
+        step = start_step - 1  # counted steps done
+        rejected_in_a_row = 0
+        max_rejected = config.max_geometry_rejections_in_a_row
+        while step < config.max_steps:
+            if max_rejected > 0 and rejected_in_a_row >= max_rejected:
+                break
             logger.debug("Previous last_opt_ok: %s", self.state.last_opt_ok)
-            logger.debug("Step number %s", step)
+            logger.debug("Step number %s", step + 1)
 
+            self.state.last_observation = None
+            self.state.geometry_rejected = False
+            t0 = time.monotonic()
             try:
-                t0 = time.monotonic()
                 result = bo.optimize(1, dataset, model, rule, fit_initial_model=False)
-                logger.info("Optimization step %s succeed! (bo.optimize took %.1f s)", step, time.monotonic() - t0)
-            except Exception:
-                logger.exception(
-                    "trieste bo.optimize() raised on step %s — skipping this step, "
-                    "keeping previous dataset/model unchanged.", step
+                new_dataset = result.try_get_final_dataset()
+                model = result.try_get_final_model()
+                dataset = new_dataset
+                logger.info("Optimization step %s succeed! (bo.optimize took %.1f s)", step + 1, time.monotonic() - t0)
+            except Exception as e:
+                if self.state.last_observation is None:
+                    # Failed before the objective ran (acquisition): nothing new to keep
+                    logger.exception(
+                        "Step %d: trieste failed before the objective was called — no new point, "
+                        "keeping previous dataset and model. The step is not counted.", step + 1,
+                    )
+                    rejected_in_a_row += 1
+                    model.update(dataset)
+                    try:
+                        model.optimize(dataset)
+                    except Exception as e2:
+                        logger.error("Step %d: fallback model.optimize also failed: %s.", step + 1, e2)
+                    continue
+                # Failed after ORCA (GP update/fit): keep the observed point instead of losing hours of ORCA
+                logger.error(
+                    "Step %d: trieste failed after the objective was evaluated (%s) — adding the "
+                    "observed point to the dataset directly.", step + 1, e,
                 )
-                continue
+                query_point, energy = self.state.last_observation
+                dataset = dataset + Dataset(
+                    tf.constant([query_point], dtype=tf.float64), tf.constant([[energy]], dtype=tf.float64),
+                )
+
+            if self.state.geometry_rejected:
+                rejected_in_a_row += 1
+            else:
+                rejected_in_a_row = 0
+                step += 1
 
             logger.debug("After step: %s", self.state.last_opt_ok)
 
@@ -1769,37 +1856,6 @@ class ConfSearchRunner:
                 logger.error("Status file missing — acq/objective failed before dump")
             logger.debug("Last opt status: %s", last_opt_status)
 
-            try:
-                dataset = result.try_get_final_dataset()
-                model = result.try_get_final_model()
-            except Exception as e:
-                if "GatherV2" in str(e) or "not in [0" in str(e):
-                    logger.error(
-                        "Step %s: trieste result unavailable due to an indexing error in "
-                        "acquisition-function. Keeping previous dataset and model.",
-                        step,
-                    )
-                else:
-                    logger.error(
-                        "Step %d: could not get final dataset/model from trieste result: %s. "
-                        "Keeping previous dataset and model. "
-                        "Likely cause: GP hyperparameter optimization failed (Inf/NaN). "
-                        "This usually means dataset observations are in a bad range — "
-                        "check norm_energy and ensemble normalization.",
-                        step, e
-                    )
-                # Continue with old dataset, model
-                model.update(dataset)
-                try:
-                    model.optimize(dataset)
-                except Exception as e2:
-                    logger.error(
-                        "Step %d: fallback model.optimize also failed: %s. "
-                        "Continuing with stale hyperparameters.",
-                        step, e2
-                    )
-                continue
-
             logger.debug("Last asked point was %s", self.state.asked_points[-1])
 
             deepest_minima.append(tf.reduce_min(dataset.observations).numpy())
@@ -1816,10 +1872,9 @@ class ConfSearchRunner:
 
             logger.debug("Eta is %s", getattr(rule._acquisition_function, "_eta", None))
             if self.state.last_opt_ok:
-                dataset = self._erase_last_from_dataset(dataset, 1)
-                dataset = self._upd_dataset_from_trj(
-                    str(_qc_calcs_dir(self.state.mol_file_name) / (Path(self.state.mol_file_name).stem + "_trj.xyz")), dataset
-                )
+                part = self._trj_dataset_part(self._last_trj_path())
+                if part is not None:
+                    dataset = self._erase_last_from_dataset(dataset, 1) + part
             else:
                 logger.warning("Last optimization finished with error, skipping trj parsing!")
             model.update(dataset)
@@ -1840,26 +1895,42 @@ class ConfSearchRunner:
                 logger.debug("Unable to read current minima from acquisition function" )
             logger.info("Updated!")
 
-            logger.info("Step %s completed!", step)
             obs = dataset.observations.numpy().flatten()
             n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
-            logger.info(
-                "Step %d completed. Dataset: %d points, best=%.3f, "
-                "broken=%d, mean_valid=%.3f",
-                step, len(obs), float(obs.min()), n_broken,
-                float(obs[obs < config.broken_struct_energy * 0.9].mean())
-                if n_broken < len(obs) else float("nan"),
-            )
-            _print_progress(step, config.max_steps, float(obs.min()), len(obs), n_broken)
+            if self.state.geometry_rejected:
+                logger.info(
+                    "Candidate rejected by the structure check (%d in a row) — added to the GP as broken, "
+                    "step counter stays at %d/%d. Dataset: %d points, broken=%d",
+                    rejected_in_a_row, step, config.max_steps, len(obs), n_broken,
+                )
+                print(
+                    f"[BOCSER] rejected by structure check ({rejected_in_a_row} in a row), "
+                    f"step stays {step}/{config.max_steps}  points={len(obs):>4}  broken={n_broken:>3}",
+                    flush=True,
+                )
+            else:
+                logger.info("Step %s completed!", step)
+                logger.info(
+                    "Step %d completed. Dataset: %d points, best=%.3f, "
+                    "broken=%d, mean_valid=%.3f",
+                    step, len(obs), float(obs.min()), n_broken,
+                    float(obs[obs < config.broken_struct_energy * 0.9].mean())
+                    if n_broken < len(obs) else float("nan"),
+                )
+                _print_progress(step, config.max_steps, float(obs.min()), len(obs), n_broken)
 
             all_minima_file = Path(self.state.working_folder) / f"{self.state.exp_name}_all_minima.json"
             with open(all_minima_file, "w") as json_minima_writer:
                 json.dump(self.state.minima, json_minima_writer)
             
             try:
+                # A rejected candidate overwrites the snapshot of the current step, so it is kept on resume
                 self._save_checkpoint(dataset, step)
             except Exception:
                 logger.exception("Failed to write checkpoint at step %s", step)
+
+            if self.state.geometry_rejected:
+                continue
 
             # Last N acquisition values: a step can add no value (bo.optimize failed before
             # the objective ran), so indexing the list by step number would misalign the window
@@ -1892,7 +1963,13 @@ class ConfSearchRunner:
                 early_termination_flag = True
                 break
 
-        if not early_termination_flag:
+        if step < config.max_steps and not early_termination_flag:
+            logger.error(
+                "Stopping: %d candidates in a row were rejected before ORCA (max_geometry_rejections_in_a_row=%d); "
+                "%d of %d steps done.", rejected_in_a_row, max_rejected, step, config.max_steps,
+            )
+            print(f"[BOCSER] Stopped: {rejected_in_a_row} rejected candidates in a row at step {step}", flush=True)
+        elif not early_termination_flag:
             logger.info("Max number of steps has been reached!")
             print(f"[BOCSER] Finished: reached max_steps={config.max_steps}", flush=True)
         else:

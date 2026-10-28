@@ -92,7 +92,8 @@ All files are written to `--folder`, prefixed with `exp_name`:
 3. **Initialize dataset** from random RDKit embeddings or a seed ensemble.
 4. **Bayesian optimization loop** (up to `max_steps`):
    - Acquisition function selects next dihedral angles to evaluate.
-   - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt.
+   - The candidate geometry is checked before ORCA (atom clashes, stretched bonds, TS bonds outside `[ts_bond_min_length, ts_bond_max_length]`, opened rings). A rejected candidate goes into the GP with `broken_struct_energy` but does not count towards `max_steps`; after `max_geometry_rejections_in_a_row` rejections in a row the run stops.
+   - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt. The full-opt result goes through the same checks; a broken result counts as a failed full opt.
    - Result updates the GP model.
    - Early-stop when acquisition values plateau (rolling window criterion).
 5. **Deduplicate** all discovered minima (heavy-atom RMSD + energy window) → write final ensemble sorted by energy.

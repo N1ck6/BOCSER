@@ -23,7 +23,8 @@ class ConfSearchConfig:
     rolling_std_threshold : float = 0.15
     rolling_mean_threshold : float = 1.
     num_initial_points : int = 3
-    max_steps : int = 50
+    max_steps : int = 50  # counts only BO steps whose candidate passed the structure check and went to ORCA
+    max_geometry_rejections_in_a_row: int = 50  # stop the run after this many uncounted (rejected) candidates in a row; 0 = no limit
     exp_name : str = "cs"
     load_ensemble : Union[str, None] = None
     acquisition_function : str = "evm"  # ei | evm | ik
