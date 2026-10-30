@@ -914,7 +914,16 @@ class ConfSearchRunner:
                 logger.info("Fixed torsions (at double bonds): %s", self.state.fixed_dihedrals)
 
             if ik_loss_dihedrals_idxs:
-                self.state.ik_loss = IKLoss.from_rdkit(self.state.mol, ring_atoms_list)
+                # The ring closure must use the TS-bond lengths the pre-opt holds, not the .mol ones
+                ts_lengths = {frozenset(pair): float(length) for pair, length in self.state.fixed_ts_bond_targets}
+                ring_bonds = {frozenset((r[k], r[(k + 1) % len(r)])) for r in ring_atoms_list for k in range(len(r))}
+                for pair in ts_lengths.keys() & ring_bonds:
+                    logger.info(
+                        "IK loss: ring TS bond %s uses the pre-opt length %.4f A instead of the .mol length",
+                        tuple(with_h_canonical_to_raw1(a, self.state.mol_file_name) for a in sorted(pair)),
+                        ts_lengths[pair],
+                    )
+                self.state.ik_loss = IKLoss.from_rdkit(self.state.mol, ring_atoms_list, bond_length_overrides=ts_lengths)
                 self.state.ik_loss_dihedrals_idxs = ik_loss_dihedrals_idxs
                 logger.info("IK loss prepared. IK dihedral indices: %s", ik_loss_dihedrals_idxs)
             else:

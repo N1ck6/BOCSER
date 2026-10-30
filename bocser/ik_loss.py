@@ -99,12 +99,20 @@ class IKLoss:
             self.T_matrices.append(tf.stack(cycle_T_matrices))
 
     @classmethod
-    def from_rdkit(cls, mol: Chem.Mol, all_ring_atoms: List[List[int]]) -> "IKLoss":
+    def from_rdkit(
+        cls,
+        mol: Chem.Mol,
+        all_ring_atoms: List[List[int]],
+        bond_length_overrides: Dict[frozenset, float] = None,
+    ) -> "IKLoss":
         """Build IKLoss from an RDKit molecule and ring atom index lists.
 
         The helper uses `ringo` to extract reference geometry. It returns a
         complete IKLoss instance with tensors prepared for TF computations.
+        bond_length_overrides: {frozenset((a, b)): length} replacing the .mol length of
+        these ring bonds (TS bonds held at another length in the pre-optimization).
         """
+        bond_length_overrides = bond_length_overrides or {}
         mol = Chem.AddHs(mol)
         with tempfile.NamedTemporaryFile(suffix=".xyz", delete=True) as tmp:
             Chem.MolToXYZFile(mol, tmp.name)
@@ -124,7 +132,10 @@ class IKLoss:
             ring_atoms = CyclicCollection(ring_atoms_list)
 
             bl = [
-                conf.l(*_one_based(tuple(ring_atoms[i] for i in (k, k + 1))))
+                bond_length_overrides.get(
+                    frozenset((ring_atoms[k], ring_atoms[k + 1])),
+                    conf.l(*_one_based(tuple(ring_atoms[i] for i in (k, k + 1)))),
+                )
                 for k in range(len(ring_atoms))
             ]
             va = [
