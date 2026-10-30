@@ -92,9 +92,9 @@ class IKLoss:
                     cycle_T_matrices.append(self.T_matrix_single(da))
                 except ValueError as e:
                     raise ValueError(
-                        f"IKLoss.__init__: не удалось построить эталонную "
-                        f"T-матрицу для кольца #{cycle_idx}, позиция #{pos_idx} "
-                        f"(значение={da!r}): {e}"
+                        f"IKLoss.__init__: could not build the reference "
+                        f"T-matrix for ring #{cycle_idx}, position #{pos_idx} "
+                        f"(value={da!r}): {e}"
                     ) from e
             self.T_matrices.append(tf.stack(cycle_T_matrices))
 

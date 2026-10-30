@@ -789,7 +789,7 @@ class ConfSearchRunner:
         _validate_extra_constraints_atoms(config)
         self.state.extra_constraints = resolve_extra_constraints(config.extra_constraints, self.state.mol_file_name)
         if self.state.extra_constraints:
-            logger.info("Загружено %d пользовательских extra_constraints", len(self.state.extra_constraints))
+            logger.info("Loaded %d user extra_constraints", len(self.state.extra_constraints))
 
         self.state.exp_name = config.exp_name
         self.state.structures_path = str(Path(self.state.working_folder) / f"{config.exp_name}/")
@@ -819,7 +819,7 @@ class ConfSearchRunner:
             for a, b in config.ts_bonds
         ]
         if self.state.ts_bonds:
-            logger.info("TS-связи (config 1-idx -> canonical 0-idx): %s -> %s", config.ts_bonds, self.state.ts_bonds)
+            logger.info("TS bonds (config 1-idx -> canonical 0-idx): %s -> %s", config.ts_bonds, self.state.ts_bonds)
 
         # Must run before vary_ts_bond_lengths is read below (it may be switched off here)
         self.state.fixed_ts_bond_targets = self._resolve_fixed_ts_bond_targets(config)
@@ -967,7 +967,7 @@ class ConfSearchRunner:
                         f"IK dihedral index {idx} is out of range n_dihedral={n_dihedral}. "
                         f"ik_loss_dihedrals_idxs={ik_loss_dihedrals_idxs}. "
                         f"Check frag_key_to_position in get_ring_dihedrals() and filter "
-                        f"fixed_double_bonds в get_interesting_frags()."
+                        f"fixed_double_bonds in get_interesting_frags()."
                     )
 
         if config.vary_ts_bond_lengths and self.state.ts_bonds:
@@ -1099,7 +1099,7 @@ class ConfSearchRunner:
                         f"IK dihedral index {idx} is out of range search_dim={self.state.search_dim}. "
                         f"ik_loss_dihedrals_idxs={ik_loss_dihedrals_idxs}. "
                         f"Check frag_key_to_position in get_ring_dihedrals() and filter "
-                        f"fixed_double_bonds в get_interesting_frags()."
+                        f"fixed_double_bonds in get_interesting_frags()."
                     )
 
     def _build_model_and_acquisition(self) -> Tuple[Any, Any, Any]:

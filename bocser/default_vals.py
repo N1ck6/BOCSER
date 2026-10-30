@@ -130,15 +130,15 @@ class ConfSearchConfig:
         normalized = []
         for i, raw in enumerate(self.extra_constraints):
             if "type" not in raw or "atoms" not in raw:
-                raise ValueError(f"extra_constraints[{i}]: нужны поля 'type' и 'atoms', получено {raw}")
+                raise ValueError(f"extra_constraints[{i}]: fields 'type' and 'atoms' are required, got {raw}")
             ctype = raw["type"]
             if ctype not in _CONSTRAINT_ATOM_COUNT:
-                raise ValueError(f"extra_constraints[{i}]: type должен быть bond/angle/dihedral, получено {ctype!r}")
+                raise ValueError(f"extra_constraints[{i}]: type must be bond/angle/dihedral, got {ctype!r}")
             atoms = tuple(int(a) for a in raw["atoms"])
             if len(atoms) != _CONSTRAINT_ATOM_COUNT[ctype]:
                 raise ValueError(
-                    f"extra_constraints[{i}]: для type={ctype} нужно "
-                    f"{_CONSTRAINT_ATOM_COUNT[ctype]} атомов, получено {len(atoms)}: {atoms}"
+                    f"extra_constraints[{i}]: type={ctype} needs "
+                    f"{_CONSTRAINT_ATOM_COUNT[ctype]} atoms, got {len(atoms)}: {atoms}"
                 )
             value = raw.get("value", "current")
             normalized.append({"type": ctype, "atoms": atoms, "value": value})

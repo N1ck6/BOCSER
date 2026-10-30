@@ -290,7 +290,7 @@ def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list
             value = float(value)
         c = Constraint(ctype, canon_atoms, round(value, 6))
         logger.info(
-            "extra_constraint: type=%s raw_atoms(1-idx, с H)=%s -> canonical(0-idx)=%s value=%.4f",
+            "extra_constraint: type=%s raw_atoms(1-idx, with H)=%s -> canonical(0-idx)=%s value=%.4f",
             ctype, raw["atoms"], canon_atoms, value,
         )
         result.append(c)
