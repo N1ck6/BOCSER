@@ -51,8 +51,10 @@ from rdkit.Chem import AllChem, rdMolAlign
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import hashlib
+import atexit
 import json
 import re
+import socket
 import shutil
 from pathlib import Path
 import numpy as np
@@ -210,6 +212,21 @@ class ConfSearchState:
     outcomes: dict = field(default_factory=dict)
     n_unique_conformers: int = 0
     _dihedral_ids_finalized: bool = False
+
+
+LOCK_FILE_NAME = "bocser.lock"
+
+
+def _pid_alive(pid) -> bool:
+    if os.name == "nt":
+        return True  # os.kill(pid, 0) is not a harmless probe on Windows
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _is_broken(energy: float, broken_ref: float, tol: float = 5.0) -> bool:
@@ -390,6 +407,54 @@ class ConfSearchRunner:
             "from %d to %d entries.",
             len(drop_idx_to_window), orig_len, len(new_dihedral_ids),
         )
+
+    def acquire_lock(self) -> None:
+        """One BOCSER run per qc_calcs/ folder (next to the .mol): two runs there overwrite
+        each other's ORCA inputs, outputs and scratch files. A lock left by a dead process
+        on this host is removed; a lock from another host has to be deleted by hand."""
+        qc_dir = Path(self.state.config.mol_file_name).resolve().parent / "qc_calcs"
+        qc_dir.mkdir(parents=True, exist_ok=True)
+        path = qc_dir / LOCK_FILE_NAME
+        host = socket.gethostname()
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                try:
+                    owner = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    owner = {}
+                if owner.get("host") == host and not _pid_alive(owner.get("pid")):
+                    logger.warning("Removing a stale lock %s (process %s is not running)", path, owner.get("pid"))
+                    path.unlink(missing_ok=True)
+                    continue
+                raise RuntimeError(
+                    f"Another BOCSER run uses {qc_dir}: host {owner.get('host', '?')}, pid {owner.get('pid', '?')}, "
+                    f"folder {owner.get('working_folder', '?')}, started {owner.get('started', '?')}. Two runs with "
+                    f"the same .mol folder overwrite each other's ORCA files. Wait for that run to finish or put "
+                    f"the .mol into a folder of its own. If no run is active, delete {path}."
+                )
+            with os.fdopen(fd, "w") as fh:
+                json.dump({
+                    "host": host, "pid": os.getpid(), "working_folder": self.state.working_folder,
+                    "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }, fh)
+            self._lock_path = path
+            atexit.register(self.release_lock)
+            logger.info("Lock taken: %s", path)
+            return
+        raise RuntimeError(f"Could not take the lock {path}")
+
+    def release_lock(self) -> None:
+        path = getattr(self, "_lock_path", None)
+        if path is None:
+            return
+        try:
+            if json.loads(path.read_text()).get("pid") == os.getpid():
+                path.unlink()
+        except (OSError, ValueError):
+            pass
+        self._lock_path = None
 
     def _dump_status_hook(self, dumping_value: bool, filename: Optional[str] = None) -> None:
         """Save optimization status to JSON file."""
@@ -1378,6 +1443,7 @@ class ConfSearchRunner:
         keep.add(Path(config.sbatch_template_name).resolve())
         qc_dir = (Path(config.mol_file_name).resolve().parent / "qc_calcs").resolve()
         keep.add(qc_dir / config.sbatch_template_name)
+        keep.add(qc_dir / LOCK_FILE_NAME)  # held by this run
 
         if config.load_ensemble:
             # same lookup as _resolve_ensemble_path: working folder, then CWD
@@ -2366,8 +2432,12 @@ def main():
 
     runner = ConfSearchRunner(working_folder=args.folder)
     runner.load_config(args.config)
-    runner.setup()
-    runner.run()
+    runner.acquire_lock()
+    try:
+        runner.setup()
+        runner.run()
+    finally:
+        runner.release_lock()
 
     logger.info("Conformational search completed!")
 
