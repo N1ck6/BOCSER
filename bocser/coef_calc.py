@@ -38,6 +38,7 @@ class CoefCalculator:
         db_connector : Union[Connector, None] = None,
         fixed_double_bonds: set = None,
         ts_bonds: set = None,
+        submit_scans: bool = True,
     ) -> None:
         """
             mol - rdkit molecule
@@ -49,7 +50,10 @@ class CoefCalculator:
             charge - charge of molecule
             multipl - multiplicity
             degrees - degree grid to scan
+            submit_scans - False (dry run): scans not in the cache are not run, flat mean instead
         """
+        self.submit_scans = submit_scans
+        self.skipped_scans = set() # not run in a dry run
 
         self.mol = mol
         self.dir_for_inps = (dir_for_inps.rstrip("/") + "/") if dir_for_inps else ""
@@ -652,7 +656,7 @@ class CoefCalculator:
         for inp_name in lst:
             res_file_name = inp_name[:-3] + "relaxscanact.dat"
 
-            if self.scanfile2smiles[inp_name] in self.fetched_coefs:
+            if self.scanfile2smiles[inp_name] in self.fetched_coefs or inp_name in self.skipped_scans:
                 result.append(None)
                 continue
 
@@ -695,7 +699,10 @@ class CoefCalculator:
             if self.scanfile2smiles[cur] not in self.fetched_coefs
         ]
 
-        if to_run:
+        if to_run and not self.submit_scans:
+            logger.info("Dry run: %d torsion scan(s) not submitted, flat mean used for them", len(to_run))
+            self.skipped_scans.update(to_run)
+        elif to_run:
             job_ids = [submit_calc(cur, scan=True) for cur in to_run]
             logger.info("Submitted %d independent torsion scans concurrently: %s", len(job_ids), job_ids)
             cfg = config_manager.get_config()
@@ -714,6 +721,9 @@ class CoefCalculator:
             if self.scanfile2smiles[inp_filename] in self.fetched_coefs:
                 res.append(self.fetched_coefs[self.scanfile2smiles[inp_filename]])
                 continue
+            if inp_filename in self.skipped_scans:
+                res.append((0.0,) * 7)
+                continue
             if inp_filename not in self.failed_scans:
                 try:
                     res.append(calc_coefs(self.degrees, energies))
@@ -728,7 +738,7 @@ class CoefCalculator:
             )
             res.append((0.0,) * 7)
 
-        self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs) - len(self.failed_scans)
+        self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs) - len(self.failed_scans) - len(self.skipped_scans)
         self.n_fourier_cached = len(self.fetched_coefs) - len(self.flat_ring_smiles)
         logger.info(
             "Sucessful calculated %s coefs and fetched from db %s coefs! (%d ring fragment(s) not scanned, flat mean)",
@@ -736,7 +746,8 @@ class CoefCalculator:
         )
 
         for inp_filename, coefs in zip(inp_filenames, res):
-            if self.scanfile2smiles[inp_filename] in self.fetched_coefs or inp_filename in self.failed_scans:
+            if (self.scanfile2smiles[inp_filename] in self.fetched_coefs
+                    or inp_filename in self.failed_scans or inp_filename in self.skipped_scans):
                 continue
             self.db_connector.set_request_params(
                 "INSERT INTO dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) "

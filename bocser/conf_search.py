@@ -272,6 +272,7 @@ class ConfSearchRunner:
             db_file = str(parent_dir / "dihedral_logs.db")
         
         self.state.db_file = db_file
+        self.dry_run = False  # --dry-run: no ORCA, see dry_run_report()
         
         # Ensure working folder exists
         Path(working_folder).mkdir(parents=True, exist_ok=True)
@@ -474,6 +475,59 @@ class ConfSearchRunner:
         self.state.last_observation = ([float(v) for v in self.state.asked_points[-1]], float(en))
         return en
 
+    def _ts_bond_targets(self, point) -> Optional[list]:
+        """TS-bond lengths held in the pre-optimization only: sampled by BO, or fixed
+        (user values / lowest-energy ensemble conformer, see _resolve_fixed_ts_bond_targets)."""
+        n_dih = len(self.state.dihedral_ids)
+        if self.state.vary_ts_bond_lengths:
+            return list(zip(self.state.ts_bonds, point[n_dih:]))
+        if self.state.fixed_ts_bond_targets:
+            return list(self.state.fixed_ts_bond_targets)
+        return None
+
+    def dry_run_report(self) -> None:
+        """--dry-run: write the pre-opt and full-opt ORCA inputs of one candidate (the .mol
+        geometry at its own torsions) to the working folder, without running ORCA."""
+        point = [float(v) for v in self._extract_dofs_values(self.state.mol).numpy()[0]]
+        n_dih = len(self.state.dihedral_ids)
+        folder = Path(self.state.working_folder)
+        pre_inp = folder / f"{self.state.exp_name}_dry_run_preopt.inp"
+        opt_inp = folder / f"{self.state.exp_name}_dry_run_opt.inp"
+        common = dict(
+            ik_loss=self.state.ik_loss, original_mol=self.state.mol, broken_structs_dir=None,
+            success_out_dir=None, ts_bonds=self.state.ts_bonds,
+            ts_bond_max_length=self.state.config.ts_bond_max_length,
+            fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
+        )
+        failure = {}
+        _, ok = calc_energy(
+            self.state.mol_file_name, list(zip(self.state.dihedral_ids, point[:n_dih])), 0.0,
+            constrained_opt=True, ts_bond_targets=self._ts_bond_targets(point), failure_info=failure,
+            write_input_only=str(pre_inp), **common,
+        )
+        if ok:
+            # Geometry here is the pre-opt input; in a real run the full opt starts from the pre-opt result
+            calc_energy(
+                self.state.mol_file_name, list(zip(self.state.dihedral_ids, point[:n_dih])), 0.0,
+                write_input_only=str(opt_inp), **common,
+            )
+        unknown = list(getattr(self.state.config, "unknown_keys", []))
+        lines = [
+            "===== BOCSER dry run =====",
+            f"GP search dimensions: {self.state.search_dim} ({n_dih} torsions"
+            + (f", {len(self.state.ts_bonds)} TS-bond lengths)" if self.state.vary_ts_bond_lengths else ")"),
+            "Test candidate (.mol geometry): "
+            + ("passes the structure check" if ok else f"REJECTED by the structure check ({failure.get('reason')})"),
+        ]
+        if ok:
+            lines.append(f"ORCA inputs written: {pre_inp.name}, {opt_inp.name}")
+        if unknown:
+            lines.append(f"Unknown config keys (ignored): {', '.join(unknown)}")
+        lines.append("norm_energy and torsion scans not in the cache are not computed in a dry run.")
+        lines.append("==========================")
+        logger.info("\n".join(lines))
+        print("[BOCSER] Dry run finished, see the log" + (f"; inputs in {folder}" if ok else ""), flush=True)
+
     def _count_outcome(self, category: str, reason: str = "") -> None:
         key = f"{category}:{reason}" if reason else category
         self.state.outcomes[key] = self.state.outcomes.get(key, 0) + 1
@@ -506,14 +560,7 @@ class ConfSearchRunner:
         # Pre-opt
         n_dih = len(self.state.dihedral_ids)
         dihedral_vals = dihedrals[:n_dih]
-        # TS-bond lengths held in the pre-optimization only: sampled by BO, or fixed
-        # (user values / lowest-energy ensemble conformer, see _resolve_fixed_ts_bond_targets)
-        if self.state.vary_ts_bond_lengths:
-            ts_bond_targets = list(zip(self.state.ts_bonds, dihedrals[n_dih:]))
-        elif self.state.fixed_ts_bond_targets:
-            ts_bond_targets = list(self.state.fixed_ts_bond_targets)
-        else:
-            ts_bond_targets = None
+        ts_bond_targets = self._ts_bond_targets(dihedrals)
 
         logger.info("Optimizing constrained struct")
         preopt_failure = {}
@@ -847,7 +894,9 @@ class ConfSearchRunner:
         tf.config.run_functions_eagerly(config.tf_eager_mode)
         logger.info("tf.config.run_functions_eagerly(%s)", config.tf_eager_mode)
         
-        if config.clear_working_folder:
+        if self.dry_run:
+            logger.info("Dry run: the working folder is left as it is, ORCA is not started.")
+        elif config.clear_working_folder:
             self._clear_working_folder()
         else:
             self._drop_previous_log()
@@ -960,6 +1009,7 @@ class ConfSearchRunner:
             db_connector=LocalConnector(self.state.db_file),
             fixed_double_bonds=fixed_double_bonds,
             ts_bonds=ts_bonds_heavy_canonical,
+            submit_scans=not self.dry_run,
         )
 
         logger.info("Coef calculator created!")
@@ -1146,6 +1196,12 @@ class ConfSearchRunner:
                     nsteps=nsteps,
                 )
                 pairs_to_scan.append((a, b, pair_key, inp_name))
+
+            if pairs_to_scan and self.dry_run:
+                logger.info("Dry run: %d TS-bond scan(s) not submitted, flat mean used for them", len(pairs_to_scan))
+                for (_, _, pair_key, _) in pairs_to_scan:
+                    cached_coefs[pair_key] = (0.0, 1.0, (config.ts_bond_min_length + config.ts_bond_max_length) / 2, 0.0)
+                pairs_to_scan = []
 
             if pairs_to_scan:
                 job_ids = [submit_calc(inp_name, scan=True) for (_, _, _, inp_name) in pairs_to_scan]
@@ -2416,6 +2472,11 @@ def main():
         default="config.yaml",
         help="Config file name (relative to --folder or absolute path)"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check the config: build the GP axes and write the ORCA inputs of one candidate, without running ORCA"
+    )
 
     args = parser.parse_args()
 
@@ -2432,6 +2493,11 @@ def main():
 
     runner = ConfSearchRunner(working_folder=args.folder)
     runner.load_config(args.config)
+    if args.dry_run:
+        runner.dry_run = True
+        runner.setup()
+        runner.dry_run_report()
+        return
     runner.acquire_lock()
     try:
         runner.setup()

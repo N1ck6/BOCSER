@@ -17,7 +17,13 @@ pip install -r requirements.txt
 mkdir my_run && cd my_run
 # Place molecule.mol and config.yaml here
 
-# 3. Run (in the background; '>>' keeps the previous run's log for the backup)
+# 3. Optional check without ORCA: builds the GP axes and writes the pre-opt and
+#    full-opt ORCA inputs of one candidate ({exp_name}_dry_run_*.inp) to my_run/
+python bocser/conf_search.py --folder my_run --config config.yaml --dry-run
+
+# 4. Run (in the background; '>>' keeps the previous run's log for the backup)
+# At the end the log shows a run summary (outcomes by stage, minima, unknown config keys),
+# also saved to {exp_name}_run_summary.json
 nohup python -u bocser/conf_search.py --folder my_run --config config.yaml >> my_run/run.log 2>&1 &
 
 # Or via Slurm (requiers installed ORCA to perform calculations and Slurm workload manager to manage them)
