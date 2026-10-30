@@ -57,11 +57,13 @@ def load_config(path: str) -> ConfSearchConfig:
 
     cfg_kwargs: Dict[str, Any] = {}
     valid_fields = {f.name: f.type for f in fields(ConfSearchConfig)}
+    unknown_keys = []
 
     for k, v in raw.items():
         if k not in valid_fields:
             # don't fail hard on unknown keys, just warn
             logger.warning("Unknown config key '%s' - ignoring", k)
+            unknown_keys.append(k)
             continue
         target_type = valid_fields[k]
         try:
@@ -80,4 +82,5 @@ def load_config(path: str) -> ConfSearchConfig:
     except TypeError as e:
         raise ConfigError(f"Failed to construct ConfSearchConfig: {e}")
 
+    config.unknown_keys = unknown_keys  # repeated in the run summary, not a config field
     return config

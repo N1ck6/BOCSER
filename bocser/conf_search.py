@@ -206,6 +206,9 @@ class ConfSearchState:
     geometry_rejected: bool = False
     # Last objective call: (query point, energy), to rebuild the dataset if trieste fails after it
     last_observation: Optional[tuple] = None
+    # Outcome of every evaluated candidate, "category:reason" -> count (run summary)
+    outcomes: dict = field(default_factory=dict)
+    n_unique_conformers: int = 0
     _dihedral_ids_finalized: bool = False
 
 
@@ -406,6 +409,10 @@ class ConfSearchRunner:
         self.state.last_observation = ([float(v) for v in self.state.asked_points[-1]], float(en))
         return en
 
+    def _count_outcome(self, category: str, reason: str = "") -> None:
+        key = f"{category}:{reason}" if reason else category
+        self.state.outcomes[key] = self.state.outcomes.get(key, 0) + 1
+
     def _calc_point_energy(self, dihedrals: list[float]) -> float:
         if self.state.model_chk:
             logger.info("Checkpoint is not null, calculating previous acq. func. max!")
@@ -474,6 +481,10 @@ class ConfSearchRunner:
             self._dump_status_hook(dumping_value=self.state.last_opt_ok)
             skipped_structure_id = increase_structure_id()
             self.state.geometry_rejected = preopt_failure.get("stage") == "geometry"
+            self._count_outcome(
+                "rejected_before_orca" if self.state.geometry_rejected else "preopt_failed",
+                preopt_failure.get("reason") or "error",
+            )
             if self.state.geometry_rejected:
                 logger.error(
                     "Candidate %s rejected by the structure check before ORCA — broken_struct_energy "
@@ -516,7 +527,14 @@ class ConfSearchRunner:
         logger.info("Optimized! En = %s", en)
         self._dump_status_hook(dumping_value=self.state.last_opt_ok)
 
-        if not opt_status:
+        if opt_status:
+            self._count_outcome("success")
+        else:
+            self._count_outcome(
+                {"geometry": "opt_input_rejected", "result": "opt_result_broken"}.get(
+                    full_opt_failure.get("stage"), "opt_failed"),
+                full_opt_failure.get("reason") or "error",
+            )
             skipped_structure_id = increase_structure_id()
             logger.error("Opt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
             if self.state.config.use_preopt_energy_on_opt_failure and full_opt_failure.get("stage") in ("orca", "result"):
@@ -548,6 +566,7 @@ class ConfSearchRunner:
         logger.error("Final full-opt geometry failed the structure check (%s, atoms %s).", reason, atoms_raw1)
         _save_broken_struct(xyz_final, self.state.broken_structs_path, f"opt_result_{reason}", atoms_raw1)
         failure_info["stage"] = "result"
+        failure_info["reason"] = reason
         return False
 
     def _func_objective(self, cur: tf.Tensor) -> tf.Tensor:
@@ -1540,6 +1559,8 @@ class ConfSearchRunner:
             "acq_vals_log": list(self.state.acq_vals_log),
             "deepest_minima": [float(v) for v in self.state.deepest_minima],
             "norm_energy": float(self.state.norm_energy),  # all observations are relative to it
+            "outcomes": dict(self.state.outcomes),
+            "events": run_state.events(),
         }
 
         existing = self._load_checkpoint_file()
@@ -1676,6 +1697,8 @@ class ConfSearchRunner:
                 )
             self.state.norm_energy = float(ckpt_norm)
         self.state.minima = snapshot.get("minima", [])
+        self.state.outcomes = dict(snapshot.get("outcomes", {}))
+        run_state.set_events(snapshot.get("events", {}))
         self.state.current_minima = float(snapshot.get("current_minima", 1e9))
         self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
         self.state.deepest_minima = list(snapshot.get("deepest_minima", []))
@@ -1816,6 +1839,7 @@ class ConfSearchRunner:
                 start_step, config.max_steps,
             )
             self._save_results(dataset)
+            self._log_run_summary(start_step - 1, "nothing left to run")
             return
         
         # A BO step counts towards max_steps only if its candidate reached ORCA: candidates
@@ -1997,19 +2021,81 @@ class ConfSearchRunner:
                 break
 
         if step < config.max_steps and not early_termination_flag:
+            stop_reason = f"{rejected_in_a_row} rejected candidates in a row"
             logger.error(
                 "Stopping: %d candidates in a row were rejected before ORCA (max_geometry_rejections_in_a_row=%d); "
                 "%d of %d steps done.", rejected_in_a_row, max_rejected, step, config.max_steps,
             )
             print(f"[BOCSER] Stopped: {rejected_in_a_row} rejected candidates in a row at step {step}", flush=True)
         elif not early_termination_flag:
+            stop_reason = "max_steps reached"
             logger.info("Max number of steps has been reached!")
             print(f"[BOCSER] Finished: reached max_steps={config.max_steps}", flush=True)
         else:
+            stop_reason = "convergence criterion met"
             print(f"[BOCSER] Finished early: convergence criterion met at step {step}", flush=True)
 
         logger.info("MINIMA: %s", self.state.minima)
         self._save_results(dataset)
+        self._log_run_summary(step, stop_reason)
+
+    _OUTCOME_TITLES = (
+        ("success", "successful (pre-opt + full opt)"),
+        ("rejected_before_orca", "rejected by the structure check before ORCA"),
+        ("preopt_failed", "pre-opt failed in ORCA"),
+        ("opt_input_rejected", "pre-opt result rejected by the structure check"),
+        ("opt_failed", "full opt failed in ORCA"),
+        ("opt_result_broken", "full opt result rejected by the structure check"),
+    )
+
+    def _log_run_summary(self, steps_done: int, stop_reason: str) -> None:
+        """Counts of candidate outcomes by stage and reason (whole run, resumed parts included),
+        logged and written to {exp_name}_run_summary.json."""
+        config = self.state.config
+        by_category: dict = {}
+        for key, n in self.state.outcomes.items():
+            category, _, reason = key.partition(":")
+            by_category.setdefault(category, {})
+            by_category[category][reason or "-"] = by_category[category].get(reason or "-", 0) + n
+        events = run_state.events()
+        unknown_keys = list(getattr(config, "unknown_keys", []))
+
+        lines = [
+            "===== BOCSER run summary =====",
+            f"Steps counted: {steps_done} of max_steps={config.max_steps} (stopped: {stop_reason})",
+            f"Candidates evaluated: {sum(self.state.outcomes.values())}",
+        ]
+        for category, title in self._OUTCOME_TITLES:
+            reasons = by_category.get(category, {})
+            total = sum(reasons.values())
+            detail = ", ".join(f"{r} {n}" for r, n in sorted(reasons.items(), key=lambda x: -x[1]) if r != "-")
+            lines.append(f"  {title}: {total}" + (f" ({detail})" if detail else ""))
+        lines.append(f"MMFF regularization not converged: {events.get('mmff_not_converged', 0)}")
+        lines.append(
+            f"Minima found: {len(self.state.minima)}, unique conformers in the final ensemble: "
+            f"{self.state.n_unique_conformers}"
+        )
+        if unknown_keys:
+            lines.append(f"Unknown config keys (ignored): {', '.join(unknown_keys)}")
+        lines.append("==============================")
+        logger.info("\n".join(lines))
+
+        summary = {
+            "steps_counted": steps_done,
+            "max_steps": config.max_steps,
+            "stop_reason": stop_reason,
+            "outcomes": by_category,
+            "events": events,
+            "minima_found": len(self.state.minima),
+            "unique_conformers": self.state.n_unique_conformers,
+            "unknown_config_keys": unknown_keys,
+        }
+        try:
+            (Path(self.state.working_folder) / f"{self.state.exp_name}_run_summary.json").write_text(
+                json.dumps(summary, indent=2)
+            )
+        except OSError:
+            logger.exception("Could not write the run summary file")
 
     def _save_results(self, dataset: Dataset) -> None:
         """Save final results and ensembles."""
@@ -2040,6 +2126,7 @@ class ConfSearchRunner:
             return
 
         res = self._cluster_minima_by_rmsd()
+        self.state.n_unique_conformers = len(res)
 
         clustering_file = str(Path(self.state.working_folder) / f"{self.state.exp_name}_clustering_results.json")
         logger.info(

@@ -798,10 +798,16 @@ def inp_to_out_name(inp_file_name : str) -> str:
     cfg = _get_config_or_raise()
     return (inp_file_name[:-4] + ".out") if not cfg.ts or not cfg.use_grass else (os.path.dirname(inp_file_name) + "/outfile.out")
 
-def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
+def find_energy_in_log(log_name : str, info: Union[dict, None] = None) -> tuple[float, bool, int | None]:
     """
         finds energy of structure in log file
+        info: optional dict; on failure its "reason" is set to no_out_file,
+            no_normal_termination, max_iterations, no_energy or parse_error
     """
+    def fail(reason: str) -> None:
+        if info is not None:
+            info["reason"] = reason
+
     import re
     energy_re = re.compile(r"FINAL SINGLE POINT ENERGY\s+(-?\d+\.\d+)")
     alt_re = re.compile(r"TOTAL ENERGY\s*[:=]\s*(-?\d+\.\d+)")
@@ -825,6 +831,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
                     "treating optimization as failed, not parsing energy.",
                     log_name, len(last_lines),
                 )
+                fail("no_normal_termination")
                 return cfg.broken_struct_energy, False, None
 
             cycles = [int(c) for c in cycle_re.findall(joined)]
@@ -833,6 +840,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
             if maxiter_re.search(joined):
                 # Iteration threshhold is hit, point can be not a minimum
                 logger.warning("ORCA reached MaxIter (cycle=%s) — returning broken_struct_energy", n_cycles)
+                fail("max_iterations")
                 return cfg.broken_struct_energy, False, n_cycles
 
             # The window can hold several optimization cycles: the final energy is the LAST match
@@ -840,6 +848,7 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
             if not matches:
                 # no energy line found -> optimization likely failed; return broken_struct_energy
                 logger.warning("No energy line found in %s; returning broken_struct_energy", log_name)
+                fail("no_energy")
                 return cfg.broken_struct_energy, False, None
             m = matches[-1]
 
@@ -847,10 +856,12 @@ def find_energy_in_log(log_name : str) -> tuple[float, bool, int | None]:
 
     except FileNotFoundError:
         logger.error("No log file: %s. Returning broken_struct_energy", log_name)
+        fail("no_out_file")
         return cfg.broken_struct_energy, False, None
     except Exception:
         matched_text = m.group(0) if m is not None else "<no match — exception occurred before energy regex ran>"
         logger.exception("Failed to parse energy from log (matched text: %s)", matched_text)
+        fail("parse_error")
         return cfg.broken_struct_energy, False, None
 
 def _save_broken_struct(
@@ -1198,6 +1209,7 @@ def _mmff_regularize_xyz(
     status = ff.Minimize(maxIts=max_its)
     if status != 0:
         logger.warning("MMFF94 regularization did not converge in %d iterations; using the last geometry.", max_its)
+        run_state.count_event("mmff_not_converged")
     logger.info("MMFF94 regularization applied before the ORCA pre-optimization")
     return "\n".join(Chem.MolToXYZBlock(reg_mol).split("\n")[2:])
 
@@ -1219,6 +1231,7 @@ def calc_energy(
         extra_constraints=None,
         ts_bond_targets=None,
         failure_info: Union[dict, None] = None,
+        write_input_only: Union[str, None] = None,
 ) -> tuple[float, bool]:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -1226,11 +1239,15 @@ def calc_energy(
         If config is provided, uses its values; otherwise uses module-level defaults.
         failure_info: optional dict; on failure its "stage" is set to
             "geometry" (rejected by the structure checks before ORCA) or
-            "orca" (ORCA job failed, did not converge or gave no energy).
+            "orca" (ORCA job failed, did not converge or gave no energy),
+            and "reason" to the failed check or the ORCA failure kind.
+        write_input_only: write the ORCA input to this path and return (0.0, True)
+            without running ORCA (dry run).
     """
-    def failed(stage: str) -> None:
+    def failed(stage: str, reason: str = "") -> None:
         if failure_info is not None:
             failure_info["stage"] = stage
+            failure_info.setdefault("reason", reason)
 
     # Use explicit config if provided, otherwise require central config
     if config is None:
@@ -1297,10 +1314,19 @@ def calc_energy(
             reason, atoms_raw1, cfg.broken_struct_energy,
         )
         _save_broken_struct(xyz_upd, broken_structs_dir, reason, atoms_raw1)
-        failed("geometry")
+        failed("geometry", reason)
         return cfg.broken_struct_energy, False
 
     opt_status = True
+
+    if write_input_only:
+        generate_oinp(
+            xyz_upd, dihedrals, write_input_only, constrained_opt=constrained_opt,
+            num_of_procs=cfg.num_of_procs, method_of_calc=cfg.orca_method, charge=cfg.charge,
+            multipl=cfg.spin_multiplicity, hard_constraints=hard_constraints,
+            ts_bond_targets=ts_bond_targets, constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
+        )
+        return 0.0, True
 
     inp_name = mol_to_inp_name(mol_file_name)
     out_name = inp_to_out_name(inp_name)
@@ -1340,10 +1366,10 @@ def calc_energy(
         # sbatch -W reports a non-zero job exit code (ORCA abort, SCF failure, time limit)
         logger.exception("ORCA job for %s failed", inp_name)
         _save_broken_struct(xyz_upd, broken_structs_dir, failed_tag, extra_files=[out_name])
-        failed("orca")
+        failed("orca", "job_error")
         return cfg.broken_struct_energy, False
     
-    res, opt_status, n_cycles = find_energy_in_log(out_name)
+    res, opt_status, n_cycles = find_energy_in_log(out_name, failure_info)
     
     logger.info(
         "ORCA finished: success=%s  cycles=%s  energy=%.6f",

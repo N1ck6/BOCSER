@@ -7,6 +7,22 @@ as module-level globals in other modules (e.g. `_CURRENT_STRUCTURE_ID` in
 from typing import Final
 
 _CURRENT_STRUCTURE_ID: int = 0
+# Counts of side events for the run summary (e.g. MMFF regularization not converged)
+_EVENTS: dict = {}
+
+
+def count_event(name: str, n: int = 1) -> None:
+    _EVENTS[name] = _EVENTS.get(name, 0) + n
+
+
+def events() -> dict:
+    return dict(_EVENTS)
+
+
+def set_events(values: dict) -> None:
+    """Restore event counts (resume from a checkpoint)."""
+    _EVENTS.clear()
+    _EVENTS.update({str(k): int(v) for k, v in values.items()})
 
 
 def increase_structure_id() -> int:
@@ -36,6 +52,7 @@ def reset() -> None:
     """Reset the runtime state (useful for tests)."""
     global _CURRENT_STRUCTURE_ID
     _CURRENT_STRUCTURE_ID = 0
+    _EVENTS.clear()
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
