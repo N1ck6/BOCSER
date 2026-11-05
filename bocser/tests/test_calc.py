@@ -11,8 +11,8 @@ from calc import (
     mol_to_inp_name,
     inp_to_out_name,
     check_is_broken,
-    increase_structure_id,
 )
+from run_state import increase_structure_id
 from default_vals import ConfSearchConfig
 import config_manager
 

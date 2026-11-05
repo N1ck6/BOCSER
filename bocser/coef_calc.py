@@ -63,6 +63,8 @@ class CoefCalculator:
         self.charge = config.charge
         self.multipl = config.spin_multiplicity
         self.af = config.acquisition_function
+        # ik: a torsion in a ring is scanned on an open (acyclic) fragment around its bond
+        self.scan_ring_torsions = getattr(config, "scan_ring_torsions", True)
         self.degrees = degrees
         self.fixed_double_bonds = fixed_double_bonds or set()
         self.ts_bond_set = {frozenset(b) for b in (ts_bonds or set())}
@@ -409,6 +411,51 @@ class CoefCalculator:
             
         return Chem.MolToSmiles(Chem.RemoveAllHs(cur_mol))
 
+    def _ring_bond_fragment_smiles(self, key: tuple) -> str:
+        """Acyclic fragment for the scan of the ring torsion `key` = (n1, b, e, n2).
+
+        Kept: the central bond b-e, every neighbour of b and e, and the atoms bound to those
+        neighbours by a double or triple bond (C=O, C=C keep the conjugation). Every other
+        bond is cut and the cut atoms are filled with H, so the fragment has no ring and its
+        scan is a normal periodic one. The four torsion atoms carry atom maps 1-4: the scan
+        rotates exactly them, and the mapped SMILES is the cache key (it differs from the
+        plain SMILES of a chain fragment, whose scan torsion is chosen otherwise).
+        A TS bond is cut too: in the fragment it would be an ordinary covalent bond."""
+        mol = Chem.RWMol(self.mol)
+        Chem.Kekulize(mol, clearAromaticFlags=True)
+        n1, b, e, n2 = key
+        atoms = {b, e}
+        bonds = {mol.GetBondBetweenAtoms(b, e).GetIdx()}
+        for center, other in ((b, e), (e, b)):
+            for nbr in mol.GetAtomWithIdx(center).GetNeighbors():
+                # A TS partner stays only as an atom of the torsion itself (the IK key needs it)
+                is_ts = frozenset((center, nbr.GetIdx())) in self.ts_bond_set
+                if nbr.GetIdx() != other and (not is_ts or nbr.GetIdx() in (n1, n2)):
+                    atoms.add(nbr.GetIdx())
+                    bonds.add(mol.GetBondBetweenAtoms(center, nbr.GetIdx()).GetIdx())
+        for n in sorted(atoms - {b, e}):
+            for bond in mol.GetAtomWithIdx(n).GetBonds():
+                m = bond.GetOtherAtomIdx(n)
+                if m not in atoms and bond.GetBondTypeAsDouble() >= 2 and frozenset((n, m)) not in self.ts_bond_set:
+                    atoms.add(m)
+                    bonds.add(bond.GetIdx())
+        for atom in mol.GetAtoms():
+            atom.SetAtomMapNum(0)
+        for num, idx in enumerate(key, start=1):
+            mol.GetAtomWithIdx(idx).SetAtomMapNum(num)
+        smiles = Chem.MolFragmentToSmiles(
+            mol, atomsToUse=sorted(atoms), bondsToUse=sorted(bonds), kekuleSmiles=True,
+        )
+        return self._sanitize_smiles(smiles)
+
+    @staticmethod
+    def _mapped_torsion(mol: Chem.rdchem.Mol):
+        """Atoms with maps 1-4 (the torsion of a ring-bond fragment), else None."""
+        mapped = {a.GetAtomMapNum(): a.GetIdx() for a in mol.GetAtoms() if a.GetAtomMapNum()}
+        if all(k in mapped for k in (1, 2, 3, 4)):
+            return tuple(mapped[k] for k in (1, 2, 3, 4))
+        return None
+
     def get_interesting_frags(self) -> list[Chem.rdchem.Mol]:
         """
             returns a list of simple molecules with one
@@ -419,6 +466,7 @@ class CoefCalculator:
         """
 
         rotable_frags = []
+        ring_keys_done = set()
 
         count = 0
 
@@ -452,6 +500,29 @@ class CoefCalculator:
 
             minor_rings = []
             for ring_atoms in rings_to_process:
+                if ring_atoms is not None and self.scan_ring_torsions:
+                    # The axis key comes from get_ring_dihedrals (ring atoms on both sides, as
+                    # the IK loss needs); the scan is done on an open fragment around it
+                    b_idx, e_idx = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+                    axis = frozenset((b_idx, e_idx))
+                    key = next((k for k in self.frags if frozenset((k[1], k[2])) == axis), None)
+                    if key is None:
+                        b_nbrs = [a for a in ring_atoms if a != e_idx and self.mol.GetBondBetweenAtoms(a, b_idx)]
+                        e_nbrs = [a for a in ring_atoms if a != b_idx and self.mol.GetBondBetweenAtoms(a, e_idx)]
+                        if not b_nbrs or not e_nbrs:
+                            continue
+                        key = (b_nbrs[0], b_idx, e_idx, e_nbrs[0])
+                    if key in ring_keys_done:
+                        continue
+                    ring_keys_done.add(key)
+                    frag_smiles = self._ring_bond_fragment_smiles(key)
+                    if frag_smiles not in self.unique_frags:
+                        rotable_frags.append(Chem.MolFromSmiles(frag_smiles))
+                        self.unique_frags[frag_smiles] = count
+                        count += 1
+                    self.frags[key] = self.unique_frags[frag_smiles]
+                    logger.debug("Ring torsion %s scanned on the open fragment %s", key, frag_smiles)
+                    continue
                 if ring_atoms is not None:
                     atoms_to_use = ring_atoms
                 else:
@@ -540,6 +611,11 @@ class CoefCalculator:
                     if frozenset((existing_key[1], existing_key[2])) == real_axis:
                         existing_for_axis = existing_key
                         break
+                if existing_for_axis is not None and ring_atoms is not None and existing_for_axis not in ring_keys_done:
+                    # Key made by get_ring_dihedrals holds a ring position, not a fragment index
+                    ring_keys_done.add(existing_for_axis)
+                    self.frags[existing_for_axis] = self.unique_frags[frag_smiles]
+                    continue
                 if existing_for_axis is not None:
                     if existing_for_axis != old_idxs:
                         logger.debug(
@@ -619,7 +695,7 @@ class CoefCalculator:
             if len(db_response) > 0:
                 self.fetched_coefs[cur_mol_smiles] = db_response[0]
 
-            idxs_to_rotate = self.get_idxs_to_rotate(cur_mol)
+            idxs_to_rotate = self._mapped_torsion(cur_mol) or self.get_idxs_to_rotate(cur_mol)
             heavy_mol = Chem.RemoveAllHs(cur_mol)
             central_bond = heavy_mol.GetBondBetweenAtoms(idxs_to_rotate[1], idxs_to_rotate[2])
             if not central_bond.IsInRing():

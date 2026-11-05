@@ -65,8 +65,13 @@ class IKLoss:
         bond_lengths_dicts: List[Dict[Tuple[int, int], float]],
         valence_angles_dicts: List[Dict[Tuple[int, int, int], float]],
         dihedral_angles_dicts: List[Dict[Tuple[int, int, int, int], float]],
+        open_links: List = None,
     ) -> None:
+        """open_links: per ring None, or (position k, lo, hi) of a TS bond ring[k]-ring[k+1]
+        whose length may be anything in [lo, hi] A: the ring counts as closed when the chain
+        of the other links brings the two TS atoms to a distance in that range."""
         self.bond_lengths = bond_lengths_dicts
+        self.open_links = list(open_links) if open_links is not None else [None] * len(bond_lengths)
         self.valence_angles = valence_angles_dicts
         self.dihedral_angles = dihedral_angles_dicts
 
@@ -104,6 +109,7 @@ class IKLoss:
         mol: Chem.Mol,
         all_ring_atoms: List[List[int]],
         bond_length_overrides: Dict[frozenset, float] = None,
+        ts_bond_ranges: Dict[frozenset, Tuple[float, float]] = None,
     ) -> "IKLoss":
         """Build IKLoss from an RDKit molecule and ring atom index lists.
 
@@ -111,8 +117,13 @@ class IKLoss:
         complete IKLoss instance with tensors prepared for TF computations.
         bond_length_overrides: {frozenset((a, b)): length} replacing the .mol length of
         these ring bonds (TS bonds held at another length in the pre-optimization).
+        ts_bond_ranges: {frozenset((a, b)): (lo, hi)} TS bonds whose length is free in a range:
+        a ring with exactly one of them is closed when the TS distance is in the range
+        (its valence angles and torsions around the TS bond do not enter the loss).
         """
         bond_length_overrides = bond_length_overrides or {}
+        ts_bond_ranges = ts_bond_ranges or {}
+        open_links = []
         mol = Chem.AddHs(mol)
         with tempfile.NamedTemporaryFile(suffix=".xyz", delete=True) as tmp:
             Chem.MolToXYZFile(mol, tmp.name)
@@ -154,6 +165,18 @@ class IKLoss:
             valence_angles.append(va)
             dihedral_angles.append(da)
 
+            ts_positions = [
+                k for k in range(len(ring_atoms))
+                if frozenset((ring_atoms[k], ring_atoms[k + 1])) in ts_bond_ranges
+            ]
+            if len(ts_positions) == 1:
+                k = ts_positions[0]
+                lo, hi = ts_bond_ranges[frozenset((ring_atoms[k], ring_atoms[k + 1]))]
+                open_links.append((k, float(lo), float(hi)))
+            else:
+                # Two TS bonds split the ring into two chains: keep the fixed-length closure
+                open_links.append(None)
+
             bond_lengths_dicts.append({
                 tuple(ring_atoms[k] for k in (i, i + 1)): v
                 for i, v in enumerate(bl)
@@ -174,6 +197,7 @@ class IKLoss:
             bond_lengths_dicts,
             valence_angles_dicts,
             dihedral_angles_dicts,
+            open_links=open_links,
         )
 
     @staticmethod
@@ -326,11 +350,35 @@ class IKLoss:
 
         return total[-1]
 
+    def open_chain_distance(self, i: int, T: tf.Tensor) -> tf.Tensor:
+        """Distance [N] between the two TS atoms of ring i, through the other links.
+
+        The chain starts at the atom after the TS bond and ends at the atom before it; the
+        translation of the chain product is the position of the last atom in the frame of
+        the first. The valence angles at the two TS atoms and the torsions defined over the
+        TS bond only rotate the chain about its first atom, so they do not change it."""
+        k, _, _ = self.open_links[i]
+        n = len(self.T_matrices[i])
+        order = [(k + 1 + j) % n for j in range(n - 1)]  # all links but the TS one
+        V = tf.gather(self.V_matrices[i], order)[None, ...]
+        D = tf.gather(self.D_matrices[i], order)[None, ...]
+        S = V @ D @ tf.gather(T, order, axis=1)
+        S = tf.transpose(S, [1, 0, 2, 3])
+        total = tf.scan(fn=lambda prev, cur: prev @ cur, elems=S)[-1]
+        return tf.norm(total[:, 0:3, 3], axis=-1)
+
     def __call__(self, dihedrals: List[tf.Tensor]) -> tf.Tensor:
         T_matrices = self.build_T_matrices(dihedrals)
 
         total_loss = 0
         for i in range(len(dihedrals)):
+            if self.open_links[i] is not None:
+                # TS bond with a length range: penalty only outside [lo, hi], in A^2
+                _, lo, hi = self.open_links[i]
+                d = self.open_chain_distance(i, T_matrices[i])
+                ik_loss = tf.square(tf.nn.relu(lo - d)) + tf.square(tf.nn.relu(d - hi))
+                total_loss = total_loss + ik_loss[:, None]
+                continue
             total_motions = self.compute_total_motions(
                 self.V_matrices[i], self.D_matrices[i], T_matrices[i]
             )

@@ -8,7 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def parse_energy_from_xyz_2nd_line(s):
-    return float(s.split()[-1]) #*HARTRI_TO_KCAL
+    return float(s.split()[-1]) #*HARTREE_TO_KCAL
 
 class EnsembleProcessor:
     def __init__(

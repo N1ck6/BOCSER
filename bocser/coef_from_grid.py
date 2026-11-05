@@ -3,7 +3,7 @@ from scipy.optimize import curve_fit
 
 import tensorflow as tf
 
-from calc import HARTRI_TO_KCAL
+from calc import HARTREE_TO_KCAL
 
 def pes(
     x : np.ndarray, 
@@ -41,7 +41,7 @@ def calc_coefs(
         y - observed signal [N]
         returns [7, inp_dims] array of coefs
     """ 
-    y = (y - y.mean()) * HARTRI_TO_KCAL
+    y = (y - y.mean()) * HARTREE_TO_KCAL
     coefs, cov_matrix = curve_fit(pes, x, y, p0=np.ones(7), maxfev=10000)
     return coefs
 
@@ -77,7 +77,7 @@ def calc_bond_coefs(
         y - energy in Hartree [N]
         returns [4] set of morze coefficients: De, a, re, c
     """
-    y = (y - y.min()) * HARTRI_TO_KCAL
+    y = (y - y.min()) * HARTREE_TO_KCAL
     # Начальные приближения: De ~ размах кривой, re ~ точка минимума
     p0 = [max(y.max() - y.min(), 1.0), 2.0, r[np.argmin(y)], 0.0]
     coefs, _ = curve_fit(morse, r, y, p0=p0, maxfev=10000)

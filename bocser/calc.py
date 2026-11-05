@@ -28,7 +28,7 @@ from typing import NamedTuple
 
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-HARTRI_TO_KCAL = 627.509474063
+HARTREE_TO_KCAL = 627.509474063
 
 _CONSTRAINT_LETTER = {"bond": "B", "angle": "A", "dihedral": "D"}
 
@@ -66,6 +66,18 @@ class Constraint(NamedTuple):
     type: str      # "bond" | "angle" | "dihedral"
     atoms: tuple   # canonical 0-idx (with-H)
     value: Union[float, None]   # deg for angle/dihedral, A for bond; None = freeze the current value in ORCA
+    # value: current in the config: MMFF holds the .mol value, ORCA gets no value and freezes
+    # the value of its input geometry (the same one, built by MMFF), sign-convention free
+    current: bool = False
+
+
+# MMFF force constants of the candidate builder (RDKit: E = 0.5 * k * d^2, d in A or rad).
+# BO torsions at 1e2: a 10 deg miss costs 1.5 kcal/mol, so the build lands on the asked
+# point (at k = 1 a 60 deg miss cost 0.5 kcal/mol and the ring torsions barely moved).
+_MMFF_BO_TORSION_K = 1e2
+# TS bonds are bonds in the .mol, so MMFF pulls them to ~1.5 A with ~4000 kcal/mol/A at
+# 2.8 A: 1e2 let a 2.8 A TS bond shrink by 0.8 A, 1e5 keeps it within 0.03 A.
+_MMFF_TS_BOND_K = 1e5
 
 def _get_config_or_raise() -> ConfSearchConfig:
     """Return the runtime config or raise RuntimeError if it's not set.
@@ -279,7 +291,8 @@ def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list
         ctype = raw["type"]
         canon_atoms = tuple(raw1_to_with_h_canonical(a, mol_file_name) for a in raw["atoms"])
         value = raw["value"]
-        if value == "current" or value is None:
+        current = value == "current" or value is None
+        if current:
             if ctype == "bond":
                 value = rdMolTransforms.GetBondLength(conf, *canon_atoms)
             elif ctype == "angle":
@@ -288,7 +301,7 @@ def resolve_extra_constraints(raw_constraints: list, mol_file_name: str) -> list
                 value = rdMolTransforms.GetDihedralDeg(conf, *canon_atoms)
         else:
             value = float(value)
-        c = Constraint(ctype, canon_atoms, round(value, 6))
+        c = Constraint(ctype, canon_atoms, round(value, 6), current)
         logger.info(
             "extra_constraint: type=%s raw_atoms(1-idx, with H)=%s -> canonical(0-idx)=%s value=%.4f",
             ctype, raw["atoms"], canon_atoms, value,
@@ -415,13 +428,24 @@ def wait_for_jobs(job_ids: list[str], timeout_minutes: int) -> None:
 def change_dihedrals(mol_file_name: str,
                      dihedrals: list[list[tuple[tuple[int,int,int,int], float]]], ik_loss=None,
                     full_block=False, ts_bonds=None, fixed_dihedrals=None, extra_constraints=None,
-                    ts_bond_targets=None):
+                    ts_bond_targets=None, start_coords=None, build_status=None):
+    """Geometry of a candidate: the .mol (or start_coords: a known structure in the canonical
+    atom order) with the BO torsions set. "ik" mode builds it with constrained MMFF and
+    writes the torsions it reached back into `dihedrals`.
+    build_status: optional dict; "mmff_not_converged" is set to True when the MMFF build
+    did not converge (the caller rejects the candidate)."""
     ts_bond_set = {frozenset(b) for b in (ts_bonds or [])}
 
     try:
         mol = Chem.MolFromMolFile(mol_file_name, removeHs=False)
         heavy_idx, h_idx = _heavy_and_h_order(mol)
         mol = Chem.RenumberAtoms(mol, heavy_idx + h_idx)
+        if start_coords is not None:
+            if len(start_coords) != mol.GetNumAtoms():
+                raise ValueError(f"start_coords has {len(start_coords)} atoms, the .mol {mol.GetNumAtoms()}")
+            conf = mol.GetConformer()
+            for idx, (x, y, z) in enumerate(start_coords):
+                conf.SetAtomPosition(idx, Point3D(float(x), float(y), float(z)))
 
         if not dihedrals and not fixed_dihedrals and not extra_constraints and not ts_bond_targets:
             if full_block:
@@ -457,15 +481,21 @@ def change_dihedrals(mol_file_name: str,
                         continue  # TS-bond is not fixed
                     ff.MMFFAddDistanceConstraint(a, b, False, value, value, 1e3)
 
-            # TS-bond-length starting guess + a SOFTER MMFF distance
-            # constraint (BO-requested target), applied directly to tmp_mol
-            # so the FF stage doesn't fight against the guess
-            for (a, b), target_len in (ts_bond_targets or []):
-                _set_atom_distance(tmp_mol, a, b, float(target_len))
-                ff.MMFFAddDistanceConstraint(a, b, False, float(target_len), float(target_len), 1e2)
+            # TS bonds: set to the target (BO-sampled or fixed length) or kept at the start
+            # length, and held hard, since MMFF treats them as ordinary bonds
+            ts_targets = {frozenset(atoms): float(length) for atoms, length in (ts_bond_targets or [])}
+            for a, b in (ts_bonds or []):
+                target_len = ts_targets.get(frozenset((a, b)))
+                if target_len is None:
+                    target_len = rdMolTransforms.GetBondLength(tmp_mol.GetConformer(), a, b)
+                else:
+                    _set_atom_distance(tmp_mol, a, b, target_len)
+                ff.MMFFAddDistanceConstraint(a, b, False, target_len, target_len, _MMFF_TS_BOND_K)
 
             for va_dict in ik_valence_angles:
                 for (a, b, c), value in va_dict.items():
+                    if frozenset((a, b)) in ts_bond_set or frozenset((b, c)) in ts_bond_set:
+                        continue  # angles at a TS bond follow its length (IK range), not the .mol
                     ff.MMFFAddAngleConstraint(a, b, c, False, np.rad2deg(value), np.rad2deg(value), 1e2)
 
             ik_covered_bonds = {
@@ -487,8 +517,11 @@ def change_dihedrals(mol_file_name: str,
                     angle_deg = rdMolTransforms.GetAngleDeg(conf0, a, b, c)
                     ff.MMFFAddAngleConstraint(a, b, c, False, angle_deg, angle_deg, 1e2)
 
+            # BO values are dihedral_angle() values, i.e. RDKit dihedrals in [0, 2*pi) — the
+            # convention of the ensemble, the ORCA trajectories and the non-ik SetDihedralRad.
+            # (A -value here built every candidate at the mirror torsions.)
             for (a, b, c, d), value in dihedrals:
-                ff.MMFFAddTorsionConstraint(a, b, c, d, False, np.rad2deg(-value), np.rad2deg(-value), 1)
+                ff.MMFFAddTorsionConstraint(a, b, c, d, False, np.rad2deg(value), np.rad2deg(value), _MMFF_BO_TORSION_K)
 
             for atoms, value in (fixed_dihedrals or []):
                 a, b, c, d = atoms
@@ -500,10 +533,19 @@ def change_dihedrals(mol_file_name: str,
                 elif c.type == "angle":
                     ff.MMFFAddAngleConstraint(*c.atoms, False, c.value, c.value, 1e2)
                 elif c.type == "dihedral":
+                    # c.value is an RDKit dihedral (GetDihedralDeg for "current")
                     a, b, cc, d = c.atoms
-                    ff.MMFFAddTorsionConstraint(a, b, cc, d, False, -c.value, -c.value, 1e2)
+                    ff.MMFFAddTorsionConstraint(a, b, cc, d, False, c.value, c.value, 1e2)
 
-            ff.Minimize(maxIts=1000)
+            # Large ring torsion changes may need more than one BFGS run
+            for _ in range(3):
+                if ff.Minimize(maxIts=1000) == 0:
+                    break
+            else:
+                logger.warning("MMFF build of the candidate did not converge in 3000 iterations.")
+                run_state.count_event("mmff_build_not_converged")
+                if build_status is not None:
+                    build_status["mmff_not_converged"] = True
             mol = tmp_mol
 
             for i, (atoms, old_val) in enumerate(dihedrals):
@@ -561,14 +603,15 @@ def generate_oinp(
         hard_constraints: list = None,
         ts_bond_targets: list = None, # BO-sampled or fixed TS-bond lengths; pre-opt only
         constrain_bo_dihedrals: bool = False, # also freeze BO dihedrals in the final (unconstrained) opt
+        ts_mode_bond: tuple = None, # canonical 0-idx pair: OptTS follows the mode with most of this bond
     ) -> None:
     """
         generates orca .inp file
 
-        Dihedral constraints whose value is None are written without a value:
-        ORCA then freezes the value present in the input geometry ("current").
-        Bond constraints (TS-bond targets, user bonds) keep explicit values, so ORCA
-        corrects the small deviations left by the MMFF stage.
+        Constraints whose value is None (BO and fixed torsions) or "current" (extra_constraints)
+        are written without a value: ORCA then freezes the value present in the input geometry.
+        TS-bond targets and user values keep explicit values, so ORCA corrects the small
+        deviations left by the MMFF stage.
     """
     # Require runtime config to be set; config provides TS flag
     cfg = _get_config_or_raise()
@@ -635,13 +678,15 @@ def generate_oinp(
                     for c in all_constraints:
                         letter = _CONSTRAINT_LETTER[c.type]
                         atoms_str = " ".join(str(a) for a in c.atoms)
-                        value_str = "" if c.value is None else " " + str(c.value)
+                        value_str = "" if c.value is None or c.current else " " + str(c.value)
                         tmp.write("{ " + letter + " " + atoms_str + value_str + " C }\n")
                     tmp.write("end\n")
                 if cfg.ts and not constrained_opt:
                     max_iter = cfg.ts_max_iter * 2
                     tmp.write(f"MaxIter {max_iter}\n")
                     tmp.write("Calc_Hess true\n")
+                    if ts_mode_bond is not None:
+                        tmp.write(f"TS_Mode {{B {ts_mode_bond[0]} {ts_mode_bond[1]}}} end\n")
                 elif constrained_opt:
                     tmp.write(f"MaxIter {cfg.preopt_max_iter}\n")
                 tmp.write("end\n")
@@ -909,6 +954,13 @@ def _save_successful_out(out_name: str, constrained_opt: bool, success_out_dir: 
     except Exception:
         logger.exception("Failed to save successful .out file %s to %s", out_name, success_out_dir)
 
+def xyz_coords(xyz_block: str) -> np.ndarray:
+    """Atom coordinates [n, 3] of an xyz block, with or without the two header lines."""
+    lines = [l for l in xyz_block.strip().split('\n') if l.strip()]
+    if lines and lines[0].strip().lstrip('-').isdigit():
+        lines = lines[2:]
+    return np.array([[float(v) for v in l.split()[1:4]] for l in lines if len(l.split()) >= 4], dtype=float)
+
 def check_is_broken(
     xyz_block: str,
     len_threshold: float | None = None,
@@ -1125,6 +1177,56 @@ def check_structure(
 
     return None, None
 
+class MMFFNotConverged(RuntimeError):
+    pass
+
+
+def _mmff_ts_pair_energy(mol, props, conf, ts_bonds) -> float:
+    """MMFF94 terms of the TS-bond pairs alone: the bond stretch of a TS bond drawn in the .mol,
+    else the vdW + electrostatic pair term. They change by tens of kcal/mol with the TS-bond
+    length (a drawn TS bond sits 0.5-1 A from its MMFF rest length), so mmff_energy leaves
+    them out and compares the rest of the molecule."""
+    total = 0.0
+    for a, b in ts_bonds or []:
+        r = conf.GetAtomPosition(a).Distance(conf.GetAtomPosition(b))
+        if mol.GetBondBetweenAtoms(a, b) is not None:
+            params = props.GetMMFFBondStretchParams(mol, a, b)
+            if params:
+                _, kb, r0 = params
+                dr, cs = r - r0, -2.0
+                total += 143.9325 / 2.0 * kb * dr * dr * (1.0 + cs * dr + 7.0 / 12.0 * cs * cs * dr * dr)
+            continue
+        vdw = props.GetMMFFVdWParams(a, b)
+        if vdw:
+            _, _, r_star, eps = vdw
+            rho = r / r_star
+            total += eps * (1.07 / (rho + 0.07)) ** 7 * (1.12 / (rho ** 7 + 0.12) - 2.0)
+        qa, qb = props.GetMMFFPartialCharge(a), props.GetMMFFPartialCharge(b)
+        total += 332.0716 * qa * qb / (r + 0.05)
+    return total
+
+
+def mmff_energy(xyz_block: str, mol_file_name: str, ts_bonds=None) -> Union[float, None]:
+    """MMFF94 energy (kcal/mol, no constraints) of a geometry in the canonical with-H order
+    of the .mol, without the TS-bond pair terms (_mmff_ts_pair_energy); None when MMFF94 has
+    no parameters for the molecule or the atoms differ."""
+    lines = [line for line in xyz_block.strip().split("\n") if line.strip()]
+    if lines and lines[0].strip().lstrip("-").isdigit():
+        lines = lines[2:]
+    mol = Chem.Mol(_reference_with_h_mol_cached(mol_file_name))
+    if len(lines) != mol.GetNumAtoms():
+        return None
+    conf = mol.GetConformer()
+    for idx, line in enumerate(lines):
+        x, y, z = map(float, line.split()[1:4])
+        conf.SetAtomPosition(idx, Point3D(x, y, z))
+    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94")
+    if props is None:
+        return None
+    energy = AllChem.MMFFGetMoleculeForceField(mol, props).CalcEnergy()
+    return float(energy - _mmff_ts_pair_energy(mol, props, conf, ts_bonds))
+
+
 def _mmff_regularize_xyz(
     xyz_block: str,
     mol_file_name: str,
@@ -1142,7 +1244,8 @@ def _mmff_regularize_xyz(
     window is flat inside, so the minimizer leaves the value at a window edge):
       - BO and fixed dihedrals at their CURRENT values (the geometry was built at them;
         no sign convention involved);
-      - TS bonds at the requested length (ts_bond_targets) or at the current one;
+      - TS bonds at the requested length (ts_bond_targets) or at the current one, with
+        _MMFF_TS_BOND_K (MMFF sees them as ordinary bonds);
       - bonds and valence angles around TS atoms at current values, so MMFF can't absorb
         a stretched TS distance by distorting the scaffold;
       - extra_constraints: bonds/angles at their configured values, dihedrals at current values.
@@ -1180,7 +1283,8 @@ def _mmff_regularize_xyz(
     for a, b in (ts_bonds or []):
         ts_atoms.update((a, b))
         pair = frozenset((a, b))
-        hold_bond(a, b, targets.get(pair, rdMolTransforms.GetBondLength(conf, a, b)))
+        length = targets.get(pair, rdMolTransforms.GetBondLength(conf, a, b))
+        ff.MMFFAddDistanceConstraint(a, b, False, length, length, _MMFF_TS_BOND_K)
         held_bonds.add(pair)
 
     for center in ts_atoms:
@@ -1208,8 +1312,9 @@ def _mmff_regularize_xyz(
 
     status = ff.Minimize(maxIts=max_its)
     if status != 0:
-        logger.warning("MMFF94 regularization did not converge in %d iterations; using the last geometry.", max_its)
+        logger.warning("MMFF94 regularization did not converge in %d iterations.", max_its)
         run_state.count_event("mmff_not_converged")
+        raise MMFFNotConverged(f"MMFF94 regularization did not converge in {max_its} iterations")
     logger.info("MMFF94 regularization applied before the ORCA pre-optimization")
     return "\n".join(Chem.MolToXYZBlock(reg_mol).split("\n")[2:])
 
@@ -1232,6 +1337,11 @@ def calc_energy(
         ts_bond_targets=None,
         failure_info: Union[dict, None] = None,
         write_input_only: Union[str, None] = None,
+        start_coords=None,
+        ts_mode_bond: Union[tuple, None] = None,
+        build_info: Union[dict, None] = None,
+        max_build_deviation: Union[float, None] = None,
+        mmff_energy_limit: Union[float, None] = None,
 ) -> tuple[float, bool]:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -1243,6 +1353,18 @@ def calc_energy(
             and "reason" to the failed check or the ORCA failure kind.
         write_input_only: write the ORCA input to this path and return (0.0, True)
             without running ORCA (dry run).
+        start_coords: build the candidate from this structure (canonical atom order)
+            instead of the .mol geometry.
+        ts_mode_bond: canonical 0-idx pair for TS_Mode in the final OptTS.
+        build_info: optional dict; "dihedrals" is set to the BO torsions (BO convention,
+            radians) and "ts_bond_lengths" to the TS-bond lengths of the geometry sent to ORCA,
+            "mmff_energy" to its MMFF94 energy (when mmff_energy_window is set).
+        max_build_deviation: reject the candidate when a BO torsion of the built geometry is
+            farther than this (radians) from the asked value (reason mmff_off_target).
+        mmff_energy_limit: reject the candidate when its MMFF94 energy is above this
+            (kcal/mol, reason mmff_energy_high).
+    The MMFF build has no fallback: a build that fails or does not converge rejects the
+    candidate before ORCA (stage "geometry"), and BO proposes the next one.
     """
     def failed(stage: str, reason: str = "") -> None:
         if failure_info is not None:
@@ -1276,16 +1398,35 @@ def calc_energy(
         hard_constraints,
     )
     
+    def reject_build(reason: str, xyz=None, atoms=None):
+        logger.warning("Candidate rejected before ORCA (%s) — skipping ORCA", reason)
+        if xyz is not None:
+            _save_broken_struct(xyz, broken_structs_dir, reason, atoms)
+        failed("geometry", reason)
+        return cfg.broken_struct_energy, False
+
+    asked_dihedrals = [(atoms, float(value)) for atoms, value in dihedrals]
     if force_xyz_block:
         xyz_upd = force_xyz_block
     else:
-        xyz_upd = change_dihedrals(
-            mol_file_name, dihedrals, ik_loss,
-            ts_bonds=ts_bonds, fixed_dihedrals=fixed_dihedrals,
-            extra_constraints=extra_constraints,
-            ts_bond_targets=ts_bond_targets,
-        )
-    
+        build_status = {}
+        try:
+            xyz_upd = change_dihedrals(
+                mol_file_name, dihedrals, ik_loss,
+                ts_bonds=ts_bonds, fixed_dihedrals=fixed_dihedrals,
+                extra_constraints=extra_constraints,
+                ts_bond_targets=ts_bond_targets,
+                start_coords=start_coords,
+                build_status=build_status,
+            )
+        except Exception:
+            logger.exception("Geometry build of the candidate failed")
+            return reject_build("build_error")
+        if xyz_upd is None:
+            return reject_build("build_error")
+        if build_status.get("mmff_not_converged"):
+            return reject_build("mmff_not_converged", xyz_upd)
+
     logger.debug("dihedrals after: %s", dihedrals)
 
     # Optional MMFF94 clean-up of the candidate before the ORCA pre-optimization only
@@ -1300,8 +1441,34 @@ def calc_energy(
                 ts_bond_targets=ts_bond_targets,
                 max_its=cfg.mmff_max_iter,
             )
+        except MMFFNotConverged:
+            return reject_build("mmff_not_converged", xyz_upd)
         except Exception:
-            logger.exception("MMFF94 regularization failed — continuing with the unregularized geometry.")
+            logger.exception("MMFF94 regularization failed")
+            return reject_build("build_error", xyz_upd)
+
+    if build_info is not None and xyz_upd is not None:
+        coords = xyz_coords(xyz_upd)
+        build_info["dihedrals"] = [dihedral_angle(*(coords[i] for i in atoms)) for atoms, _ in dihedrals]
+        build_info["ts_bond_lengths"] = {
+            (a, b): float(np.linalg.norm(coords[a] - coords[b])) for a, b in (ts_bonds or [])
+        }
+
+    if max_build_deviation is not None and not force_xyz_block and asked_dihedrals:
+        coords = xyz_coords(xyz_upd)
+        worst, worst_atoms = 0.0, None
+        for atoms, asked in asked_dihedrals:
+            d = abs(dihedral_angle(*(coords[i] for i in atoms)) - asked) % (2 * np.pi)
+            d = min(d, 2 * np.pi - d)
+            if d > worst:
+                worst, worst_atoms = d, atoms
+        if worst > max_build_deviation:
+            raw = tuple(with_h_canonical_to_raw1(a, mol_file_name) for a in worst_atoms)
+            logger.warning(
+                "MMFF built the torsion %s %.0f deg away from the asked value (limit %.0f deg)",
+                raw, np.degrees(worst), np.degrees(max_build_deviation),
+            )
+            return reject_build("mmff_off_target", xyz_upd, raw)
 
     # Unphysical geometry (clash, broken bond, TS bond out of range, opened ring) never goes to ORCA
     reason, atoms_raw1 = check_structure(
@@ -1317,6 +1484,17 @@ def calc_energy(
         failed("geometry", reason)
         return cfg.broken_struct_energy, False
 
+    if cfg.mmff_energy_window is not None and not force_xyz_block and xyz_upd is not None:
+        e_mmff = mmff_energy(xyz_upd, mol_file_name, ts_bonds=ts_bonds)
+        if build_info is not None:
+            build_info["mmff_energy"] = e_mmff
+        if e_mmff is not None and mmff_energy_limit is not None and e_mmff > mmff_energy_limit:
+            logger.warning(
+                "MMFF94 energy of the candidate %.1f kcal/mol is above the limit %.1f "
+                "(lowest known + mmff_energy_window)", e_mmff, mmff_energy_limit,
+            )
+            return reject_build("mmff_energy_high", xyz_upd)
+
     opt_status = True
 
     if write_input_only:
@@ -1325,6 +1503,7 @@ def calc_energy(
             num_of_procs=cfg.num_of_procs, method_of_calc=cfg.orca_method, charge=cfg.charge,
             multipl=cfg.spin_multiplicity, hard_constraints=hard_constraints,
             ts_bond_targets=ts_bond_targets, constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
+            ts_mode_bond=ts_mode_bond,
         )
         return 0.0, True
 
@@ -1358,8 +1537,9 @@ def calc_energy(
         hard_constraints=hard_constraints,
         ts_bond_targets=ts_bond_targets,
         constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
+        ts_mode_bond=ts_mode_bond,
     )
-    failed_tag = "preopt_failed" if constrained_opt else "opt_failed"
+    failed_tag ="preopt_failed" if constrained_opt else "opt_failed"
     try:
         start_calc(inp_name)
     except RuntimeError:
@@ -1376,7 +1556,7 @@ def calc_energy(
         opt_status, n_cycles, res
     )
 
-    res = res if not opt_status else res * HARTRI_TO_KCAL - norm_energy
+    res = res if not opt_status else res * HARTREE_TO_KCAL - norm_energy
     logger.debug("opt status in calc_energy is %s", opt_status)
     if not opt_status:
         _save_broken_struct(xyz_upd, broken_structs_dir, failed_tag, extra_files=[out_name])
@@ -1395,7 +1575,8 @@ def load_last_optimized_structure_xyz_block(mol_file_name : str) -> str:
 
 def dihedral_angle(a : list[float], b : list[float], c : list[float], d : list[float]) -> float:
     """
-    Calculates dihedral angle between 4 points
+    Calculates dihedral angle between 4 points: the RDKit dihedral (GetDihedralRad),
+    mapped to [0, 2*pi). This is the convention of every BO torsion value.
     """
     
     a = np.array(a)
@@ -1451,7 +1632,7 @@ def parse_points_from_trj(
         for i in range(len(lines) // (n + 2)):
             structures.append("\n".join(lines[i * (n + 2) : (i + 1) * (n + 2)]))
             
-            energy = float(lines[i * (n + 2) + 1].split()[-1]) * HARTRI_TO_KCAL - norm_en
+            energy = float(lines[i * (n + 2) + 1].split()[-1]) * HARTREE_TO_KCAL - norm_en
             cur_d = []
             for a, b, c, d in dihedrals:
                 a_coord = list(map(float, lines[i * (n + 2) + 2 + a].split()[1:]))

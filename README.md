@@ -75,11 +75,24 @@ extra_constraints:
 
   - type: angle
     atoms: [9, 17, 18]
-    value: current        # fix value from mol
+    value: current        # keep the start-geometry value (written to ORCA without a value)
 
   - type: dihedral
     atoms: [1, 2, 3, 4]
     value: 180.0          # degrees
+
+# Optional, defaults shown:
+# use_feasibility_model: true       # failed candidates teach P(feasible) instead of entering the GP
+# feasibility_lengthscale: 0.5      # how far around a failure P is lowered (0.5 ~ 30 deg, 1.0 ~ 60 deg)
+# feasibility_prior: 0.8            # P(feasible) far from every evaluated point
+# build_from_nearest_conformer: true
+# exclude_dof_slack: false          # true = old behaviour: only N - 6 torsions of each ring are GP axes
+# scan_ring_torsions: true          # "ik": scan ring torsions on an open fragment (else flat GP mean)
+# mmff_energy_window: 30.0          # kcal/mol above the lowest known MMFF94 energy; null = no filter
+# candidate_batch_size: 5           # maxima kept per acquisition search, tried after a rejection
+# ik_loss_weight: 1.0               # weight of the ring-closure loss in "ik"; 0 = plain EVM
+# ts_mode_bond: []                  # 1-based TS bond followed by OptTS; empty = shortest TS bond
+# ts_bond_result_margin: 0.5        # Å; 0 turns the TS-region check of the result off
 ```
 
 ---
@@ -101,12 +114,15 @@ All files are written to `--folder`, prefixed with `exp_name`:
 ## How It Works
 
 1. **Detect rotatable bonds** in the molecule (RDKit).
-2. **Pre-scan each bond** through 360° with ORCA → fit Fourier coefficients → these become the GP prior mean (cached in `dihedral_logs.db`).
+2. **Pre-scan each bond** through 360° with ORCA → fit Fourier coefficients → these become the GP prior mean (cached in `dihedral_logs.db`). In `ik` mode every rotatable ring bond is a GP axis too; it is scanned on an open fragment: the bond, its neighbours and their double-bond partners, the ring cut and the cut atoms filled with H (`scan_ring_torsions`).
 3. **Initialize dataset** from random RDKit embeddings or a seed ensemble.
 4. **Bayesian optimization loop** (up to `max_steps`):
    - Acquisition function selects next dihedral angles to evaluate.
-   - The candidate geometry is checked before ORCA (atom clashes, stretched bonds, TS bonds outside `[ts_bond_min_length, ts_bond_max_length]`, opened rings). A rejected candidate goes into the GP with `broken_struct_energy` but does not count towards `max_steps`; after `max_geometry_rejections_in_a_row` rejections in a row the run stops.
-   - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt. The full-opt result goes through the same checks; a broken result counts as a failed full opt.
+   - The candidate geometry is checked before ORCA (atom clashes, stretched bonds, TS bonds outside `[ts_bond_min_length, ts_bond_max_length]`, opened rings). A rejected candidate does not count towards `max_steps`; after `max_geometry_rejections_in_a_row` rejections in a row the run stops.
+   - **Feasibility model** (`use_feasibility_model: true`, default). A candidate without an energy (rejected geometry, failed ORCA, or a geometry that could not be built near the asked torsions) is not put into the GP as `broken_struct_energy`. It is labelled "failed" in a separate classifier P(feasible | torsions), and the acquisition is multiplied by P, so BO stops asking points next to known failures. ORCA failures with no output file or an unreadable one (queue, file system) get no label. Points with an energy are stored at the torsions of the geometry that was actually built. With `use_feasibility_model: false` the old behaviour (`broken_struct_energy` in the GP) is kept.
+   - The start geometry is built from the nearest known conformer (seed ensemble or minima found so far, `build_from_nearest_conformer`), with the BO torsions and TS bonds held by MMFF. There is no fallback geometry: if MMFF fails, does not converge, ends more than ~30° from an asked torsion, or gives an MMFF94 energy more than `mmff_energy_window` above the lowest known structure, the candidate is rejected before ORCA, labelled in the feasibility model, and the next maximum of the same acquisition search is tried (`candidate_batch_size`).
+   - In the `ik` ring-closure loss a TS bond in a ring may have any length in `[ts_bond_min_length, ts_bond_max_length]`: the ring counts as closed when the other ring bonds bring the two TS atoms within that range.
+   - ORCA runs a two-stage optimization: constrained pre-opt → full geometry opt. The full-opt result goes through the same checks; a broken result counts as a failed full opt. For a TS search, OptTS follows the TS bond given by `ts_mode_bond` (default: the shortest TS bond), and a result whose TS bonds left the range of the seed ensemble ± `ts_bond_result_margin` counts as broken.
    - Result updates the GP model.
    - Early-stop when acquisition values plateau (rolling window criterion).
 5. **Deduplicate** all discovered minima (heavy-atom RMSD + energy window) → write final ensemble sorted by energy.

@@ -51,6 +51,7 @@ from rdkit.Chem import AllChem, rdMolAlign
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 import hashlib
+import inspect
 import atexit
 import json
 import re
@@ -76,6 +77,7 @@ from coef_from_grid import (
 )
 from calc import (
     calc_energy,
+    mmff_energy,
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
     _qc_calcs_dir,
@@ -85,12 +87,13 @@ from calc import (
     with_h_canonical_to_raw1,
     raw1_to_heavy_canonical,
     _heavy_and_h_order,
-    HARTRI_TO_KCAL,
+    HARTREE_TO_KCAL,
     resolve_extra_constraints,
     _validate_extra_constraints_atoms,
     compute_mol_hash,
     build_reference_with_h_mol,
     submit_calc, wait_for_jobs,
+    xyz_coords,
 )
 from run_state import increase_structure_id
 import run_state
@@ -108,6 +111,8 @@ from evm import ExplorationalVarianceMinimizer
 from default_vals import ConfSearchConfig
 from ik_loss import IKLoss
 from imp_var_with_ik import ImprovementVarianceWithIK
+from feasibility import FeasibilityModel, FeasibilityWeightedAcquisition
+from candidate_batch import BatchRecordingOptimizer
 import time
 from tensorflow.python.ops.numpy_ops import np_config
 np_config.enable_numpy_behavior()
@@ -211,6 +216,24 @@ class ConfSearchState:
     # Outcome of every evaluated candidate, "category:reason" -> count (run summary)
     outcomes: dict = field(default_factory=dict)
     n_unique_conformers: int = 0
+    # Ring torsions left out of the GP by exclude_dof_slack: free, set by ring closure
+    free_ring_dihedrals: list = field(default_factory=list)
+    ring_atoms_list: list = field(default_factory=list)
+    # IK loss of the acquisition: only rings whose torsions are all GP axes (or fixed)
+    ik_acq_loss: Optional[Any] = None
+    ik_acq_dihedrals_idxs: list = field(default_factory=list)
+    feasibility: Optional[FeasibilityModel] = None
+    # Last objective call: it gave an energy usable by the GP, and the BO point of the
+    # geometry actually built (the GP observation goes there, not to the asked point)
+    last_eval_valid: bool = False
+    last_built_point: Optional[list] = None
+    last_failure_reason: Optional[str] = None
+    # Known structures to build candidates from: [(BO point, canonical coords)]
+    templates: list = field(default_factory=list)
+    # Lowest MMFF94 energy of the known structures (mmff_energy_window), None until one is known
+    mmff_reference: Optional[float] = None
+    ts_mode_bond: Optional[tuple] = None
+    ts_bond_windows: dict = field(default_factory=dict)  # (a, b) -> (lo, hi), final OptTS check
     _dihedral_ids_finalized: bool = False
 
 
@@ -278,6 +301,7 @@ class ConfSearchRunner:
         Path(working_folder).mkdir(parents=True, exist_ok=True)
 
     _RING_DOF_SLACK = 6
+    _GP_TORSION_LENGTHSCALE = 0.7  # prior median of the per-torsion GP lengthscales
 
     def _require_dihedral_ids_finalized(self, caller: str) -> None:
         """Guard against setup() ordering regressions. Call this at the top of
@@ -298,6 +322,10 @@ class ConfSearchRunner:
         """Cap the number of GP-searched (independently sampled) torsion axes
         per ring at (n_flexible_positions_in_ring - _RING_DOF_SLACK)
 
+        The demoted axes are free: no constraint in the MMFF build or in the pre-opt, so ring
+        closure sets them (6 torsions close a ring once the others are given). Freezing them
+        at the .mol values left the ring over-constrained and tied every candidate to the
+        .mol conformation.
         Ring-fusion axes are never demoted: they encode the relative orientation of two rings.
         A ring whose optional-axis count does not exceed its cap is left completely untouched.
         """
@@ -358,7 +386,7 @@ class ConfSearchRunner:
                 "Ring DOF cap: ring #%d (size=%d) has %d GP-searched axes "
                 "(%d shared, %d optional) > cap=%d (n_flexible=%d - slack=%d) "
                 "— demoting %d optional axis(es), evenly spaced around the "
-                "ring, to fixed (original-geometry) torsions: %s. Kept %d "
+                "ring, to free torsions set by ring closure: %s. Kept %d "
                 "optional axis(es): %s. Shared (ring-fusion) axes are never "
                 "demoted: %s.",
                 ring_i, len(cycle_idx), total_in_ring, len(shared_in_ring),
@@ -374,9 +402,7 @@ class ConfSearchRunner:
             logger.info("Ring DOF cap: no rings exceeded their cap — dihedral_ids unchanged.")
             return
 
-        for idx, d in drop_idx_to_window.items():
-            val = -Chem.rdMolTransforms.GetDihedralRad(self.state.mol.GetConformer(), *d)
-            self.state.fixed_dihedrals.append((list(d), val))
+        self.state.free_ring_dihedrals = [list(d) for d in drop_idx_to_window.values()]
 
         orig_len = len(self.state.dihedral_ids)
         old_to_new: dict = {}
@@ -397,7 +423,7 @@ class ConfSearchRunner:
             for pos in range(len(cycle_idx)):
                 idx = cycle_idx[pos]
                 if idx in drop_idx_to_window:
-                    cycle_idx[pos] = -4  # demoted: left unconstrained, IK uses static reference
+                    cycle_idx[pos] = -4  # demoted: free torsion, set by ring closure
                 elif idx >= 0:
                     cycle_idx[pos] = old_to_new[idx]
 
@@ -408,6 +434,95 @@ class ConfSearchRunner:
             "from %d to %d entries.",
             len(drop_idx_to_window), orig_len, len(new_dihedral_ids),
         )
+
+    def _prepare_acquisition_ik_loss(self) -> None:
+        """IK loss for the "ik" acquisition: only rings whose torsions are all GP axes (or fixed).
+        A ring with free (demoted) torsions closes itself in the MMFF build; its IK loss would
+        hold those torsions at the .mol values and pull every candidate back to the .mol
+        conformation. Whether such a ring can be built is learned by the feasibility model."""
+        idxs = self.state.ik_loss_dihedrals_idxs
+        self.state.ik_acq_loss, self.state.ik_acq_dihedrals_idxs = None, []
+        if self.state.ik_loss is None or not idxs:
+            return
+        keep = [i for i, cycle in enumerate(idxs) if -4 not in cycle and any(j >= 0 for j in cycle)]
+        if len(keep) == len(idxs):
+            self.state.ik_acq_loss, self.state.ik_acq_dihedrals_idxs = self.state.ik_loss, idxs
+            return
+        logger.info(
+            "IK loss of the acquisition: %d of %d ring(s) (rings with free torsions or no GP axis are left out)",
+            len(keep), len(idxs),
+        )
+        if not keep:
+            return
+        try:
+            self.state.ik_acq_loss = IKLoss.from_rdkit(
+                self.state.mol, [self.state.ring_atoms_list[i] for i in keep],
+                bond_length_overrides=getattr(self, "_ik_ts_lengths", None),
+                ts_bond_ranges=getattr(self, "_ik_ts_ranges", None),
+            )
+            self.state.ik_acq_dihedrals_idxs = [idxs[i] for i in keep]
+        except Exception:
+            logger.exception("Could not build the IK loss of the acquisition — the acquisition runs without it.")
+
+    def _resolve_ts_mode_bond(self, config: ConfSearchConfig) -> Optional[tuple]:
+        """Canonical pair for TS_Mode {B a b} in the final OptTS: ts_mode_bond from the config,
+        else the shortest TS bond (fixed TS-bond length, else the .mol length)."""
+        if not config.ts or config.use_grass or not self.state.ts_bonds:
+            if config.ts_mode_bond:
+                logger.warning("ts_mode_bond is ignored: it needs ts: true, ts_bonds and no GRASS.")
+            return None
+        if config.ts_mode_bond:
+            try:
+                pair = tuple(raw1_to_with_h_canonical(a, self.state.mol_file_name) for a in config.ts_mode_bond)
+            except ValueError as e:
+                raise ConfigError(f"ts_mode_bond {config.ts_mode_bond}: atom not in the .mol") from e
+            source = "ts_mode_bond"
+        else:
+            conf = build_reference_with_h_mol(self.state.mol_file_name).GetConformer()
+            fixed = {frozenset(p): length for p, length in self.state.fixed_ts_bond_targets}
+            lengths = {
+                tuple(p): fixed.get(frozenset(p), Chem.rdMolTransforms.GetBondLength(conf, *p))
+                for p in self.state.ts_bonds
+            }
+            pair = min(lengths, key=lengths.get)
+            source = f"shortest TS bond, {lengths[pair]:.3f} A"
+        logger.info(
+            "OptTS follows the Hessian mode of bond %s (1-idx .mol; %s)",
+            tuple(with_h_canonical_to_raw1(a, self.state.mol_file_name) for a in pair), source,
+        )
+        return pair
+
+    def _resolve_ts_bond_windows(self) -> dict:
+        """Allowed TS-bond lengths of the final OptTS geometry: the range over load_ensemble
+        (else over the .mol and the fixed TS-bond lengths) widened by ts_bond_result_margin."""
+        config = self.state.config
+        margin = float(config.ts_bond_result_margin)
+        if not config.ts or not self.state.ts_bonds or margin <= 0:
+            return {}
+        ref = {tuple(p): [] for p in self.state.ts_bonds}
+        source = ".mol and fixed TS-bond lengths"
+        ep = self.state.ensemble_processor
+        n_atoms = build_reference_with_h_mol(self.state.mol_file_name).GetNumAtoms()
+        if ep is not None and ep.coords and len(ep.coords[0]) == n_atoms:
+            for coords in ep.coords:
+                c = np.asarray(coords, dtype=float)
+                for a, b in ref:
+                    ref[(a, b)].append(float(np.linalg.norm(c[a] - c[b])))
+            source = f"{len(ep.coords)} load_ensemble conformers"
+        else:
+            conf = build_reference_with_h_mol(self.state.mol_file_name).GetConformer()
+            for a, b in ref:
+                ref[(a, b)].append(Chem.rdMolTransforms.GetBondLength(conf, a, b))
+            for (a, b), length in self.state.fixed_ts_bond_targets:
+                key = (a, b) if (a, b) in ref else (b, a)
+                ref[key].append(float(length))
+        windows = {pair: (max(0.0, min(v) - margin), max(v) + margin) for pair, v in ref.items()}
+        for (a, b), (lo, hi) in windows.items():
+            logger.info(
+                "Final OptTS check: TS bond %s must stay within [%.3f, %.3f] A (%s +- %.2f A)",
+                tuple(with_h_canonical_to_raw1(i, self.state.mol_file_name) for i in (a, b)), lo, hi, source, margin,
+            )
+        return windows
 
     def acquire_lock(self) -> None:
         """One BOCSER run per qc_calcs/ folder (next to the .mol): two runs there overwrite
@@ -471,9 +586,109 @@ class ConfSearchRunner:
         then — target lengths for TS-bonds."""
         self.state.geometry_rejected = False
         self.state.last_observation = None
+        self.state.last_eval_valid = False
+        self.state.last_built_point = None
+        self.state.last_failure_reason = None
         en = self._calc_point_energy(dihedrals)
-        self.state.last_observation = ([float(v) for v in self.state.asked_points[-1]], float(en))
+        asked = [float(v) for v in self.state.asked_points[-1]]
+        self.state.last_observation = (asked, float(en))
+        self._record_feasibility(asked)
         return en
+
+    # A candidate built farther than this from the asked point (max over the BO torsions,
+    # radians, ~30 deg) is a different point: the asked one counts as not buildable
+    _BUILD_TOLERANCE = 0.5
+
+    def _torsion_deviation(self, a, b) -> float:
+        """Largest absolute difference over the BO torsions, radians."""
+        n_dih = len(self.state.dihedral_ids)
+        if n_dih == 0:
+            return 0.0
+        d = np.abs(np.asarray(a[:n_dih], dtype=float) - np.asarray(b[:n_dih], dtype=float)) % (2 * np.pi)
+        return float(np.max(np.minimum(d, 2 * np.pi - d)))
+
+    # ORCA failures that say nothing about the geometry (no output file, unreadable output):
+    # such a candidate gets no label, so a queue or file-system hiccup does not close a region
+    _INFRA_FAILURES = ("no_out_file", "parse_error")
+
+    def _record_feasibility(self, asked: list) -> None:
+        """Label the evaluated candidate for the feasibility model (use_feasibility_model).
+        Candidates the MMFF build could not bring near the asked torsions are rejected before
+        ORCA (mmff_off_target), so a labelled point is always the asked one."""
+        fm = self.state.feasibility
+        if fm is None:
+            return
+        if not self.state.last_eval_valid:
+            if self.state.last_failure_reason in self._INFRA_FAILURES:
+                logger.warning(
+                    "Candidate failed for a technical reason (%s) — not labelled in the feasibility model.",
+                    self.state.last_failure_reason,
+                )
+                return
+            fm.add(asked, False)
+        else:
+            fm.add(asked, True)
+        logger.info(
+            "Feasibility model: %d labels, %d failed; P at this point is now %.2f",
+            len(fm), fm.n_failed, fm.probability_at(asked),
+        )
+
+    def _nearest_template(self, point) -> Optional[list]:
+        """Coordinates of the known structure closest to `point` in the BO torsions
+        (build_from_nearest_conformer), or None to build from the .mol."""
+        if not self.state.config.build_from_nearest_conformer or not self.state.templates:
+            return None
+        n_dih = len(self.state.dihedral_ids)
+        target = np.asarray(point, dtype=float)
+        pts = np.asarray([p for p, _ in self.state.templates], dtype=float)
+        d2 = np.sum((2.0 * np.sin(0.5 * (pts[:, :n_dih] - target[None, :n_dih]))) ** 2, axis=1)
+        if pts.shape[1] > n_dih:
+            ts_scale = max(float(self.state.config.ts_bond_kernel_lengthscale), 1e-6)
+            d2 += np.sum(((pts[:, n_dih:] - target[None, n_dih:]) / ts_scale) ** 2, axis=1)
+        best = int(np.argmin(d2))
+        logger.info(
+            "Candidate built from known structure #%d of %d (largest BO-torsion difference %.0f deg)",
+            best, len(self.state.templates), np.degrees(self._torsion_deviation(pts[best], target)),
+        )
+        return self.state.templates[best][1]
+
+    def _add_template(self, point, coords) -> None:
+        """Known structure (canonical-order coordinates) and its BO point, for _nearest_template."""
+        coords = np.asarray(coords, dtype=float)
+        if getattr(self, "_n_atoms_with_h", None) is None:
+            self._n_atoms_with_h = build_reference_with_h_mol(self.state.mol_file_name).GetNumAtoms()
+        if len(coords) != self._n_atoms_with_h or len(point) != self.state.search_dim:
+            return
+        self.state.templates.append((np.asarray(point, dtype=float), coords.tolist()))
+        self._note_mmff_reference(coords)
+
+    def _note_mmff_reference(self, coords) -> None:
+        """Lower the MMFF94 reference (mmff_energy_window) with a known good structure."""
+        if self.state.config.mmff_energy_window is None:
+            return
+        block = "\n".join(f"X {x:.6f} {y:.6f} {z:.6f}" for x, y, z in np.asarray(coords, dtype=float))
+        try:
+            energy = mmff_energy(block, self.state.mol_file_name, ts_bonds=self.state.ts_bonds)
+        except Exception:
+            logger.debug("MMFF94 energy of a known structure failed", exc_info=True)
+            return
+        self._note_mmff_energy(energy)
+
+    def _note_mmff_energy(self, energy: Optional[float]) -> None:
+        if energy is None or not np.isfinite(energy):
+            return
+        if self.state.mmff_reference is None or energy < self.state.mmff_reference:
+            self.state.mmff_reference = float(energy)
+            logger.info(
+                "MMFF94 reference energy is now %.1f kcal/mol: candidates above %.1f are rejected before ORCA",
+                energy, energy + self.state.config.mmff_energy_window,
+            )
+
+    def _mmff_energy_limit(self) -> Optional[float]:
+        window = self.state.config.mmff_energy_window
+        if window is None or self.state.mmff_reference is None:
+            return None
+        return self.state.mmff_reference + float(window)
 
     def _ts_bond_targets(self, point) -> Optional[list]:
         """TS-bond lengths held in the pre-optimization only: sampled by BO, or fixed
@@ -509,7 +724,7 @@ class ConfSearchRunner:
             # Geometry here is the pre-opt input; in a real run the full opt starts from the pre-opt result
             calc_energy(
                 self.state.mol_file_name, list(zip(self.state.dihedral_ids, point[:n_dih])), 0.0,
-                write_input_only=str(opt_inp), **common,
+                write_input_only=str(opt_inp), ts_mode_bond=self.state.ts_mode_bond, **common,
             )
         unknown = list(getattr(self.state.config, "unknown_keys", []))
         lines = [
@@ -564,6 +779,7 @@ class ConfSearchRunner:
 
         logger.info("Optimizing constrained struct")
         preopt_failure = {}
+        build_info = {}
         try:
             en, preopt_status = calc_energy(
                 self.state.mol_file_name,
@@ -581,13 +797,22 @@ class ConfSearchRunner:
                 extra_constraints=self.state.extra_constraints,
                 ts_bond_targets=ts_bond_targets,
                 failure_info=preopt_failure,
+                start_coords=self._nearest_template(dihedrals),
+                build_info=build_info,
+                max_build_deviation=self._BUILD_TOLERANCE,
+                mmff_energy_limit=self._mmff_energy_limit(),
             )
         except Exception:
             logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
             en, preopt_status = self.state.config.broken_struct_energy, False
             # Dump the status file immediately, right to avoidcrash on exception
             self._dump_status_hook(dumping_value=False)
+        self.state.last_built_point = self._built_point(dihedrals, build_info)
         self.state.last_opt_ok = preopt_status
+        if preopt_status:
+            self._note_mmff_energy(build_info.get("mmff_energy"))
+        else:
+            self.state.last_failure_reason = preopt_failure.get("reason")
         logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
         if not preopt_status:
             self._dump_status_hook(dumping_value=self.state.last_opt_ok)
@@ -599,8 +824,10 @@ class ConfSearchRunner:
             )
             if self.state.geometry_rejected:
                 logger.error(
-                    "Candidate %s rejected by the structure check before ORCA — broken_struct_energy "
-                    "goes to the GP, the BO step is not counted.", skipped_structure_id,
+                    "Candidate %s rejected by the structure check before ORCA — %s, the BO step is "
+                    "not counted.", skipped_structure_id,
+                    "labelled infeasible (not added to the GP)" if self.state.feasibility is not None
+                    else "broken_struct_energy goes to the GP",
                 )
             else:
                 logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
@@ -627,6 +854,7 @@ class ConfSearchRunner:
                 extra_constraints=self.state.extra_constraints,
                 ts_bond_targets=None,  # TS-bond lengths are free in the final Opt/OptTS
                 failure_info=full_opt_failure,
+                ts_mode_bond=self.state.ts_mode_bond,
             )
         except Exception:
             # e.g. sbatch -W reports a non-zero ORCA exit code: lose this point, not the whole run
@@ -634,6 +862,8 @@ class ConfSearchRunner:
             en, opt_status = self.state.config.broken_struct_energy, False
         if opt_status:
             opt_status = self._check_full_opt_result(full_opt_failure)
+        if not opt_status:
+            self.state.last_failure_reason = full_opt_failure.get("reason")
         self.state.last_opt_ok = opt_status
         logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
         logger.info("Optimized! En = %s", en)
@@ -641,6 +871,7 @@ class ConfSearchRunner:
 
         if opt_status:
             self._count_outcome("success")
+            self.state.last_eval_valid = True
         else:
             self._count_outcome(
                 {"geometry": "opt_input_rejected", "result": "opt_result_broken"}.get(
@@ -657,9 +888,28 @@ class ConfSearchRunner:
                     "for this point instead of broken_struct_energy.",
                     "ORCA" if full_opt_failure["stage"] == "orca" else "broken final geometry", preopt_en,
                 )
+                self.state.last_eval_valid = True
                 return preopt_en
 
         return en + ((not opt_status) * np.random.randn())
+
+    def _built_point(self, asked: list, build_info: dict) -> list:
+        """BO point of the geometry sent to the pre-opt (the asked point if it was not built)."""
+        n_dih = len(self.state.dihedral_ids)
+        built = [float(v) for v in asked]
+        values = build_info.get("dihedrals")
+        if values is None or len(values) != n_dih:
+            return built
+        built[:n_dih] = [float(v) % (2 * np.pi) for v in values]
+        if self.state.vary_ts_bond_lengths:
+            lo, hi = self.state.config.ts_bond_min_length, self.state.config.ts_bond_max_length
+            lengths = build_info.get("ts_bond_lengths", {})
+            for k, pair in enumerate(self.state.ts_bonds):
+                if tuple(pair) in lengths:
+                    built[n_dih + k] = float(np.clip(lengths[tuple(pair)], lo, hi))
+        deviation = self._torsion_deviation(asked, built)
+        logger.info("Built candidate: largest BO-torsion difference from the asked point %.1f deg", np.degrees(deviation))
+        return built
 
     def _check_full_opt_result(self, failure_info: dict) -> bool:
         """Run the structure checks on the final geometry of a successful full optimization.
@@ -670,6 +920,8 @@ class ConfSearchRunner:
                 xyz_final, self.state.mol_file_name, original_mol=self.state.mol,
                 ts_bonds=self.state.ts_bonds, check_rings=self.state.ik_loss is not None,
             )
+            if reason is None:
+                reason, atoms_raw1 = self._left_ts_region(xyz_final)
         except Exception:
             logger.exception("Could not check the final full-opt geometry — keeping the result.")
             return True
@@ -681,6 +933,23 @@ class ConfSearchRunner:
         failure_info["reason"] = reason
         return False
 
+    def _left_ts_region(self, xyz_block: str) -> tuple:
+        """("left_ts_region", atoms) when a TS bond of the final OptTS geometry is outside its
+        ts_bond_result_margin window (the OptTS fell to the product or the reactant)."""
+        if not self.state.ts_bond_windows:
+            return None, None
+        coords = xyz_coords(xyz_block)
+        for (a, b), (lo, hi) in self.state.ts_bond_windows.items():
+            length = float(np.linalg.norm(coords[a] - coords[b]))
+            if not lo <= length <= hi:
+                atoms = tuple(with_h_canonical_to_raw1(i, self.state.mol_file_name) for i in (a, b))
+                logger.error(
+                    "OptTS left the TS region: TS bond %s is %.3f A, allowed [%.3f, %.3f] A "
+                    "(ts_bond_result_margin=%.2f)", atoms, length, lo, hi, self.state.config.ts_bond_result_margin,
+                )
+                return "left_ts_region", atoms
+        return None, None
+
     def _func_objective(self, cur: tf.Tensor) -> tf.Tensor:
         """Defines the objective function for the Bayesian optimization."""
         cur_np = cur.numpy() if hasattr(cur, "numpy") else np.asarray(cur)
@@ -688,10 +957,12 @@ class ConfSearchRunner:
         return tf.constant(results, dtype=tf.float64)
 
     def _extract_dofs_values(self, m: Chem.Mol) -> tf.Tensor:
-        """Extract dihedral angles from a molecule conformer."""
+        """Extract dihedral angles from a molecule conformer, in the BO convention: RDKit
+        dihedrals in [0, 2*pi), as calc.dihedral_angle gives for the ensemble and trajectories
+        (the old -GetDihedralRad gave the mirror torsions and could fall outside the box)."""
         conf = m.GetConformer()
         dihedral_vals = [
-            -Chem.rdMolTransforms.GetDihedralRad(conf, *self.state.dihedral_ids[i])
+            Chem.rdMolTransforms.GetDihedralRad(conf, *self.state.dihedral_ids[i]) % (2 * np.pi)
             for i in range(len(self.state.dihedral_ids))
         ]
 
@@ -785,6 +1056,7 @@ class ConfSearchRunner:
             with open(minima_file, "w") as minima_xyz_writer:
                 minima_xyz_writer.write(last_xyz)
             self.state.minima.append((last_point["coords"], last_point["rel_en"]))
+            self._add_template(last_point["coords"], xyz_coords(last_xyz))
         else:
             logger.warning(
                 "Last trajectory point (energy=%.3f kcal/mol) discarded: %s. Not added to minima.",
@@ -956,6 +1228,7 @@ class ConfSearchRunner:
 
         # Must run before vary_ts_bond_lengths is read below (it may be switched off here)
         self.state.fixed_ts_bond_targets = self._resolve_fixed_ts_bond_targets(config)
+        self.state.ts_mode_bond = self._resolve_ts_mode_bond(config)
 
         logger.info("Coef calculator creating")
 
@@ -1038,8 +1311,24 @@ class ConfSearchRunner:
                         tuple(with_h_canonical_to_raw1(a, self.state.mol_file_name) for a in sorted(pair)),
                         ts_lengths[pair],
                     )
-                self.state.ik_loss = IKLoss.from_rdkit(self.state.mol, ring_atoms_list, bond_length_overrides=ts_lengths)
+                # A TS bond in a ring may close it at any length in [ts_bond_min_length, ts_bond_max_length]
+                ts_ranges = {
+                    frozenset(pair): (config.ts_bond_min_length, config.ts_bond_max_length)
+                    for pair in self.state.ts_bonds
+                } if config.ts else {}
+                for pair in ts_ranges.keys() & ring_bonds:
+                    logger.info(
+                        "IK loss: ring TS bond %s closes the ring at any length in [%.2f, %.2f] A",
+                        tuple(with_h_canonical_to_raw1(a, self.state.mol_file_name) for a in sorted(pair)),
+                        *ts_ranges[pair],
+                    )
+                self.state.ik_loss = IKLoss.from_rdkit(
+                    self.state.mol, ring_atoms_list, bond_length_overrides=ts_lengths, ts_bond_ranges=ts_ranges,
+                )
+                self._ik_ts_ranges = ts_ranges
                 self.state.ik_loss_dihedrals_idxs = ik_loss_dihedrals_idxs
+                self.state.ring_atoms_list = ring_atoms_list
+                self._ik_ts_lengths = ts_lengths
                 logger.info("IK loss prepared. IK dihedral indices: %s", ik_loss_dihedrals_idxs)
             else:
                 self.state.ik_loss = None
@@ -1087,6 +1376,7 @@ class ConfSearchRunner:
 
         if config.exclude_dof_slack:
             self._apply_ring_dof_cap(dihedral_list_all, ik_loss_dihedrals_idxs)
+        self._prepare_acquisition_ik_loss()
 
         # Mark dihedral_ids as finalized BEFORE anything downstream is allowed to read it.
         self.state._dihedral_ids_finalized = True
@@ -1260,12 +1550,17 @@ class ConfSearchRunner:
         dih_dims = list(range(n_dih))
         ts_dims = list(range(n_dih, n_dih + n_ts))
 
+        # Periodic term: one lengthscale per torsion (ARD), so the GP can learn which torsions
+        # change the energy quickly. The prior (median 0.7, x/e^0.5) replaces the old
+        # LogNormal(0.005, 0.001), which pinned one lengthscale for all torsions at 1.0.
+        # In the Periodic kernel r = sin(dTheta/2) / l: with l = 0.7 the correlation is 0.77
+        # at 60 deg and 0.46 at 120 deg (gauche and anti are told apart).
         kernel = (
             gpflow.kernels.White(0.001)
             + gpflow.kernels.Periodic(
                 gpflow.kernels.RBF(
                     variance=0.07,
-                    lengthscales=0.005,
+                    lengthscales=[self._GP_TORSION_LENGTHSCALE] * n_dih,
                     active_dims=dih_dims,
                 ),
                 period=[2 * np.pi for _ in dih_dims],
@@ -1274,17 +1569,20 @@ class ConfSearchRunner:
                 potential_func,
                 gpflow.kernels.RBF(
                     variance=0.12,
-                    lengthscales=0.005,
+                    lengthscales=1.0,
                     active_dims=dih_dims,
                 ),
             )
         )
 
         kernel.kernels[1].base_kernel.lengthscales.prior = tfp.distributions.LogNormal(
-            loc=tf.constant(0.005, dtype=tf.float64), scale=tf.constant(0.001, dtype=tf.float64)
+            loc=tf.constant(np.log(self._GP_TORSION_LENGTHSCALE), dtype=tf.float64),
+            scale=tf.constant(0.5, dtype=tf.float64),
         )
+        # Lengthscale over the scan-profile energies (kcal/mol): same centre (1.0) as before,
+        # no longer pinned
         kernel.kernels[2].base_kernel.lengthscales.prior = tfp.distributions.LogNormal(
-            loc=tf.constant(0.005, dtype=tf.float64), scale=tf.constant(0.001, dtype=tf.float64)
+            loc=tf.constant(0.0, dtype=tf.float64), scale=tf.constant(0.5, dtype=tf.float64)
         )
 
         if n_ts > 0:
@@ -1315,14 +1613,14 @@ class ConfSearchRunner:
                     f"load_ensemble at {ensemble_path}: no conformers/energies found. "
                     f"norm_energy can't be calculated."
                 )
-            # BO energies are E_orca * HARTRI_TO_KCAL - norm_energy, so the ensemble must hold absolute
+            # BO energies are E_orca * HARTREE_TO_KCAL - norm_energy, so the ensemble must hold absolute
             # kcal/mol energies (< -9e4 for any molecule with a heavy-atom torsion). Hartree or
             # relative values would silently mix scales with every later ORCA result.
             if max(self.state.ensemble_processor.energies) > -1e4:
                 raise RuntimeError(
                     f"load_ensemble at {ensemble_path}: energies (max={max(self.state.ensemble_processor.energies):.4f}) "
                     f"are not absolute energies in kcal/mol. Put the absolute energy in kcal/mol "
-                    f"(Hartree * {HARTRI_TO_KCAL}) as the last token of each comment line."
+                    f"(Hartree * {HARTREE_TO_KCAL}) as the last token of each comment line."
                 )
             self.state.norm_energy = min(self.state.ensemble_processor.energies)
             logger.info(
@@ -1356,6 +1654,7 @@ class ConfSearchRunner:
                     success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
                     ts_bond_max_length=self.state.config.ts_bond_max_length,
                     fixed_dihedrals=self.state.fixed_dihedrals, extra_constraints=self.state.extra_constraints,
+                    ts_mode_bond=self.state.ts_mode_bond,
                 )
                 logger.info("Norm energy: %s", self.state.norm_energy)
                 if not ok:
@@ -1414,8 +1713,18 @@ class ConfSearchRunner:
                     f"Dataset energy range ({obs_range:.1f} kcal/mol) is too large for GP. "
                     f"Use ensemble_min normalization instead of ORCA norm_energy for TS ensembles."
                 )
+            if self.state.feasibility is not None:
+                for point in dataset.query_points.numpy():
+                    self.state.feasibility.add(point, True)
+                logger.info("Feasibility model seeded with %d ensemble conformers", len(self.state.feasibility))
         else:
-            for idx in range(config.num_initial_points):
+            use_fm = self.state.feasibility is not None
+            # Rejected embeddings are cheap (no ORCA): with the feasibility model they are
+            # retried, like rejected BO candidates, so the GP still starts from num_initial_points
+            max_retries = config.max_geometry_rejections_in_a_row or 50
+            n_done, n_retried, idx = 0, 0, -1
+            while n_done < config.num_initial_points:
+                idx += 1
                 # Check conformer existance
                 mol_copy = Chem.RWMol(self.state.mol)
                 mol_copy = Chem.AddHs(mol_copy) # Silence RDkit warning
@@ -1445,6 +1754,15 @@ class ConfSearchRunner:
                     initial_query_points = self._extract_dofs_values(mol_copy)
 
                 observed_point = observer(initial_query_points)
+                if use_fm and not self.state.last_eval_valid:
+                    if self.state.geometry_rejected and n_retried < max_retries:
+                        n_retried += 1
+                        logger.warning("Initial point rejected before ORCA — trying another embedding (%d)", n_retried)
+                        continue
+                    n_done += 1
+                    logger.warning("Initial point gave no energy — kept only in the feasibility model.")
+                    continue
+                n_done += 1
                 part = self._trj_dataset_part(self._last_trj_path()) if self.state.last_opt_ok else None
                 if part is None:
                     if not self.state.last_opt_ok:
@@ -1452,8 +1770,14 @@ class ConfSearchRunner:
                             "Optimization didn't finish well. Continue only with the returned energy in required point: %s",
                             observed_point,
                         )
-                    part = observed_point
+                    part = self._move_last_to_built_point(observed_point)
                 dataset = part if dataset is None else dataset + part
+            if dataset is None:
+                raise RuntimeError(
+                    f"None of the {config.num_initial_points} initial points gave an energy (see the log above "
+                    f"for each). The GP needs at least one: check the .mol geometry and the ORCA settings, "
+                    f"or start from load_ensemble."
+                )
             logger.info(
                 "Initial dataset observed! %s minima observed, total %s points has been collected!",
                 config.num_initial_points,
@@ -1461,6 +1785,37 @@ class ConfSearchRunner:
             )
 
         return dataset
+
+    def _move_last_to_built_point(self, dataset: Dataset) -> Dataset:
+        """The energy of the last candidate belongs to the geometry that was built, which can
+        differ from the asked point (ring closure in the MMFF build): move the observation there."""
+        built = self.state.last_built_point
+        if built is None or not self.state.last_eval_valid or dataset.query_points.shape[0] == 0:
+            return dataset
+        query_points = dataset.query_points.numpy().copy()
+        if np.allclose(query_points[-1], built):
+            return dataset
+        query_points[-1] = built
+        return Dataset(tf.constant(query_points, dtype=tf.float64), dataset.observations)
+
+    def _drop_invalid_observations(self, dataset: Dataset) -> Dataset:
+        """Feasibility model on: broken_struct_energy values are not energies — take them out
+        of the GP data (old checkpoints and runs without the model kept them there)."""
+        if self.state.feasibility is None:
+            return dataset
+        obs = dataset.observations.numpy().reshape(-1)
+        keep = np.array([np.isfinite(e) and not _is_broken(float(e), self.state.config.broken_struct_energy) for e in obs])
+        if keep.all():
+            return dataset
+        if not keep.any():
+            raise RuntimeError(
+                "Every GP observation is broken_struct_energy: no valid energy to start from. "
+                "Check the .mol geometry and the ORCA settings."
+            )
+        logger.warning("%d broken_struct_energy observation(s) taken out of the GP data", int((~keep).sum()))
+        return Dataset(
+            tf.boolean_mask(dataset.query_points, keep), tf.boolean_mask(dataset.observations, keep),
+        )
 
     def _clear_working_folder(self) -> None:
         """Start a clean run: move the previous run's files from working_folder into a new
@@ -1624,33 +1979,44 @@ class ConfSearchRunner:
         """Build acquisition rule based on configuration."""
         config = self.state.config
 
-        rule = None
-
         match config.acquisition_function:
             case "evm":
                 logger.info("Continue with Explorational Variance Minimizer acquisition function!")
-                rule = EfficientGlobalOptimization(ExplorationalVarianceMinimizer(threshold=3))
+                builder = ExplorationalVarianceMinimizer(threshold=3)
             case "ei":
                 logger.info("Continue with ExpectedImprovement acquisition function!")
-                rule = EfficientGlobalOptimization(ExpectedImprovement())
+                builder = ExpectedImprovement()
             case "ik":
                 logger.info("Continue with ImprovementVarianceWithIK acquisition function!")
-                if self.state.ik_loss is None or len(self.state.ik_loss_dihedrals_idxs) == 0:
-                    logger.warning("IK loss is not available; falling back to ExplorationalVarianceMinimizer")
-                    rule = EfficientGlobalOptimization(ExplorationalVarianceMinimizer(threshold=3))
+                if self.state.ik_acq_loss is None or config.ik_loss_weight == 0:
+                    # Same improvement variance, without the ring-closure term
+                    logger.info(
+                        "No ring for the IK loss of the acquisition (or ik_loss_weight: 0) — using the "
+                        "improvement variance alone; the MMFF ring build is unchanged."
+                    )
+                    builder = ExplorationalVarianceMinimizer(threshold=3)
                 else:
-                    rule = EfficientGlobalOptimization(
-                        ImprovementVarianceWithIK(
-                            threshold=3.0,
-                            ik_loss=self.state.ik_loss,
-                            ik_loss_idxs=self.state.ik_loss_dihedrals_idxs,
-                            ik_loss_weight=1.0,
-                        )
+                    builder = ImprovementVarianceWithIK(
+                        threshold=3.0,
+                        ik_loss=self.state.ik_acq_loss,
+                        ik_loss_idxs=self.state.ik_acq_dihedrals_idxs,
+                        ik_loss_weight=config.ik_loss_weight,
                     )
             case _:
                 raise ValueError(f"Unknown acquisition function {config.acquisition_function}")
 
-        return rule
+        if self.state.feasibility is not None:
+            logger.info(
+                "Acquisition is weighted by the feasibility model (%d labels, %d failed)",
+                len(self.state.feasibility), self.state.feasibility.n_failed,
+            )
+            builder = FeasibilityWeightedAcquisition(builder, self.state.feasibility)
+        self._batch_optimizer = None
+        if config.candidate_batch_size > 1 and self.state.feasibility is not None:
+            # Candidates rejected before ORCA are replaced by the next maximum of the same search
+            self._batch_optimizer = BatchRecordingOptimizer(config.candidate_batch_size, len(self.state.dihedral_ids))
+            return EfficientGlobalOptimization(builder, optimizer=self._batch_optimizer)
+        return EfficientGlobalOptimization(builder)
 
     def _checkpoint_path(self) -> Path:
         return Path(self.state.working_folder) / f"{self.state.exp_name}_checkpoint.json"
@@ -1693,6 +2059,9 @@ class ConfSearchRunner:
             "outcomes": dict(self.state.outcomes),
             "events": run_state.events(),
         }
+        if self.state.feasibility is not None:
+            snapshot["feasibility_points"] = self.state.feasibility.points
+            snapshot["feasibility_labels"] = self.state.feasibility.labels
 
         existing = self._load_checkpoint_file()
         history = []
@@ -1834,6 +2203,29 @@ class ConfSearchRunner:
         self.state.acq_vals_log = list(snapshot.get("acq_vals_log", []))
         self.state.deepest_minima = list(snapshot.get("deepest_minima", []))
 
+        fm = self.state.feasibility
+        if fm is not None:
+            points, labels = snapshot.get("feasibility_points"), snapshot.get("feasibility_labels")
+            try:
+                fm.set_data(points, labels)
+                logger.info("Feasibility model restored: %d labels, %d failed", len(fm), fm.n_failed)
+            except (TypeError, ValueError):
+                # Checkpoint without labels (older version or the model was off): every GP point
+                # with an energy counts as feasible, every broken_struct_energy point as failed
+                obs = dataset.observations.numpy().reshape(-1)
+                fm.set_data(
+                    dataset.query_points.numpy().tolist(),
+                    [not _is_broken(float(e), self.state.config.broken_struct_energy) for e in obs],
+                )
+                logger.info("Feasibility model seeded from the checkpoint data: %d labels, %d failed", len(fm), fm.n_failed)
+
+        minima_dir = Path(self.state.working_folder) / f"{self.state.exp_name}_minima"
+        for i, (coords, _) in enumerate(self.state.minima):
+            try:
+                self._add_template(coords, xyz_coords((minima_dir / f"{i}.xyz").read_text()))
+            except (OSError, ValueError):
+                pass
+
         # The structure-id counter restarts at 0 in a new process: continue after the
         # highest id already on disk so resumed steps don't overwrite earlier files
         next_id = self._next_free_structure_id()
@@ -1858,7 +2250,26 @@ class ConfSearchRunner:
         config = self.state.config
 
         kernel, search_space, observer = self._build_model_and_acquisition()
-        
+
+        n_ts_dims = len(self.state.ts_bonds) if self.state.vary_ts_bond_lengths else 0
+        if config.use_feasibility_model:
+            self.state.feasibility = FeasibilityModel(
+                n_dihedrals=len(self.state.dihedral_ids), n_ts_bonds=n_ts_dims,
+                lengthscale=config.feasibility_lengthscale,
+                ts_lengthscale=config.ts_bond_kernel_lengthscale,
+                prior=config.feasibility_prior,
+            )
+        ep = self.state.ensemble_processor
+        if ep is not None and config.build_from_nearest_conformer:
+            for point, coords in zip(ep.processed_ens, ep.coords):
+                self._add_template(point, coords)
+            if not self.state.templates and ep.coords:
+                logger.warning("load_ensemble structures can't be used to build candidates (atom count differs from the .mol)")
+        elif ep is not None:
+            for coords in ep.coords:
+                self._note_mmff_reference(coords)
+        self.state.ts_bond_windows = self._resolve_ts_bond_windows()
+
         ckpt = self._resolve_checkpoint_snapshot()
         start_step = 1
         if ckpt is not None:
@@ -1870,7 +2281,10 @@ class ConfSearchRunner:
             )
         else:
             dataset = self._initialize_dataset(observer)
-        
+        dataset = self._drop_invalid_observations(dataset)
+        if config.build_from_nearest_conformer:
+            logger.info("Candidates are built from the closest of %d known structures", len(self.state.templates))
+
         obs = dataset.observations.numpy().flatten()
         obs_std = float(np.std(obs))
         obs_mean = float(np.mean(obs))
@@ -1909,7 +2323,9 @@ class ConfSearchRunner:
             init_variance, init_lengthscale
         )
 
-        gpr = gpflow.models.GPR(dataset.astuple(), kernel)
+        # Constant prior mean (trained) instead of 0: 0 is the best energy, so far from the data
+        # the GP used to predict "as good as the best" and sent the search to empty regions
+        gpr = gpflow.models.GPR(dataset.astuple(), kernel, mean_function=gpflow.mean_functions.Constant(obs_mean))
         gpflow.set_trainable(gpr.likelihood, False)
         gpflow.set_trainable(gpr.kernel.kernels[0].variance, False)
         gpflow.set_trainable(gpr.kernel.kernels[1].period, False)
@@ -1974,11 +2390,19 @@ class ConfSearchRunner:
             return
         
         # A BO step counts towards max_steps only if its candidate reached ORCA: candidates
-        # rejected by the structure check (or no candidate at all) still go into the GP, but
-        # are retried, at most max_geometry_rejections_in_a_row times in a row (0 = no limit)
+        # rejected by the structure check (or no candidate at all) are retried, at most
+        # max_geometry_rejections_in_a_row times in a row (0 = no limit). With the feasibility
+        # model a candidate without an energy only teaches that model; without it, it goes
+        # into the GP as broken_struct_energy.
         step = start_step - 1  # counted steps done
         rejected_in_a_row = 0
+        tried_in_batch: list = []  # points of the current acquisition search already evaluated
         max_rejected = config.max_geometry_rejections_in_a_row
+        # The model is refitted below after every step (after the trajectory frames replace
+        # the asked point), so trieste's own refit inside bo.optimize is skipped
+        bo_kwargs = {"fit_initial_model": False}
+        if "fit_model" in inspect.signature(bo.optimize).parameters:
+            bo_kwargs["fit_model"] = False
         while step < config.max_steps:
             if max_rejected > 0 and rejected_in_a_row >= max_rejected:
                 break
@@ -1989,11 +2413,27 @@ class ConfSearchRunner:
             self.state.geometry_rejected = False
             t0 = time.monotonic()
             try:
-                result = bo.optimize(1, dataset, model, rule, fit_initial_model=False)
-                new_dataset = result.try_get_final_dataset()
-                model = result.try_get_final_model()
-                dataset = new_dataset
-                logger.info("Optimization step %s succeed! (bo.optimize took %.1f s)", step + 1, time.monotonic() - t0)
+                queued = None
+                if rejected_in_a_row > 0 and self._batch_optimizer is not None:
+                    queued = self._batch_optimizer.pop_next(rule._acquisition_function, tried_in_batch)
+                if queued is not None:
+                    # Same GP, same acquisition search: only the feasibility weight changed
+                    tried_in_batch.append(queued)
+                    dataset = dataset + observer(tf.constant([queued], dtype=tf.float64))
+                    logger.info("Step %s: kept candidate of the last acquisition search evaluated", step + 1)
+                else:
+                    result = bo.optimize(1, dataset, model, rule, **bo_kwargs)
+                    new_dataset = result.try_get_final_dataset()
+                    model = result.try_get_final_model()
+                    dataset = new_dataset
+                    if self._batch_optimizer is not None and self.state.asked_points:
+                        tried_in_batch = [np.asarray(self.state.asked_points[-1], dtype=float)]
+                    logger.info("Optimization step %s succeed! (bo.optimize took %.1f s)", step + 1, time.monotonic() - t0)
+                if self.state.feasibility is not None and not self.state.last_eval_valid:
+                    # No energy for this candidate: it lives in the feasibility model only
+                    dataset = self._erase_last_from_dataset(dataset, 1)
+                else:
+                    dataset = self._move_last_to_built_point(dataset)
             except Exception as e:
                 if self.state.last_observation is None:
                     # Failed before the objective ran (acquisition): nothing new to keep
@@ -2014,9 +2454,10 @@ class ConfSearchRunner:
                     "observed point to the dataset directly.", step + 1, e,
                 )
                 query_point, energy = self.state.last_observation
-                dataset = dataset + Dataset(
-                    tf.constant([query_point], dtype=tf.float64), tf.constant([[energy]], dtype=tf.float64),
-                )
+                if self.state.feasibility is None or self.state.last_eval_valid:
+                    dataset = self._move_last_to_built_point(dataset + Dataset(
+                        tf.constant([query_point], dtype=tf.float64), tf.constant([[energy]], dtype=tf.float64),
+                    ))
 
             if self.state.geometry_rejected:
                 rejected_in_a_row += 1
@@ -2065,15 +2506,19 @@ class ConfSearchRunner:
                     dataset = self._erase_last_from_dataset(dataset, 1) + part
             else:
                 logger.warning("Last optimization finished with error, skipping trj parsing!")
-            model.update(dataset)
-            try:
-                model.optimize(dataset)
-            except Exception as e:
-                logger.warning(
-                    "GP optimization failed at step %d: %s. "
-                    "Continuing with current hyperparameters.",
-                    step, e
-                )
+            if self.state.feasibility is not None and not self.state.last_eval_valid:
+                # No new energy: the GP data did not change, refitting it would only cost time
+                logger.info("GP data unchanged (candidate without an energy) — GP not refitted")
+            else:
+                model.update(dataset)
+                try:
+                    model.optimize(dataset)
+                except Exception as e:
+                    logger.warning(
+                        "GP optimization failed at step %d: %s. "
+                        "Continuing with current hyperparameters.",
+                        step, e
+                    )
 
             logger.info("Updating model checkpoint!")
             self.state.model_chk = gpflow.utilities.deepcopy(model.model)
@@ -2084,12 +2529,18 @@ class ConfSearchRunner:
             logger.info("Updated!")
 
             obs = dataset.observations.numpy().flatten()
-            n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
+            if self.state.feasibility is not None:
+                # Candidates without an energy (outside the GP data)
+                n_broken = self.state.feasibility.n_failed
+            else:
+                n_broken = int(np.sum([_is_broken(v, config.broken_struct_energy) for v in obs]))
             if self.state.geometry_rejected:
                 logger.info(
-                    "Candidate rejected by the structure check (%d in a row) — added to the GP as broken, "
+                    "Candidate rejected by the structure check (%d in a row) — %s, "
                     "step counter stays at %d/%d. Dataset: %d points, broken=%d",
-                    rejected_in_a_row, step, config.max_steps, len(obs), n_broken,
+                    rejected_in_a_row,
+                    "labelled in the feasibility model" if self.state.feasibility is not None else "added to the GP as broken",
+                    step, config.max_steps, len(obs), n_broken,
                 )
                 print(
                     f"[BOCSER] rejected by structure check ({rejected_in_a_row} in a row), "
@@ -2103,7 +2554,7 @@ class ConfSearchRunner:
                     "broken=%d, mean_valid=%.3f",
                     step, len(obs), float(obs.min()), n_broken,
                     float(obs[obs < config.broken_struct_energy * 0.9].mean())
-                    if n_broken < len(obs) else float("nan"),
+                    if np.any(obs < config.broken_struct_energy * 0.9) else float("nan"),
                 )
                 _print_progress(step, config.max_steps, float(obs.min()), len(obs), n_broken)
 
@@ -2201,7 +2652,15 @@ class ConfSearchRunner:
             total = sum(reasons.values())
             detail = ", ".join(f"{r} {n}" for r, n in sorted(reasons.items(), key=lambda x: -x[1]) if r != "-")
             lines.append(f"  {title}: {total}" + (f" ({detail})" if detail else ""))
-        lines.append(f"MMFF regularization not converged: {events.get('mmff_not_converged', 0)}")
+        lines.append(
+            f"MMFF not converged: candidate build {events.get('mmff_build_not_converged', 0)}, "
+            f"regularization {events.get('mmff_not_converged', 0)}"
+        )
+        if self.state.feasibility is not None:
+            lines.append(
+                f"Feasibility model: {len(self.state.feasibility)} labels, "
+                f"{self.state.feasibility.n_failed} without an energy"
+            )
         lines.append(
             f"Minima found: {len(self.state.minima)}, unique conformers in the final ensemble: "
             f"{self.state.n_unique_conformers}"
