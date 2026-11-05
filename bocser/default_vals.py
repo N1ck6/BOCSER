@@ -31,12 +31,7 @@ class ConfSearchConfig:
     ts_bonds: List[Tuple[int, int]] = field(default_factory=list)   # 1-индексация, как в исходном .mol
     ts_bond_max_length: float = 5.0
     vary_ts_bond_lengths: bool = True
-    # True = old behaviour: each ring keeps only (N - 6) torsion axes in the GP, the rest are set by
-    # ring closure. False: every rotatable torsion is a GP axis; candidates that cannot be built
-    # (MMFF fails, ring does not close, clash, broken bond) are rejected before ORCA.
-    exclude_dof_slack: bool = False
-    # ik: scan each ring torsion on an open fragment around its bond (the ring is cut, the cut
-    # atoms get H) instead of a flat GP mean for every ring axis
+    exclude_dof_slack: bool = False # True => keep (N - 6) torsion axes in the GP
     scan_ring_torsions: bool = True
     ik_loss_weight: float = 1.0  # acquisition "ik" = IV - ik_loss_weight * IK loss (rings whose torsions are all GP axes)
     ts_bond_min_length: float = 1.0
@@ -52,66 +47,33 @@ class ConfSearchConfig:
     tf_eager_mode: bool = False # Управляет tf.config.run_functions_eagerly() - отладка shape-ошибок, замедление расчетов acquisition
     bond_stretch_factor: float = 1.4  # порог для _check_bond_topology_intact
     preopt_max_iter: int = 100
-
-    # TS only (ts: true). Fixed TS-bond lengths are held in the ORCA pre-optimization only,
-    # never in the final OptTS. Sources: bond entries of extra_constraints on a ts_bonds pair,
-    # or (when True) the lengths in the lowest-energy conformer of load_ensemble.
     infer_ts_bond_lengths_from_ensemble: bool = False
-
-    # TS only: OptTS follows the Hessian mode with the largest share of this bond ([a, b], 1-idx
-    # as in the .mol). Empty = the shortest TS bond (the most formed one is the stiffest and
-    # loads mostly on the reaction mode; a long partial bond also changes in soft torsion modes).
     ts_mode_bond: List[int] = field(default_factory=list)
-    # TS only: the final OptTS geometry must keep every TS bond within this margin (A) of the
-    # reference lengths (range over load_ensemble, else the .mol and fixed TS-bond lengths).
-    # Outside it the OptTS left the TS (fell to the product or the reactant) and the result
-    # counts as a failed full opt. 0 = no check.
     ts_bond_result_margin: float = 0.5
-
-    # Full opt failed in ORCA (MaxIter, SCF, abort) after a successful pre-opt: give the GP the
-    # pre-opt energy of the point instead of broken_struct_energy. A geometry rejected by the
-    # structure checks is always broken. False = old behaviour (penalize the region).
     use_preopt_energy_on_opt_failure: bool = True
-
-    # The final Opt/OptTS runs without constraints by default; all of them are held in the pre-opt.
-    # Also freeze the BO dihedrals in the final Opt/OptTS (they are always frozen in the pre-opt).
-    # The result is then a constrained structure, not a free stationary point.
     constrain_bo_dihedrals_in_final_opt: bool = False
-    # Also hold the fixed torsions (double bonds) and extra_constraints in the
-    # final Opt/OptTS and in the norm_energy optimization of the .mol geometry.
-    constrain_final_opt: bool = False
+    constrain_final_opt: bool = False # Hold the double bonds and extra_constraints in the Full opt
 
-    # Separate model of P(the candidate gives a valid energy) over the search space. A candidate
-    # that gives no energy (rejected by the structure check, ORCA failed, or the geometry could
-    # not be built near the asked point) teaches this model and never enters the energy GP; the
-    # acquisition is multiplied by P. False = old behaviour: broken_struct_energy goes to the GP.
+    # Separate model of P() - the candidate gives a valid energy by structure check and ORKA runs
     use_feasibility_model: bool = True
     feasibility_lengthscale: float = 0.5  # per torsion, in 2*sin(dTheta/2) units (0.5 ~ 30 deg, 1.0 ~ 60 deg)
     feasibility_prior: float = 0.8        # P far from every evaluated point
 
-    # Start the geometry of every candidate from the closest known structure (load_ensemble
-    # conformers and minima found in this run, closest in the GP torsions) instead of the .mol:
-    # the torsions that are not GP axes (dependent ring torsions, small-ring puckers, OH groups)
-    # then come from a real low-energy structure.
-    build_from_nearest_conformer: bool = True
+    build_from_nearest_conformer: bool = True# Not GP torsion axes come from a real low-energy structure.
 
-    # Final ensemble: two minima are one conformer when BOTH hold (defaults as in CREST)
     dedup_rmsd_threshold: float = 0.125   # heavy-atom RMSD after symmetry-aware alignment, A
     dedup_energy_threshold: float = 0.05  # kcal/mol
 
-    # Optional MMFF94 clean-up of each candidate before the ORCA pre-optimization.
     use_mmff_regularization: bool = False
     mmff_max_iter: int = 1000
 
-    # Reject a candidate before ORCA when its MMFF94 energy is more than this (kcal/mol) above
+    #  above
     # the lowest MMFF94 energy of the known structures (load_ensemble conformers, minima found,
     # candidates built so far). Same force field and same constraints-free energy on both sides.
-    # null = no filter.
-    mmff_energy_window: Union[float, None] = 30.0
+    
+    mmff_energy_window: Union[float, None] = 30.0 # Reject a candidate if MMFF94 energy exceeds this (kcal/mol); null = no filter.
 
-    # A BO step keeps up to this many distinct maxima of the acquisition. When the first
-    # candidate is rejected before ORCA, the next one is tried without a new acquisition search.
-    candidate_batch_size: int = 5
+    candidate_batch_size: int = 5 # Amount of candidates, taken from GP on each step
 
     # Optional: feed more frames of each ORCA trajectory into the GP (thinned in BO coordinates).
     augment_gp_from_orca_trj: bool = False
