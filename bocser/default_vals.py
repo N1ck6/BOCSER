@@ -50,7 +50,6 @@ class ConfSearchConfig:
     infer_ts_bond_lengths_from_ensemble: bool = False
     ts_mode_bond: List[int] = field(default_factory=list)
     ts_bond_result_margin: float = 0.5
-    use_preopt_energy_on_opt_failure: bool = True
     constrain_bo_dihedrals_in_final_opt: bool = False
     constrain_final_opt: bool = False # Hold the double bonds and extra_constraints in the Full opt
 

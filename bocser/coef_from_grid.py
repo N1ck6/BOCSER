@@ -5,44 +5,37 @@ import tensorflow as tf
 
 from calc import HARTREE_TO_KCAL
 
-def pes(
-    x : np.ndarray, 
-    A11 : float, A21 : float, A31 : float,
-    b11 : float, b21 : float, b31 : float,
-    c1 : float
-) -> np.ndarray:
-    """
-        Function, that could describe PES
-    """
-    return A11 * np.cos(b11 * x[:, 0]) + A21 * np.cos(2 * b21 * x[:, 0]) + A31 * np.cos(3 * b31 * x[:, 0]) + c1
+# ============================================================================
+# NEW FOURIER MODEL (2026-11-06)
+# Fixed integer harmonics guarantee exact 2π periodicity. The cache namespace
+# is versioned in coef_calc.py so legacy seven-parameter rows are never reused.
+# ============================================================================
+def pes(x: np.ndarray, A1: float, A2: float, A3: float, C: float) -> np.ndarray:
+    """Strictly 2π-periodic three-harmonic cosine torsional profile."""
+    theta = np.asarray(x, dtype=float).reshape(-1)
+    return A1 * np.cos(theta) + A2 * np.cos(2.0 * theta) + A3 * np.cos(3.0 * theta) + C
 
-def pes_tf(
-    x : tf.Tensor,
-    A11 : float, A21 : float, A31 : float,
-    b11 : float, b21 : float, b31 : float,
-    c1 : float
-) -> tf.Tensor:
-    return A11 * tf.cos(b11 * x) + A21 * tf.cos(2 * b21 * x) + A31 * tf.cos(3 * b31 * x) + c1
 
-def pes_tf_grad(
-    x : tf.Tensor,
-    A11 : float, A21 : float, A31 : float,
-    b11 : float, b21 : float, b31 : float,
-    c1 : float
-) -> tf.Tensor:
-    return -(A11 * b11 * tf.sin(b11 * x) + A21 * 2 * b21 * tf.sin(2 * b21 * x) + A31 * 3 * b31 * tf.sin(3 * b31 * x))
+def pes_tf(x: tf.Tensor, A1: float, A2: float, A3: float, C: float) -> tf.Tensor:
+    """TensorFlow implementation of the strictly periodic torsional profile."""
+    return A1 * tf.cos(x) + A2 * tf.cos(2.0 * x) + A3 * tf.cos(3.0 * x) + C
 
-def calc_coefs(
-    x : np.ndarray,
-    y : np.ndarray,
-) -> np.ndarray:
-    """
-        x - observed points [N, inp_dims]
-        y - observed signal [N]
-        returns [7, inp_dims] array of coefs
-    """ 
-    y = (y - y.mean()) * HARTREE_TO_KCAL
-    coefs, cov_matrix = curve_fit(pes, x, y, p0=np.ones(7), maxfev=10000)
+
+def pes_tf_grad(x: tf.Tensor, A1: float, A2: float, A3: float, C: float) -> tf.Tensor:
+    """Derivative with respect to the dihedral angle."""
+    return -(A1 * tf.sin(x) + 2.0 * A2 * tf.sin(2.0 * x) + 3.0 * A3 * tf.sin(3.0 * x))
+
+
+def calc_coefs(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Fit [A1, A2, A3, C] by linear least squares; y is in Hartree."""
+    theta = np.asarray(x, dtype=float).reshape(-1)
+    energy = (np.asarray(y, dtype=float).reshape(-1) - np.mean(y)) * HARTREE_TO_KCAL
+    if theta.size != energy.size or theta.size < 4:
+        raise ValueError(f"Fourier fit requires at least four paired points; got {theta.size} angles and {energy.size} energies")
+    design = np.column_stack((np.cos(theta), np.cos(2.0 * theta), np.cos(3.0 * theta), np.ones_like(theta)))
+    coefs, _, rank, _ = np.linalg.lstsq(design, energy, rcond=None)
+    if rank < 4 or not np.all(np.isfinite(coefs)):
+        raise ValueError(f"Periodic Fourier design matrix is rank deficient (rank={rank})")
     return coefs
 
 def morse(

@@ -604,6 +604,9 @@ def generate_oinp(
         ts_bond_targets: list = None, # BO-sampled or fixed TS-bond lengths; pre-opt only
         constrain_bo_dihedrals: bool = False, # also freeze BO dihedrals in the final (unconstrained) opt
         ts_mode_bond: tuple = None, # canonical 0-idx pair: OptTS follows the mode with most of this bond
+        opt_type: Union[str, None] = None,
+        force_unconstrained: bool = False,
+        inhess_file: Union[str, None] = None, # OptTS: start from this Hessian instead of computing one
     ) -> None:
     """
         generates orca .inp file
@@ -628,14 +631,21 @@ def generate_oinp(
             tmp.write("\n\n")
             tmp.write(coords)
         else:
-            opt_cmd = "OptTS" if (cfg.ts) else "Opt"
+            # NEW (2026-11-06): stage-specific ORCA task. TS workflow uses Opt for
+            # constrained preparation, then OptTS with and without torsional constraints.
+            opt_cmd = opt_type or ("OptTS" if cfg.ts else "Opt")
+            if opt_cmd not in ("Opt", "OptTS"):
+                raise ValueError(f"Unsupported ORCA optimization task: {opt_cmd}")
             tmp.write(orca_input_head(method_of_calc, opt_cmd))
             tmp.write("%pal\nnprocs " + str(num_of_procs) + "\nend\n")
 
             hard_by_axis = {}
             hard_bond_pairs = set()
             all_constraints = []
-            for c in (hard_constraints or []):
+            # Stage 4 explicitly suppresses configured hard constraints: it is the
+            # unconstrained refinement of the stage-3 transition-state structure.
+            effective_hard_constraints = [] if force_unconstrained else (hard_constraints or [])
+            for c in effective_hard_constraints:
                 if c.type == "dihedral":
                     axis = frozenset((c.atoms[1], c.atoms[2]))
                     if axis in hard_by_axis:
@@ -645,7 +655,7 @@ def generate_oinp(
                     hard_bond_pairs.add(frozenset(c.atoms))
                 all_constraints.append(c)
 
-            if constrained_opt or constrain_bo_dihedrals:
+            if not force_unconstrained and (constrained_opt or constrain_bo_dihedrals):
                 # The geometry was already built at the BO dihedrals (and the MMFF branch reads
                 # the values back), so freezing the current value is exact and sign-independent
                 for atoms, _ in dihedrals:
@@ -656,8 +666,8 @@ def generate_oinp(
                         continue
                     all_constraints.append(Constraint("dihedral", tuple(atoms), None))
 
-            if constrained_opt:
-                # TS-bond lengths are held only during the pre-optimization
+            if constrained_opt and not force_unconstrained:
+                # TS-bond lengths are held only during the stage-2 pre-optimization
                 for atoms, value in (ts_bond_targets or []):
                     pair = frozenset(atoms)
                     if pair in hard_bond_pairs:
@@ -681,10 +691,14 @@ def generate_oinp(
                         value_str = "" if c.value is None or c.current else " " + str(c.value)
                         tmp.write("{ " + letter + " " + atoms_str + value_str + " C }\n")
                     tmp.write("end\n")
-                if cfg.ts and not constrained_opt:
+                if opt_cmd == "OptTS":
                     max_iter = cfg.ts_max_iter * 2
                     tmp.write(f"MaxIter {max_iter}\n")
-                    tmp.write("Calc_Hess true\n")
+                    if inhess_file:
+                        tmp.write("InHess Read\n")
+                        tmp.write(f'InHessName "{inhess_file}"\n')
+                    else:
+                        tmp.write("Calc_Hess true\n")
                     if ts_mode_bond is not None:
                         tmp.write(f"TS_Mode {{B {ts_mode_bond[0]} {ts_mode_bond[1]}}} end\n")
                 elif constrained_opt:
@@ -793,18 +807,31 @@ def start_calc(gjf_name: str, scan=False):
 _ORCA_JUNK_SUFFIXES = {
     ".gbw", ".densities", ".tmp", ".ges",
     ".prop", ".bas", ".engrad", ".pcgrad",
-    ".hess", ".bibtex",
+    ".bibtex",
 }
+
+
+def last_hess_path(mol_file_name: str) -> Path:
+    """Hessian of the last ORCA job of this molecule (kept by _cleanup_orca_tempfiles):
+    the stage-3 OptTS Hessian, read by the stage-4 OptTS."""
+    return _qc_calcs_dir(mol_file_name) / (Path(mol_file_name).stem + "_last.hess")
 
 def _cleanup_orca_tempfiles(inp_path: Path) -> None:
     """Delete large ORCA scratch files after each calculation.
     
-    Keeps: .inp, .out, .xyz, _trj.xyz, .sh
+    Keeps: .inp, .out, .xyz, _trj.xyz, .sh; the .hess is renamed to {stem}_last.hess
     Deletes: .gbw, .densities, .tmp and other scratch files.
     """
     stem = inp_path.stem
     parent = inp_path.parent
     deleted_bytes = 0
+
+    hess = parent / (stem + ".hess")
+    if hess.is_file():
+        try:
+            os.replace(hess, parent / (stem + "_last.hess"))
+        except OSError as e:
+            logger.warning("Could not keep the Hessian %s: %s", hess.name, e)
 
     for f in parent.iterdir():
         if f.stem == stem and f.suffix in _ORCA_JUNK_SUFFIXES:
@@ -1342,6 +1369,9 @@ def calc_energy(
         build_info: Union[dict, None] = None,
         max_build_deviation: Union[float, None] = None,
         mmff_energy_limit: Union[float, None] = None,
+        opt_type: Union[str, None] = None,
+        force_unconstrained: bool = False,
+        inhess_file: Union[str, None] = None,
 ) -> tuple[float, bool]:
     """
         Calculates energy of molecule from 'mol_file_name'
@@ -1384,7 +1414,7 @@ def calc_energy(
     # Fixed torsions and extra_constraints are held in the pre-opt; the full opt (and the
     # norm_energy opt) runs without any constraint unless constrain_final_opt is set
     hard_constraints = []
-    if constrained_opt or cfg.constrain_final_opt:
+    if not force_unconstrained and (constrained_opt or cfg.constrain_final_opt):
         for atoms, _ in (fixed_dihedrals or []):
             # The geometry already holds these torsions (input .mol / MMFF stage): freeze the current value
             hard_constraints.append(Constraint("dihedral", tuple(atoms), None))
@@ -1503,7 +1533,8 @@ def calc_energy(
             num_of_procs=cfg.num_of_procs, method_of_calc=cfg.orca_method, charge=cfg.charge,
             multipl=cfg.spin_multiplicity, hard_constraints=hard_constraints,
             ts_bond_targets=ts_bond_targets, constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
-            ts_mode_bond=ts_mode_bond,
+            ts_mode_bond=ts_mode_bond, opt_type=opt_type,
+            force_unconstrained=force_unconstrained, inhess_file=inhess_file,
         )
         return 0.0, True
 
@@ -1537,7 +1568,8 @@ def calc_energy(
         hard_constraints=hard_constraints,
         ts_bond_targets=ts_bond_targets,
         constrain_bo_dihedrals=cfg.constrain_bo_dihedrals_in_final_opt,
-        ts_mode_bond=ts_mode_bond,
+        ts_mode_bond=ts_mode_bond, opt_type=opt_type,
+        force_unconstrained=force_unconstrained, inhess_file=inhess_file,
     )
     failed_tag ="preopt_failed" if constrained_opt else "opt_failed"
     try:

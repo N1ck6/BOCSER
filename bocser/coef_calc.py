@@ -60,6 +60,8 @@ class CoefCalculator:
         self.skip_triple_equal_terminal_atoms = skip_triple_equal_terminal_atoms
         self.num_of_procs = config.num_of_procs
         self.method_of_calc = config.orca_method
+        # NEW (2026-11-06): isolate fixed-harmonic Fourier coefficients from legacy free-frequency rows.
+        self.coefficient_method_key = self.method_of_calc.lower() + "|fourier3-periodic-v2"
         self.charge = config.charge
         self.multipl = config.spin_multiplicity
         self.af = config.acquisition_function
@@ -687,13 +689,13 @@ class CoefCalculator:
             cur_mol_smiles = Chem.MolToSmiles(Chem.RemoveHs(cur_mol))
 
             db_response = self.db_connector.get_request_params(
-                "SELECT a1, a2, a3, b1, b2, b3, c FROM dihedrals "
+                "SELECT a1, a2, a3, c FROM dihedrals "
                 "WHERE dihedral_smiles = ? AND method = ?",
-                (cur_mol_smiles, self.method_of_calc.lower()),
+                (cur_mol_smiles, self.coefficient_method_key),
             )
             
             if len(db_response) > 0:
-                self.fetched_coefs[cur_mol_smiles] = db_response[0]
+                self.fetched_coefs[cur_mol_smiles] = tuple(db_response[0])
 
             idxs_to_rotate = self._mapped_torsion(cur_mol) or self.get_idxs_to_rotate(cur_mol)
             heavy_mol = Chem.RemoveAllHs(cur_mol)
@@ -701,12 +703,12 @@ class CoefCalculator:
             if not central_bond.IsInRing():
                 SetDihedralRad(cur_mol.GetConformer(), *idxs_to_rotate, 0)
             elif cur_mol_smiles not in self.fetched_coefs:
-                # A ring dihedral cannot be freely scanned (the ring breaks);
-                # use a flat GP mean prior so the IK loss alone guides ring geometry.
-                self.fetched_coefs[cur_mol_smiles] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                # A torsion inside a ring cannot be scanned (the ring breaks): flat GP mean.
+                # Reached only with scan_ring_torsions: false; otherwise the fragment is open.
+                self.fetched_coefs[cur_mol_smiles] = (0.0,) * 4
                 self.flat_ring_smiles.add(cur_mol_smiles)
 
-            xyz = Chem.MolToXYZBlock(cur_mol)
+            xyz =Chem.MolToXYZBlock(cur_mol)
             filename = self.dir_for_inps + "scan_" + str(angle_number) + ".inp"
             self.generate_scan_inp(
                 xyz=self.get_coords_from_xyz_block(xyz), 
@@ -717,6 +719,13 @@ class CoefCalculator:
             inp_names.append(filename)
             angle_number += 1
             self.scanfile2smiles[filename] = cur_mol_smiles
+            parent_axes = [key for key, coef_idx in self.frags.items()
+                           if coef_idx == self.unique_frags.get(cur_mol_smiles)]
+            logger.info(
+                "Torsion scan input %s: fragment=%s; fragment-local dihedral=%s; "
+                "parent dihedral(s)=%s",
+                filename, cur_mol_smiles, tuple(idxs_to_rotate), parent_axes,
+            )
     
         return inp_names
 
@@ -774,6 +783,10 @@ class CoefCalculator:
             cur for cur in inp_files
             if self.scanfile2smiles[cur] not in self.fetched_coefs
         ]
+        logger.info(
+            "Torsion scan preparation: %d unique fragment(s), %d cache hit(s), %d scan job(s) to submit",
+            len(inp_files), len(inp_files) - len(to_run), len(to_run),
+        )
 
         if to_run and not self.submit_scans:
             logger.info("Dry run: %d torsion scan(s) not submitted, flat mean used for them", len(to_run))
@@ -798,7 +811,7 @@ class CoefCalculator:
                 res.append(self.fetched_coefs[self.scanfile2smiles[inp_filename]])
                 continue
             if inp_filename in self.skipped_scans:
-                res.append((0.0,) * 7)
+                res.append((0.0,) * 4)
                 continue
             if inp_filename not in self.failed_scans:
                 try:
@@ -812,13 +825,15 @@ class CoefCalculator:
                 "Using flat mean function for %s (%s) — torsion scan failed",
                 inp_filename, self.scanfile2smiles[inp_filename],
             )
-            res.append((0.0,) * 7)
+            res.append((0.0,) * 4)
 
         self.n_fourier_computed = len(inp_filenames) - len(self.fetched_coefs) - len(self.failed_scans) - len(self.skipped_scans)
         self.n_fourier_cached = len(self.fetched_coefs) - len(self.flat_ring_smiles)
         logger.info(
-            "Sucessful calculated %s coefs and fetched from db %s coefs! (%d ring fragment(s) not scanned, flat mean)",
-            self.n_fourier_computed, self.n_fourier_cached, len(self.flat_ring_smiles),
+            "Periodic Fourier profiles: %d calculated, %d retrieved from cache, %d failed/dry-run, "
+            "%d ring torsion(s) not scanned (flat mean)",
+            self.n_fourier_computed, self.n_fourier_cached, len(self.failed_scans) + len(self.skipped_scans),
+            len(self.flat_ring_smiles),
         )
 
         for inp_filename, coefs in zip(inp_filenames, res):
@@ -826,11 +841,11 @@ class CoefCalculator:
                     or inp_filename in self.failed_scans or inp_filename in self.skipped_scans):
                 continue
             self.db_connector.set_request_params(
-                "INSERT INTO dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO dihedrals (dihedral_smiles, method, a1, a2, a3, b1, b2, b3, c) "
+                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 0.0, ?)",
                 (
-                    self.scanfile2smiles[inp_filename], self.method_of_calc.lower(),
-                    coefs[0], coefs[1], coefs[2], coefs[3], coefs[4], coefs[5], coefs[6],
+                    self.scanfile2smiles[inp_filename], self.coefficient_method_key,
+                    coefs[0], coefs[1], coefs[2], coefs[3],
                 ),
             )
 
@@ -872,7 +887,7 @@ class CoefCalculator:
             coef_idx = self.frags[idxs]
             if not has_real:
                 logger.debug("No Fourier coefs for ring-fusion axis %s — using flat mean function.", idxs)
-                result.append((list(idxs), (0.0,) * 7))
+                result.append((list(idxs), (0.0,) * 4))
             else:
                 result.append((list(idxs), unique_coefs[coef_idx]))
         return result

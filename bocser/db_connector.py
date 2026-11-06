@@ -50,7 +50,7 @@ class LocalConnector(Connector):
         self.ensure_ts_bond_coefs_table()
 
     def ensure_dihedrals_table(self) -> None:
-        """Fourier torsion-scan coefficients (fragment SMILES + method)."""
+        """Fourier torsion-scan coefficients. New fixed-harmonic rows use a versioned method key and a1/a2/a3/c; legacy columns remain for compatibility."""
         self.set_request(
             """CREATE TABLE IF NOT EXISTS dihedrals (
                    dihedral_smiles TEXT NOT NULL,

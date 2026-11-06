@@ -78,6 +78,7 @@ from coef_from_grid import (
 from calc import (
     calc_energy,
     mmff_energy,
+    last_hess_path,
     load_last_optimized_structure_xyz_block,
     parse_points_from_trj,
     _qc_calcs_dir,
@@ -753,8 +754,6 @@ class ConfSearchRunner:
             dihedrals_tf = tf.constant(dihedrals, dtype=tf.float64)
             if len(dihedrals_tf.shape) == 1:
                 dihedrals_tf = tf.reshape(dihedrals_tf, [1, dihedrals_tf.shape[0]])
-            logger.debug("Cur dihedrals_tf: %s", dihedrals_tf)
-            logger.debug("Current minima: %s", self.state.current_minima)
             mean, variance = self.state.model_chk.predict_f(dihedrals_tf)
             normal = tfp.distributions.Normal(mean, tf.sqrt(variance))
             tau = self.state.current_minima + 3.0
@@ -767,61 +766,71 @@ class ConfSearchRunner:
 
         if tf.is_tensor(dihedrals):
             dihedrals = list(dihedrals.numpy())
-
         self.state.asked_points.append(dihedrals)
 
-        logger.debug("Point: %s", dihedrals)
-
-        # Pre-opt
         n_dih = len(self.state.dihedral_ids)
         dihedral_vals = dihedrals[:n_dih]
         ts_bond_targets = self._ts_bond_targets(dihedrals)
+        ts_mode_bond = self.state.ts_mode_bond
+        ts_pair_keys = {frozenset(pair) for pair in self.state.ts_bonds}
+        # A TS-bond entry in extra_constraints (often value="current" in legacy
+        # configs) must not override a BO-sampled stage-2 target when bond lengths vary.
+        stage2_extra_constraints = self.state.extra_constraints
+        if self.state.vary_ts_bond_lengths:
+            stage2_extra_constraints = [
+                c for c in self.state.extra_constraints
+                if not (c.type == "bond" and frozenset(c.atoms) in ts_pair_keys)
+            ]
+        # Stage 3 always releases TS-bond distances, including legacy user constraints
+        # that would otherwise silently keep them fixed.
+        stage3_extra_constraints = [
+            c for c in self.state.extra_constraints
+            if not (c.type == "bond" and frozenset(c.atoms) in ts_pair_keys)
+        ]
+        if self.state.config.ts and len(stage3_extra_constraints) != len(self.state.extra_constraints):
+            logger.info("Stage 3: removing explicit TS-bond constraints so OptTS can relax those distances")
+        if self.state.config.ts and self.state.config.use_grass:
+            raise RuntimeError(
+                "The four-stage TS workflow requires ORCA Opt/OptTS jobs; use_grass is not compatible."
+            )
+        preopt_failure, build_info = {}, {}
 
-        logger.info("Optimizing constrained struct")
-        preopt_failure = {}
-        build_info = {}
+        # TS: 1) candidate build (MMFF), 2) Opt with BO torsions and TS bonds fixed,
+        # 3) OptTS with BO torsions fixed and TS bonds free, 4) OptTS without constraints.
+        # Non-TS: stage 2 (constrained Opt) and stage 4 (Opt). The GP gets the stage-4
+        # trajectory as before (first frame = stage-3 result, plus cluster representatives).
+        logger.info("Stage 2: constrained ORCA Opt (BO torsions%s fixed)",
+                    " + TS-bond distances" if self.state.config.ts else "")
         try:
-            en, preopt_status = calc_energy(
-                self.state.mol_file_name,
-                list(zip(self.state.dihedral_ids, dihedral_vals)),
-                self.state.norm_energy,
-                True,
-                constrained_opt=True,
-                ik_loss=self.state.ik_loss,
-                original_mol=self.state.mol,
+            stage2_energy, stage2_ok = calc_energy(
+                self.state.mol_file_name, list(zip(self.state.dihedral_ids, dihedral_vals)),
+                self.state.norm_energy, True, constrained_opt=True, opt_type="Opt",
+                ik_loss=self.state.ik_loss, original_mol=self.state.mol,
                 broken_structs_dir=self.state.broken_structs_path,
-                success_out_dir=self.state.success_out_dir,
-                ts_bonds=self.state.ts_bonds,
+                success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
                 ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals,
-                extra_constraints=self.state.extra_constraints,
-                ts_bond_targets=ts_bond_targets,
-                failure_info=preopt_failure,
-                start_coords=self._nearest_template(dihedrals),
-                build_info=build_info,
+                extra_constraints=stage2_extra_constraints,
+                ts_bond_targets=ts_bond_targets, failure_info=preopt_failure,
+                start_coords=self._nearest_template(dihedrals), build_info=build_info,
                 max_build_deviation=self._BUILD_TOLERANCE,
                 mmff_energy_limit=self._mmff_energy_limit(),
             )
         except Exception:
-            logger.exception("calc_energy (preopt) fell with unexpected exception — conting point as broken.")
-            en, preopt_status = self.state.config.broken_struct_energy, False
-            # Dump the status file immediately, right to avoidcrash on exception
-            self._dump_status_hook(dumping_value=False)
+            logger.exception("Stage-2 constrained Opt failed unexpectedly — counting the point as broken.")
+            stage2_energy, stage2_ok = self.state.config.broken_struct_energy, False
+            preopt_failure.setdefault("stage", "orca")
+            preopt_failure.setdefault("reason", "stage2_exception")
+
         self.state.last_built_point = self._built_point(dihedrals, build_info)
-        self.state.last_opt_ok = preopt_status
-        if preopt_status:
-            self._note_mmff_energy(build_info.get("mmff_energy"))
-        else:
+        if not stage2_ok:
+            self.state.last_opt_ok = False
             self.state.last_failure_reason = preopt_failure.get("reason")
-        logger.info("Status of preopt: %s; LAST_OPT_OK: %s", preopt_status, self.state.last_opt_ok)
-        if not preopt_status:
-            self._dump_status_hook(dumping_value=self.state.last_opt_ok)
-            skipped_structure_id = increase_structure_id()
             self.state.geometry_rejected = preopt_failure.get("stage") == "geometry"
-            self._count_outcome(
-                "rejected_before_orca" if self.state.geometry_rejected else "preopt_failed",
-                preopt_failure.get("reason") or "error",
-            )
+            self._dump_status_hook(False)
+            skipped_structure_id = increase_structure_id()
+            self._count_outcome("rejected_before_orca" if self.state.geometry_rejected else "preopt_failed",
+                                preopt_failure.get("reason") or "error")
             if self.state.geometry_rejected:
                 logger.error(
                     "Candidate %s rejected by the structure check before ORCA — %s, the BO step is "
@@ -830,68 +839,116 @@ class ConfSearchRunner:
                     else "broken_struct_energy goes to the GP",
                 )
             else:
-                logger.error("Preopt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
-            return en + np.random.randn()
-        preopt_en = en
-        full_opt_failure = {}
+                logger.error("Stage 2 finished with error! Structure %s will be skipped!", skipped_structure_id)
+            return stage2_energy + np.random.randn()
+        self._note_mmff_energy(build_info.get("mmff_energy"))
+        stage2_xyz = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
+
+        inhess_file = None
+        if self.state.config.ts:
+            stage3_failure = {}
+            hess_path = last_hess_path(self.state.mol_file_name)
+            hess_path.unlink(missing_ok=True)  # stage 4 must read this point's Hessian, never an old one
+            logger.info("Stage 3: constrained ORCA OptTS (BO torsions fixed, TS bonds free)")
+            try:
+                stage3_energy, stage3_ok = calc_energy(
+                    self.state.mol_file_name, list(zip(self.state.dihedral_ids, dihedral_vals)),
+                    self.state.norm_energy, True, constrained_opt=True,
+                    force_xyz_block=stage2_xyz, opt_type="OptTS",
+                    ik_loss=self.state.ik_loss, original_mol=self.state.mol,
+                    broken_structs_dir=self.state.broken_structs_path,
+                    success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
+                    ts_bond_max_length=self.state.config.ts_bond_max_length,
+                    fixed_dihedrals=self.state.fixed_dihedrals,
+                    extra_constraints=stage3_extra_constraints,
+                    failure_info=stage3_failure, ts_mode_bond=ts_mode_bond,
+                )
+            except Exception:
+                logger.exception("Stage-3 constrained OptTS failed unexpectedly — counting the point as broken.")
+                stage3_energy, stage3_ok = self.state.config.broken_struct_energy, False
+                stage3_failure.setdefault("stage", "orca")
+                stage3_failure.setdefault("reason", "stage3_exception")
+            if not stage3_ok:
+                self.state.last_opt_ok = False
+                self.state.last_failure_reason = stage3_failure.get("reason")
+                self._dump_status_hook(False)
+                skipped_structure_id = increase_structure_id()
+                self._count_outcome("stage3_failed", stage3_failure.get("reason") or "error")
+                logger.error("Stage 3 finished with error! Structure %s will be skipped!", skipped_structure_id)
+                if stage3_failure.get("stage") in ("orca", "result"):
+                    # The stage-2 energy (BO torsions and TS bonds held) is a valid observation;
+                    # only a rejected input geometry is not
+                    logger.warning(
+                        "Stage 3 failed (%s) — using the stage-2 energy %.3f kcal/mol for this point.",
+                        "ORCA" if stage3_failure["stage"] == "orca" else "broken result", stage2_energy,
+                    )
+                    self.state.last_eval_valid = True
+                    return stage2_energy
+                return stage3_energy + np.random.randn()
+            stage3_xyz = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
+            if hess_path.is_file():
+                inhess_file = str(hess_path.resolve())
+            else:
+                logger.warning("Stage 3 left no Hessian file (%s) — stage 4 computes its own", hess_path.name)
+        else:
+            stage3_xyz, stage3_energy = stage2_xyz, stage2_energy
+
+        final_cmd = "OptTS" if self.state.config.ts else "Opt"
+        logger.info("Stage 4: unconstrained ORCA %s%s", final_cmd,
+                    " (reads the stage-3 Hessian)" if inhess_file else "")
+        stage4_failure = {}
         try:
-            logger.info("Optimized! Loading xyz from preopt")
-            xyz_from_constrained = load_last_optimized_structure_xyz_block(self.state.mol_file_name)
-            logger.info("Loaded! Full opt")
-            en, opt_status = calc_energy(
-                self.state.mol_file_name,
-                list(zip(self.state.dihedral_ids, dihedral_vals)),
-                self.state.norm_energy,
-                True,
-                force_xyz_block=xyz_from_constrained,
-                ik_loss=self.state.ik_loss,
-                original_mol=self.state.mol,
+            stage4_energy, stage4_ok = calc_energy(
+                self.state.mol_file_name, list(zip(self.state.dihedral_ids, dihedral_vals)),
+                self.state.norm_energy, True, constrained_opt=False,
+                force_xyz_block=stage3_xyz, opt_type=final_cmd,
+                force_unconstrained=True, inhess_file=inhess_file,
+                ik_loss=self.state.ik_loss, original_mol=self.state.mol,
                 broken_structs_dir=self.state.broken_structs_path,
-                success_out_dir=self.state.success_out_dir,
-                ts_bonds=self.state.ts_bonds,
+                success_out_dir=self.state.success_out_dir, ts_bonds=self.state.ts_bonds,
                 ts_bond_max_length=self.state.config.ts_bond_max_length,
                 fixed_dihedrals=self.state.fixed_dihedrals,
                 extra_constraints=self.state.extra_constraints,
-                ts_bond_targets=None,  # TS-bond lengths are free in the final Opt/OptTS
-                failure_info=full_opt_failure,
-                ts_mode_bond=self.state.ts_mode_bond,
+                failure_info=stage4_failure,
+                ts_mode_bond=(ts_mode_bond if self.state.config.ts else None),
             )
         except Exception:
             # e.g. sbatch -W reports a non-zero ORCA exit code: lose this point, not the whole run
-            logger.exception("calc_energy (full opt) fell with unexpected exception — counting point as broken.")
-            en, opt_status = self.state.config.broken_struct_energy, False
-        if opt_status:
-            opt_status = self._check_full_opt_result(full_opt_failure)
-        if not opt_status:
-            self.state.last_failure_reason = full_opt_failure.get("reason")
-        self.state.last_opt_ok = opt_status
-        logger.info("Status of opt: %s; LAST_OPT_OK: %s", opt_status, self.state.last_opt_ok)
-        logger.info("Optimized! En = %s", en)
-        self._dump_status_hook(dumping_value=self.state.last_opt_ok)
-
-        if opt_status:
+            logger.exception("Stage-4 %s failed unexpectedly — counting the point as failed.", final_cmd)
+            stage4_energy, stage4_ok = self.state.config.broken_struct_energy, False
+            stage4_failure.setdefault("stage", "orca")
+            stage4_failure.setdefault("reason", "stage4_exception")
+        if stage4_ok:
+            stage4_ok = self._check_full_opt_result(stage4_failure)
+        self.state.last_opt_ok = stage4_ok
+        self._dump_status_hook(stage4_ok)
+        if stage4_ok:
             self._count_outcome("success")
             self.state.last_eval_valid = True
-        else:
-            self._count_outcome(
-                {"geometry": "opt_input_rejected", "result": "opt_result_broken"}.get(
-                    full_opt_failure.get("stage"), "opt_failed"),
-                full_opt_failure.get("reason") or "error",
-            )
-            skipped_structure_id = increase_structure_id()
-            logger.error("Opt finished with error! Structure with number %s will be skipped!", skipped_structure_id)
-            if self.state.config.use_preopt_energy_on_opt_failure and full_opt_failure.get("stage") in ("orca", "result"):
-                # The pre-opt energy at this point is a valid observation (it is what the first
-                # trajectory frame gives on success); only a rejected input geometry is not.
-                logger.warning(
-                    "Full optimization failed (%s) — using the pre-optimization energy %.3f kcal/mol "
-                    "for this point instead of broken_struct_energy.",
-                    "ORCA" if full_opt_failure["stage"] == "orca" else "broken final geometry", preopt_en,
-                )
-                self.state.last_eval_valid = True
-                return preopt_en
+            logger.info("Optimized! En = %s", stage4_energy)
+            return stage4_energy
 
-        return en + ((not opt_status) * np.random.randn())
+        # Only a successful stage 4 gives a trajectory for the GP and a minimum (the run loop
+        # parses the trajectory only when last_opt_ok)
+        self.state.last_failure_reason = stage4_failure.get("reason")
+        self._count_outcome(
+            {"geometry": "opt_input_rejected", "result": "opt_result_broken"}.get(
+                stage4_failure.get("stage"), "opt_failed"),
+            stage4_failure.get("reason") or "error",
+        )
+        skipped_structure_id = increase_structure_id()
+        logger.error("Stage 4 finished with error! Structure %s will be skipped!", skipped_structure_id)
+        if stage4_failure.get("stage") in ("orca", "result"):
+            # The stage-3 (TS) or stage-2 (non-TS) energy at this point is a valid observation;
+            # only a rejected input geometry is not
+            logger.warning(
+                "Stage 4 failed (%s) — using the stage-%d energy %.3f kcal/mol for this point.",
+                "ORCA" if stage4_failure["stage"] == "orca" else "broken final geometry",
+                3 if self.state.config.ts else 2, stage3_energy,
+            )
+            self.state.last_eval_valid = True
+            return stage3_energy
+        return stage4_energy + np.random.randn()
 
     def _built_point(self, asked: list, build_info: dict) -> list:
         """BO point of the geometry sent to the pre-opt (the asked point if it was not built)."""
@@ -1713,10 +1770,9 @@ class ConfSearchRunner:
                     f"Dataset energy range ({obs_range:.1f} kcal/mol) is too large for GP. "
                     f"Use ensemble_min normalization instead of ORCA norm_energy for TS ensembles."
                 )
-            if self.state.feasibility is not None:
-                for point in dataset.query_points.numpy():
-                    self.state.feasibility.add(point, True)
-                logger.info("Feasibility model seeded with %d ensemble conformers", len(self.state.feasibility))
+            # NEW (2026-11-06): starting-ensemble conformers are energy observations only.
+            # They are NOT labelled feasible: feasibility labels must come from the same
+            # explicit candidate validation path used during the BO search.
         else:
             use_fm = self.state.feasibility is not None
             # Rejected embeddings are cheap (no ORCA): with the feasibility model they are
@@ -2062,6 +2118,9 @@ class ConfSearchRunner:
         if self.state.feasibility is not None:
             snapshot["feasibility_points"] = self.state.feasibility.points
             snapshot["feasibility_labels"] = self.state.feasibility.labels
+            # Version 2 contains only labels recorded by explicit candidate checks;
+            # older snapshots may contain incorrectly seeded ensemble conformers.
+            snapshot["feasibility_schema_version"] = 2
 
         existing = self._load_checkpoint_file()
         history = []
@@ -2206,18 +2265,19 @@ class ConfSearchRunner:
         fm = self.state.feasibility
         if fm is not None:
             points, labels = snapshot.get("feasibility_points"), snapshot.get("feasibility_labels")
-            try:
+            if snapshot.get("feasibility_schema_version") == 2 and points is not None and labels is not None:
                 fm.set_data(points, labels)
-                logger.info("Feasibility model restored: %d labels, %d failed", len(fm), fm.n_failed)
-            except (TypeError, ValueError):
-                # Checkpoint without labels (older version or the model was off): every GP point
-                # with an energy counts as feasible, every broken_struct_energy point as failed
-                obs = dataset.observations.numpy().reshape(-1)
-                fm.set_data(
-                    dataset.query_points.numpy().tolist(),
-                    [not _is_broken(float(e), self.state.config.broken_struct_energy) for e in obs],
+                logger.info("Feasibility model restored: %d explicit candidate labels, %d failed", len(fm), fm.n_failed)
+            else:
+                # Older checkpoints may have labelled every starting-ensemble conformer
+                # as feasible. Those labels cannot be distinguished from genuine candidate
+                # checks, so discard the entire legacy feasibility history rather than
+                # silently contaminating the classifier.
+                fm.set_data([], [])
+                logger.warning(
+                    "Legacy checkpoint has no trusted feasibility schema; resetting feasibility labels. "
+                    "Starting-ensemble conformers are not feasibility observations."
                 )
-                logger.info("Feasibility model seeded from the checkpoint data: %d labels, %d failed", len(fm), fm.n_failed)
 
         minima_dir = Path(self.state.working_folder) / f"{self.state.exp_name}_minima"
         for i, (coords, _) in enumerate(self.state.minima):
